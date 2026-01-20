@@ -5,6 +5,7 @@ import json
 import random
 import re
 import sys
+from subprocess import CalledProcessError, run
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -86,6 +87,27 @@ def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
 
 
+def _first_existing(columns: List[str], candidates: List[str]) -> Optional[str]:
+    colset = set(columns)
+    for name in candidates:
+        if name in colset:
+            return name
+    return None
+
+
+def _git_commit(project_root: Path) -> Optional[str]:
+    try:
+        out = run(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (CalledProcessError, FileNotFoundError):
+        return None
+    return out.stdout.strip() or None
+
+
 def _parse_options(options: Any) -> List[str]:
     if isinstance(options, list):
         return [str(x) for x in options]
@@ -127,7 +149,8 @@ def main() -> int:
     seed = int(cfg.get("seed", 0))
     split = str(cfg.get("split", "train"))
     max_samples = int(cfg.get("max_samples", 200))
-    text_template = str(cfg.get("text_template", "{question}\n{option}"))
+    prompt_template = str(cfg.get("prompt_template", cfg.get("text_template", "{question}\n{option}")))
+    prompt_hash = sha256_text(prompt_template)
 
     try:
         import torch
@@ -151,6 +174,10 @@ def main() -> int:
     if split not in ds:
         split = "test" if "test" in ds else list(ds.keys())[0]
     d0 = ds[split]
+    columns0 = list(d0.column_names)
+    label_field = _first_existing(columns0, ["label", "anomaly", "is_anomaly"])
+    class_field = _first_existing(columns0, ["category", "class_name", "object", "cls"])
+    sample_id_field = _first_existing(columns0, ["id", "sample_id", "index"])
 
     random.seed(seed)
     torch.manual_seed(seed)
@@ -232,6 +259,9 @@ def main() -> int:
         question = _safe_str(row.get("question"))
         options = _parse_options(row.get("options"))
         answer = row.get("answer")
+        sample_id = row.get(sample_id_field) if sample_id_field else None
+        class_name = row.get(class_field) if class_field else None
+        gt_label = row.get(label_field) if label_field else None
         query_image_val = row.get("query_image")
 
         if not isinstance(options, list) or len(options) == 0:
@@ -247,7 +277,7 @@ def main() -> int:
 
         texts = []
         for opt in options:
-            texts.append(text_template.format(question=question, option=_safe_str(opt)))
+            texts.append(prompt_template.format(question=question, option=_safe_str(opt)))
 
         img_cache_path = cache_img_dir / f"{int(idx)}.npy"
         image_emb = _load_npy(img_cache_path)
@@ -288,17 +318,31 @@ def main() -> int:
             correct = int(_safe_str(pred).strip() == _safe_str(ans).strip())
 
         correct_n += correct
+        raw_output = {
+            "scores": scores,
+            "pred": pred,
+            "options": options,
+        }
         rows.append(
             {
+                "sample_id": sample_id if sample_id is not None else int(idx),
+                "class_name": class_name,
+                "gt_label": gt_label,
+                "pred_label": pred,
+                "raw_output": json.dumps(raw_output, ensure_ascii=False),
                 "idx": int(idx),
                 "split": split,
+                "question": question,
                 "answer": ans,
                 "pred": pred,
                 "correct": int(correct),
                 "scores_json": json.dumps(scores, ensure_ascii=False),
                 "model_id": model_id,
                 "seed": seed,
+                "prompt_hash": prompt_hash,
+                "config_path": str(cfg_path),
                 "config_hash": config_hash,
+                "git_commit": _git_commit(project_root),
                 "baseline_name": baseline_name,
                 "device": device,
             }
@@ -313,15 +357,24 @@ def main() -> int:
     df = pd.DataFrame(
         rows,
         columns=[
+            "sample_id",
+            "class_name",
+            "gt_label",
+            "pred_label",
+            "raw_output",
             "idx",
             "split",
+            "question",
             "answer",
             "pred",
             "correct",
             "scores_json",
             "model_id",
             "seed",
+            "prompt_hash",
+            "config_path",
             "config_hash",
+            "git_commit",
             "baseline_name",
             "device",
         ],
@@ -334,7 +387,10 @@ def main() -> int:
         "N": int(len(rows)),
         "model_id": model_id,
         "seed": seed,
+        "prompt_hash": prompt_hash,
+        "config_path": str(cfg_path),
         "config_hash": config_hash,
+        "git_commit": _git_commit(project_root),
         "split": split,
         "max_samples": int(max_samples),
         "baseline_name": baseline_name,

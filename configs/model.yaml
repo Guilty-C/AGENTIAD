@@ -3,5 +3,10 @@ model_id: openai/clip-vit-base-patch32
 seed: 0
 split: train
 max_samples: 200
+prompt_template: "{question}\n{option}"
 text_template: "{question}\n{option}"
-
+generation:
+  do_sample: false
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 16
