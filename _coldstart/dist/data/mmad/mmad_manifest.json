@@ -1,0 +1,24 @@
+{
+  "dataset_id": "jiang-cc/MMAD",
+  "timestamp": "2026-01-10T06:11:12.475273+00:00",
+  "splits": [
+    "train"
+  ],
+  "split_sizes": {
+    "train": 39672
+  },
+  "column_names": {
+    "train": [
+      "query_image",
+      "question",
+      "options",
+      "answer",
+      "template_image",
+      "mask"
+    ]
+  },
+  "features_repr": {
+    "train": "{'query_image': Value(dtype='string', id=None), 'question': Value(dtype='string', id=None), 'options': Value(dtype='string', id=None), 'answer': Value(dtype='string', id=None), 'template_image': Value(dtype='string', id=None), 'mask': Value(dtype='string', id=None)}"
+  },
+  "hf_cache_dir": "C:\\Users\\Zhu YiZhen\\.cache\\huggingface\\datasets"
+}

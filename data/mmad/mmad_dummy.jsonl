@@ -1,0 +1,3 @@
+{"id": "mmad_dummy_0001", "task": "arithmetic", "question": "1 + 1 = ?", "answer": "2"}
+{"id": "mmad_dummy_0002", "task": "string", "question": "Return the first letter of 'apple'.", "answer": "a"}
+{"id": "mmad_dummy_0003", "task": "logic", "question": "If all cats are mammals and Tom is a cat, Tom is a ____.", "answer": "mammal"}

@@ -1,0 +1,19 @@
+baseline_name: vlm_yesno_v1
+model_id: openai/clip-vit-base-patch32
+seed: 0
+split: train
+max_samples: 50
+text_template: "{question}\n{option}"
+gt_key: ""
+require_query_prefix: "DS-MVTec/"
+vlm_model_id: "Qwen/Qwen2-VL-2B-Instruct"
+device: cpu
+batch: 4
+max_new_tokens: 32
+prompt_template: |-
+  You are a visual inspector. Determine whether the image contains an anomaly.
+  Reply with a single JSON object only, no extra text.
+  The JSON must be exactly one of:
+  {"anomaly":"yes"} or {"anomaly":"no"}
+gen:
+  do_sample: false

@@ -1,0 +1,236 @@
+AgentIAD（MMAD）论文复现级项目计划（Master Checklist v1.0）
+
+============================================================
+0) 项目目标与范围（固定不变）
+============================================================
+- [ ] 目标：在本地复现论文《AgentIAD: Tool-Augmented Single-Agent for Industrial Anomaly Detection》在 MMAD 基准上的
+      数据处理 → 推理链路 → 轨迹构建 → SFT（LoRA）→ GRPO（toy run / 服务器扩展）→ 评测与报告 全流程
+- [ ] 范围边界：先保证“可跑通 + 可复现 + 可审计”，再追求论文规模与最优指标
+- [ ] 强约束：尽量不新增文件；仅按既定 Level 清单新增脚本/模块；目录保持整洁、可读、可追踪
+- [ ] 核心准则（三件套必须先钉死）
+  - [ ] 可复现：固定 prompt、固定生成参数、固定 seed、记录 config_hash
+  - [ ] 可审计：trace 完整记录 tool_call 与产物（crop/ref/final JSON）
+  - [ ] 可对比：统一输出表格（CSV）与评测脚本口径
+
+============================================================
+1) 项目结构与全局规范（贯穿全项目）
+============================================================
+1.1 目录与命名规范
+- [ ] 输出目录约定
+  - [ ] outputs/tables/：所有 CSV/汇总表
+  - [ ] outputs/traces/<run_name>/<sample_id>/：每样本 trace（图 + JSON）
+  - [ ] outputs/ckpts/：训练权重与日志
+- [ ] 运行命名规范
+  - [ ] run_name 必含：level + model + split + seed（例如 L2_qwenVL_eval_seed42）
+
+1.2 可复现性规范（必须写入输出）
+- [ ] 推理参数固定化（do_sample=False, temperature=0, top_p=1, max_new_tokens 固定）
+- [ ] 全局 seed 固定（Python/NumPy/Torch）
+- [ ] 输出写入复现指纹（至少包含）
+  - [ ] model_id
+  - [ ] seed
+  - [ ] prompt_hash
+  - [ ] config_path 与 config_hash
+  - [ ] git_commit（若可得）
+
+1.3 数据 IO 规范（MMAD image → PIL）
+- [ ] 实现/确认：MMAD 样本 image 字段能稳定读为 PIL.Image
+  - [ ] 路径格式
+  - [ ] bytes / base64（如存在）
+- [ ] 自检：至少打印一次 image.size / image.mode 并写入日志或 trace
+
+============================================================
+Level 1：VLM 可用 baseline（替换 dummy baseline）
+============================================================
+L1 目标
+- [ ] 用 transformers 加载一个 vision-language 模型，对每张图输出 anomaly yes/no
+- [ ] 输出可复现 CSV：outputs/tables/baseline_vlm_*.csv
+
+L1 新增文件（固定）
+- [ ] scripts/05_eval_vlm.py
+- [ ] configs/model.yaml
+
+L1 任务清单
+L1.1 配置与 Prompt 固化
+- [ ] 设计 configs/model.yaml 字段（模型、device、batch、max_new_tokens、prompt_template、generation 参数）
+- [ ] 固化 prompt_template（不可变，否则无法复现）
+- [ ] 生成 prompt_hash（写入输出 CSV）
+
+L1.2 推理脚本实现
+- [ ] 实现 scripts/05_eval_vlm.py
+  - [ ] 读取 MMAD split
+  - [ ] image → PIL.Image（强制）
+  - [ ] batch 推理（按 config）
+  - [ ] 解析模型输出为 pred_label（YES/NO 或统一 JSON）
+  - [ ] 写 outputs/tables/baseline_vlm_*.csv
+
+L1.3 验收标准（Definition of Done）
+- [ ] 同一 config 重跑两次：除 latency 外结果一致
+- [ ] CSV 至少包含：
+      sample_id, class_name, gt_label, pred_label, raw_output, model_id, seed, prompt_hash, config_hash
+
+L1 风险/注意
+- [ ] 模型输出漂移：必须 do_sample=False + temperature=0
+- [ ] 输出格式不稳定：优先改为强约束 JSON 输出，便于 L2-L3 接续
+
+============================================================
+Level 2：AgentIAD 推理链路（PZ + CR），先不训练
+============================================================
+L2 目标
+- [ ] 实现 global → PZ →（可选）CR → final 推理链路
+- [ ] 每样本 trace 可审计：保存 crop/ref 图 + trace.json + final.json
+
+L2 新增文件（固定）
+- [ ] src/agentiad_repro/tools/pz.py
+- [ ] src/agentiad_repro/tools/cr.py
+- [ ] scripts/06_run_agentiad_infer.py
+
+L2 任务清单
+L2.1 PZ 工具（裁剪）
+- [ ] pz.py：实现 crop_image_normalized(bbox_2d, image)
+  - [ ] bbox 输入为 normalized [x1,y1,x2,y2]
+  - [ ] 输出保存 crop.png，返回 crop_path + bbox_2d
+
+L2.2 CR 工具（对比检索，最简可跑通版）
+- [ ] cr.py：实现 query_image(class_name, normal_pool)
+  - [ ] 同类 normal 图池随机取 1 张（先跑通）
+  - [ ] 输出保存 ref.png，返回 ref_path + ref_sample_id
+
+L2.3 推理主链路脚本
+- [ ] 06_run_agentiad_infer.py 实现流程：
+  - [ ] Round-0：global 直接判断
+  - [ ] Round-1：PZ（默认执行）
+  - [ ] Round-2：若不确定才 CR（规则必须写死、可复现）
+  - [ ] final：输出统一 JSON
+
+L2.4 Trace 规范（审计要求）
+- [ ] 每样本目录：outputs/traces/<run_name>/<sample_id>/
+  - [ ] crop.png（必有）
+  - [ ] ref.png（若 CR 触发）
+  - [ ] trace.json（turns + tool_call + tool_result）
+  - [ ] final.json（最终答案 JSON）
+
+L2.5 验收标准（DoD）
+- [ ] 随机抽 10 个样本 trace：能完整回放推理与工具调用
+- [ ] trace.json 内能找到：
+  - [ ] 输入信息（sample_id/class）
+  - [ ] 每轮模型输出文本（或摘要）
+  - [ ] tool_call{name,args}
+  - [ ] tool_result（含保存路径）
+
+============================================================
+Level 3：轨迹构建（SFT 数据：工具化监督必备）
+============================================================
+L3 目标
+- [ ] 构建 data/trajectories/trajectories_sft.jsonl
+- [ ] 每条样本包含标准 tool_call 结构（否则无法做工具化监督）
+
+L3 新增文件（固定）
+- [ ] scripts/07_build_trajectories.py
+- [ ] scripts/08_validate_trajectories.py
+- [ ] data/trajectories/trajectories_sft.jsonl
+
+L3 任务清单
+L3.1 abnormal bbox 构造
+- [ ] 若有 GT mask：计算最小外接矩形 bbox → normalized
+- [ ] 若有缺陷框：直接转 normalized
+- [ ] 记录 bbox 来源（mask/box/other）到轨迹字段，便于审计
+
+L3.2 normal bbox 构造（过渡方案）
+- [ ] 启发式 bbox（确定性、可复现）
+  - [ ] 网格划分 + 梯度/拉普拉斯能量最大区域
+- [ ] 保存 bbox + 评分依据（可选但建议）
+
+L3.3 轨迹格式（强制字段）
+- [ ] 每条轨迹包含：
+  - [ ] messages（system/user/assistant/tool/...）
+  - [ ] 至少一次 tool_call（PZ 或 CR）
+  - [ ] final answer（统一 JSON 格式）
+  - [ ] 复现指纹字段（seed/prompt_hash/config_hash）
+
+L3.4 Validate 脚本（强卡口）
+- [ ] 校验 JSONL 可解析、字段齐全
+- [ ] 校验 bbox 合法（0~1 且 x1<x2,y1<y2）
+- [ ] 校验 tool_call 顺序合法（先 PZ 再 CR 的逻辑）
+- [ ] 校验 final answer 为合法 JSON
+
+L3.5 验收标准（DoD）
+- [ ] validate_trajectories.py 对全量跑通（0 errors）
+- [ ] 随机抽检 20 条：tool_call 可读、bbox 合法、final JSON 合法
+
+============================================================
+Level 4：SFT（LoRA，小规模先跑通）
+============================================================
+L4 目标
+- [ ] 在本地 8GB 4060 上跑通 LoRA SFT（不追论文规模）
+- [ ] 输出 ckpt：outputs/ckpts/sft_lora/
+
+L4 新增文件（固定）
+- [ ] scripts/09_train_sft_lora.py
+- [ ] configs/sft.yaml
+- [ ] outputs/ckpts/sft_lora/
+
+L4 任务清单
+- [ ] 配置 LoRA（rank/alpha/target_modules）
+- [ ] 小 batch + gradient_accumulation + gradient_checkpointing
+- [ ] 数据读取：trajectories_sft.jsonl
+- [ ] 最小可行训练（toy subset 50~200 条）
+- [ ] 训练后 sanity check：
+  - [ ] 能生成合法 final JSON
+  - [ ] tool_call 触发率不为 0（至少在某些样本上）
+
+L4 验收标准（DoD）
+- [ ] loss 下降（或至少稳定收敛趋势）
+- [ ] 生成输出通过与 L3 相同的 JSON/format 校验
+
+============================================================
+Level 5：GRPO（本地 toy run；服务器扩展论文规模）
+============================================================
+L5 目标
+- [ ] 跑通 GRPO 框架与 reward 管线（toy run）
+- [ ] 如有资源，上服务器扩展规模并对齐论文设置
+
+L5 新增文件（固定）
+- [ ] scripts/10_train_grpo_openrlhf.ps1（或 .sh）
+- [ ] configs/grpo.yaml
+- [ ] reward 计算模块（IoU/type/工具预算惩罚）
+
+L5 任务清单
+L5.1 reward 设计与实现
+- [ ] IoU reward（基于预测 bbox 与 GT bbox/mask）
+- [ ] type reward（缺陷类别匹配）
+- [ ] 工具预算惩罚（tool_call 次数/总 token/多余调用）
+
+L5.2 toy run（本地）
+- [ ] 小样本（几十到几百）
+- [ ] 短 rollout（K 小）
+- [ ] KL 约束与日志齐全
+
+L5.3 服务器扩展（可选）
+- [ ] 多卡/更大 batch/更多 rollout
+- [ ] 与论文超参对齐（若可）
+
+L5 验收标准（DoD）
+- [ ] reward 计算可用且数值合理（非全 0、非 NaN）
+- [ ] 训练过程可复现、日志可审计
+- [ ] 至少在 toy set 上相比 SFT 有可观测改善（哪怕很小）
+                1. 验收时候baseline要求与论文的模型一致（对比）
+============================================================
+6) 统一评测与对照实验（跨 Level）
+============================================================
+- [ ] 建立统一评测口径（baseline vs L2 vs SFT vs GRPO）
+- [ ] 关键指标输出到 outputs/tables/：
+  - [ ] anomaly yes/no accuracy / F1（若适用）
+  - [ ] 缺陷类别 accuracy（若有）
+  - [ ] bbox IoU（若有）
+  - [ ] 工具调用统计（平均调用次数、CR 触发率、预算消耗）
+
+============================================================
+7) 里程碑与交付物（给导师的“看得懂版”）
+============================================================
+- [ ] M1：L1 baseline CSV 可复现（表格可对比）
+- [ ] M2：L2 trace 可审计（能回放每一步）
+- [ ] M3：L3 trajectories 合规（可用于工具化监督）
+- [ ] M4：L4 LoRA SFT 跑通（格式稳定）
+- [ ] M5：L5 GRPO toy run 跑通（reward+日志完整）
+- [ ] 最终交付：一份复现报告（配置、命令、结果表、误差分析、资源说明）

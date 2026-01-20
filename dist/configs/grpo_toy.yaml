@@ -1,0 +1,36 @@
+base_model_id: "distilgpt2"
+train_jsonl: "outputs/traces/trajectories_sft_toy.jsonl"
+output_dir: "outputs/ckpts/grpo_toy_run"
+rollout_output_jsonl: "outputs/rollouts/grpo_toy_rollouts.jsonl"
+
+seed: 0
+max_steps: 50
+lr: 0.0005
+batch_size: 1
+rollout_samples: 50
+max_new_tokens: 64
+
+gen:
+  do_sample: true
+  temperature: 0.8
+  top_p: 0.9
+
+rollouts_per_prompt: 8
+reward_audit_min_span: 0.001
+reward_audit_min_json_ok_rate: 0.02
+reward_audit_min_toolcall_rate: 0.01
+reward_audit_max_teacher_sub_rate: 1.0
+
+reward_weights:
+  w_json: 1.0
+  w_tool: 1.0
+  w_len: 0.1
+
+len_penalty_per_char: 0.001
+len_penalty_threshold: 10
+
+adapter_init: ""
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+target_modules: "c_attn,c_proj"

@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# OS / IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Logs / outputs
+outputs/
+wandb/
+runs/
+*.log
+
+# HuggingFace cache (按你习惯)
+.hf/
+cache/

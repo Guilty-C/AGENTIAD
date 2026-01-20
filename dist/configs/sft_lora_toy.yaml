@@ -1,0 +1,13 @@
+base_model_id: "sshleifer/tiny-gpt2"
+train_jsonl: "outputs/traces/trajectories_sft_toy.jsonl"
+seed: 0
+max_steps: 5
+lr: 0.0001
+batch_size: 1
+grad_accum: 4
+output_dir: "outputs/ckpts/sft_lora_toy"
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+target_modules: ""
+

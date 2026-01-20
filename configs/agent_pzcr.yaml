@@ -1,0 +1,8 @@
+base_config: configs/model.yaml
+agent_name: clip_pzcr_v1
+require_query_prefix: "DS-MVTec/"
+trigger_margin: 0.0025
+pz_topk: 2
+pz_min_box_area: 800
+pz_pad: 0.10
+cr_agg: max
