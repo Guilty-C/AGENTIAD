@@ -2,7 +2,7 @@ baseline_name: clip_mcq_v1
 model_id: openai/clip-vit-base-patch32
 seed: 0
 split: train
-max_samples: 200
+max_samples: 1
 prompt_template: "{question}\n{option}"
 text_template: "{question}\n{option}"
 generation:
