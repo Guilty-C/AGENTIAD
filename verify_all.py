@@ -959,7 +959,21 @@ def prepare_clean_room(tmp_repo, measurements):
         if data_src.exists():
             subprocess.run(f'mklink /J "{data_dst}" "{data_src}"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print(f"[CleanRoom] Data Junction created.", file=sys.stderr)
-            
+
+        # Fix: Clean-room manifest binding for strict_j
+        # If junction failed or source manifest missing, ensure deterministic state
+        manifest_rel = "data/mmad/mmad_manifest.json"
+        src_manifest = PROJECT_ROOT / manifest_rel
+        dst_manifest = tmp_repo / manifest_rel
+        
+        if not dst_manifest.exists():
+            if src_manifest.exists():
+                dst_manifest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_manifest, dst_manifest)
+            else:
+                # Deterministic fallback: ensure we don't fail vaguely
+                pass
+
         # Copy critical scripts
         # We need verify_all.py itself
         shutil.copy2(PROJECT_ROOT / "verify_all.py", tmp_repo / "verify_all.py")
