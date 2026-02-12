@@ -16,16 +16,22 @@ Follow this workflow to run code remotely without altering the server environmen
    After pulling or unzipping on the remote Linux server, run the following commands to ensure the environment is ready:
 
    ```bash
+   source conda.sh
    conda activate agentiad
-   # Check for critical dependencies (especially PyYAML)
-   python -c "import yaml; print('yaml_ok')"
-   # If missing:
-   # conda install -y pyyaml
-   # OR
-   # pip install pyyaml
+   
+   # Check imports
+   python -c "import yaml"
+   python -c "import torch, transformers, accelerate, datasets; from PIL import Image"
+   
+   # If missing dependencies:
+   # Option A: Conda
+   conda install -y pip pyyaml torch torchvision torchaudio transformers accelerate datasets pillow
+   
+   # Option B: Pip
+   python -m pip install pyyaml torch torchvision torchaudio transformers accelerate datasets pillow
    
    # Run verification
-   python verify_all.py --mode strict_j
+   CUDA_VISIBLE_DEVICES=0 python verify_all.py --mode strict_j
    ```
 
 ## 3. Execution (Remote via SSH)

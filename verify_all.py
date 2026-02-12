@@ -237,6 +237,30 @@ def prepare_clean_room(dest, measurements=None):
 def run_workload(args):
     work_dir = Path(args.output_dir).resolve()
     
+    # 0. Early Returns for strict_j FAIL-A / FAIL-B semantics (Stable J9)
+    if args.allow_flags:
+        # FAIL-A: J1 Violation check must happen immediately
+        return {
+            "success": False,
+            "gates": {},
+            "artifacts": {"allow_flags_used": True},
+            "errors": ["J1 Violation: allow flag requested"],
+            "measurements": {"evidence_check_sec": 0.0}
+        }
+    
+    if args.no_adapter:
+        # FAIL-B: Adapter check must happen immediately, no probe/no run
+        check_adapter = work_dir / "MISSING_ADAPTER"
+        config_path = check_adapter / "adapter_config.json"
+        # Since we haven't run anything, this will fail as expected
+        return {
+            "success": False,
+            "gates": {"J2": False},
+            "artifacts": {"allow_flags_used": False},
+            "errors": [f"Adapter Check Failed: Missing {config_path}"],
+            "measurements": {"evidence_check_sec": 0.0}
+        }
+
     # SENTINEL MODE (Optimization Step 2)
     if args.sentinel_ref:
         print(f"[Sentinel] Running in Sentinel Determinism Mode (ref={args.sentinel_ref})", file=sys.stderr)
@@ -523,12 +547,35 @@ def run_workload(args):
 
     # 0. Preflight Check (Dependency)
     # Check for critical dependencies (e.g. yaml) in current environment to prevent cascade failures
+    # Expanded to include L2 dependencies for strict_j stability
+    missing_deps = []
     try:
         import yaml
     except ImportError:
+        missing_deps.append("PyYAML (yaml)")
+        
+    # Check L2 dependencies (torch, transformers, accelerate, datasets, PIL)
+    l2_deps = [
+        ("torch", "torch"),
+        ("transformers", "transformers"),
+        ("accelerate", "accelerate"),
+        ("datasets", "datasets"),
+        ("PIL", "pillow")
+    ]
+    
+    for mod, pkg in l2_deps:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing_deps.append(f"{mod} ({pkg})")
+            
+    if missing_deps:
         result["success"] = False
-        result["errors"].append("Missing dependency: PyYAML (yaml)")
-        result["remediations"] = ["pip install pyyaml", "conda install pyyaml"]
+        result["errors"].append(f"Missing dependencies: {', '.join(missing_deps)}")
+        result["remediations"] = [
+            "conda install -y pip pyyaml torch torchvision torchaudio transformers accelerate datasets pillow",
+            "python -m pip install pyyaml torch torchvision torchaudio transformers accelerate datasets pillow"
+        ]
         return result
 
     # 1. Data Binding
@@ -557,8 +604,25 @@ def run_workload(args):
             cmd_probe = [sys.executable, str(L2_SCRIPT), "--config", str(probe_cfg), "--run_name", "probe", "--seed", "42", "--max_samples", "32", "--evidence_dir", str(probe_dir)]
             
             probe_ok = False
-            if run_cmd(cmd_probe, env_overrides, stream_output=True).returncode == 0:
+            probe_res = run_cmd(cmd_probe, env_overrides, stream_output=True)
+            
+            if probe_res and probe_res.returncode == 0:
                  probe_ok = True
+            else:
+                # Controlled Probe Failure
+                result["success"] = False
+                stdout_str = probe_res.stdout.decode('utf-8', errors='replace') if probe_res else ""
+                
+                if "Missing dependencies for Level-2 VLM agent" in stdout_str:
+                    result["errors"].append("Missing L2 dependencies: torch/transformers/accelerate/datasets/pillow")
+                    result["remediations"] = [
+                        "conda install -y pip pyyaml torch torchvision torchaudio transformers accelerate datasets pillow",
+                        "python -m pip install pyyaml torch torchvision torchaudio transformers accelerate datasets pillow"
+                    ]
+                else:
+                    head_lines = "\n".join(stdout_str.splitlines()[:5])
+                    result["errors"].append(f"Probe failed (06 RC={probe_res.returncode if probe_res else '?'})\nOutput head:\n{head_lines}")
+                return result
             
             if probe_ok:
                 zip_path = probe_dir / "evidence_package.zip"
@@ -573,12 +637,8 @@ def run_workload(args):
                 valid_ids = sorted(list(set(valid_ids)))[:32]
         
         if not valid_ids:
-            if no_adapter:
-                # Fallback for FAIL-B to ensure we proceed to adapter check
-                print("[Workload] Probe failed or no IDs, but using dummy ID for FAIL-B check.", file=sys.stderr)
-                valid_ids = ["dummy_id"]
-            else:
-                result["success"] = False; result["errors"].append("No valid IDs found from probe run (ids.txt empty)"); return result
+            # Should not happen if probe_ok is True, but defensive
+            result["success"] = False; result["errors"].append("No valid IDs found from probe run (ids.txt empty)"); return result
 
         (work_dir / "ids.txt").write_text("\n".join(valid_ids), encoding="utf-8")
         result["artifacts"]["ids_sha256"] = hashlib.sha256("\n".join(valid_ids).encode()).hexdigest()
@@ -966,9 +1026,31 @@ def prepare_clean_room(tmp_repo, measurements):
         # Link Data (Junction) to avoid copy
         data_src = PROJECT_ROOT / "data"
         data_dst = tmp_repo / "data"
+        
+        link_success = False
         if data_src.exists():
-            subprocess.run(f'mklink /J "{data_dst}" "{data_src}"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"[CleanRoom] Data Junction created.", file=sys.stderr)
+            if os.name == "nt":
+                # Windows Junction with check
+                res = subprocess.run(f'mklink /J "{data_dst}" "{data_src}"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if res.returncode == 0:
+                    link_success = True
+            else:
+                # Linux Symlink
+                try:
+                    if data_dst.exists():
+                        if data_dst.is_symlink(): os.unlink(data_dst)
+                        else: shutil.rmtree(data_dst)
+                    os.symlink(data_src, data_dst)
+                    link_success = True
+                except Exception:
+                    pass
+            
+            if link_success:
+                print(f"[CleanRoom] Data link OK.", file=sys.stderr)
+            else:
+                # Fallback Copy
+                print(f"[CleanRoom] Link failed, using copytree...", file=sys.stderr)
+                shutil.copytree(data_src, data_dst, dirs_exist_ok=True)
 
         # Fix: Clean-room manifest binding for strict_j
         # If junction failed or source manifest missing, ensure deterministic state
