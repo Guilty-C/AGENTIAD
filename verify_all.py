@@ -549,10 +549,18 @@ def run_workload(args):
     # Check for critical dependencies (e.g. yaml) in current environment to prevent cascade failures
     # Expanded to include L2 dependencies for strict_j stability
     missing_deps = []
+    missing_pkgs = []
+    
+    # Check Python env
+    if "conda" not in sys.executable.lower() and "venv" not in sys.executable.lower() and sys.platform != "win32":
+         # Just a warning or remediation hint if system python is used
+         pass
+
     try:
         import yaml
     except ImportError:
         missing_deps.append("PyYAML (yaml)")
+        missing_pkgs.append("pyyaml")
         
     # Check L2 dependencies (torch, transformers, accelerate, datasets, PIL)
     l2_deps = [
@@ -568,14 +576,26 @@ def run_workload(args):
             __import__(mod)
         except ImportError:
             missing_deps.append(f"{mod} ({pkg})")
+            missing_pkgs.append(pkg)
             
     if missing_deps:
         result["success"] = False
         result["errors"].append(f"Missing dependencies: {', '.join(missing_deps)}")
-        result["remediations"] = [
-            "conda install -y pip pyyaml torch torchvision torchaudio transformers accelerate datasets pillow",
-            "python -m pip install pyyaml torch torchvision torchaudio transformers accelerate datasets pillow"
-        ]
+        
+        # Build precise remediations
+        rem_conda = f"conda install -y {' '.join(missing_pkgs)}"
+        # Add pip as fallback in conda command just in case
+        if "pillow" in missing_pkgs: rem_conda += " pip"
+        
+        rem_pip = f"python3 -m pip install {' '.join(missing_pkgs)}"
+        
+        remediations = [rem_conda, rem_pip]
+        
+        # Add env check remediation
+        if "conda" not in sys.executable.lower() and sys.platform != "win32":
+            remediations.append("source ~/miniconda3/etc/profile.d/conda.sh && conda activate agentiad")
+            
+        result["remediations"] = remediations
         return result
 
     # 1. Data Binding
@@ -615,9 +635,10 @@ def run_workload(args):
                 
                 if "Missing dependencies for Level-2 VLM agent" in stdout_str:
                     result["errors"].append("Missing L2 dependencies: torch/transformers/accelerate/datasets/pillow")
+                    # Generic remediation for probe failure if we can't be precise
                     result["remediations"] = [
-                        "conda install -y pip pyyaml torch torchvision torchaudio transformers accelerate datasets pillow",
-                        "python -m pip install pyyaml torch torchvision torchaudio transformers accelerate datasets pillow"
+                        "conda install -y transformers accelerate datasets pillow",
+                        "python3 -m pip install transformers accelerate datasets pillow"
                     ]
                 else:
                     head_lines = "\n".join(stdout_str.splitlines()[:5])

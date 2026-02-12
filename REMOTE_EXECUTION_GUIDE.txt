@@ -1,14 +1,18 @@
 # Remote Execution Guide: Shared Lab Server Protocol (Zero-Pollution)
-# [SENSITIVE CREDENTIALS - DO NOT COMMIT]
-# User: lrrelevant
-# Host: 10.35.13.38
-# Password: 060409
+# [SECURITY NOTICE]
+# NEVER COMMIT SENSITIVE CREDENTIALS (PASSWORD, IP, PRIVATE KEY) TO GIT.
+# USE ENVIRONMENT VARIABLES OR LOCAL CONFIGURATION IF NEEDED.
+# IF YOU HAVE PREVIOUSLY COMMITTED PASSWORDS, PLEASE ROTATE/REVOKE THEM IMMEDIATELY.
+
+# User: <your_user> (e.g. env: REMOTE_USER)
+# Host: <your_host> (e.g. env: REMOTE_HOST)
+# Port: 22
 
 This project strictly enforces a "Zero-Pollution" policy for execution on shared lab servers.
 Follow this workflow to run code remotely without altering the server environment or leaving artifacts.
 
 ## 1. Preparation (Local)
-   - Ensure you have SSH access to the lab server.
+   - Ensure you have SSH access to the lab server (use key-based auth or lab-standard method).
    - Pack the repository excluding 'data' folder and outputs:
      PowerShell: `Compress-Archive -Path ".\src", ".\scripts", ".\dist", ".\configs", ".\*.py", ".\requirements.txt", ".\REMOTE_EXECUTION_GUIDE.txt" -DestinationPath ".\agentiad_repro_tmp.zip" -Force`
 
@@ -20,26 +24,26 @@ Follow this workflow to run code remotely without altering the server environmen
    conda activate agentiad
    
    # Check imports
-   python -c "import yaml"
-   python -c "import torch, transformers, accelerate, datasets; from PIL import Image"
+   python3 -c "import yaml"
+   python3 -c "import torch, transformers, accelerate, datasets; from PIL import Image"
    
    # If missing dependencies:
    # Option A: Conda
    conda install -y pip pyyaml torch torchvision torchaudio transformers accelerate datasets pillow
    
    # Option B: Pip
-   python -m pip install pyyaml torch torchvision torchaudio transformers accelerate datasets pillow
+   python3 -m pip install pyyaml torch torchvision torchaudio transformers accelerate datasets pillow
    
    # Run verification
-   CUDA_VISIBLE_DEVICES=0 python verify_all.py --mode strict_j
+   CUDA_VISIBLE_DEVICES=0 python3 verify_all.py --mode strict_j
    ```
 
 ## 3. Execution (Remote via SSH)
-   - Upload the zip (Enter password '060409' when prompted):
-     `scp ".\agentiad_repro_tmp.zip" lrrelevant@10.35.13.38:~/`
+   - Upload the zip:
+     `scp ".\agentiad_repro_tmp.zip" <user>@<host>:~/`
    
-   - Run the "One-Liner" execution block (Enter password '060409' when prompted):
-     ssh lrrelevant@10.35.13.38 "bash -lc '
+   - Run the "One-Liner" execution block:
+     ssh <user>@<host> "bash -lc '
        # A. Create unique temp dir in /tmp
        export TMP_RUN=/tmp/run_\$(date +%s)
        mkdir -p \$TMP_RUN
@@ -72,12 +76,12 @@ Follow this workflow to run code remotely without altering the server environmen
      '"
 
 ## 3. Retrieval & Cleanup
-   - Download the evidence package (Enter password '060409' when prompted):
-     `scp lrrelevant@10.35.13.38:/tmp/run_*/dist/outputs/evidence_prep_fullpaper/evidence_package.zip ".\dist\outputs\evidence_prep_fullpaper\"`
-     `scp lrrelevant@10.35.13.38:/tmp/run_*/dist/outputs/evidence_prep_fullpaper/INDEX.txt ".\dist\outputs\evidence_prep_fullpaper\"`
+   - Download the evidence package:
+     `scp <user>@<host>:/tmp/run_*/dist/outputs/evidence_prep_fullpaper/evidence_package.zip ".\dist\outputs\evidence_prep_fullpaper\"`
+     `scp <user>@<host>:/tmp/run_*/dist/outputs/evidence_prep_fullpaper/INDEX.txt ".\dist\outputs\evidence_prep_fullpaper\"`
 
-   - Cleanup remote artifacts (Enter password '060409' when prompted):
-     `ssh lrrelevant@10.35.13.38 "rm -f ~/agentiad_repro_tmp.zip && rm -rf /tmp/run_*"`
+   - Cleanup remote artifacts:
+     `ssh <user>@<host> "rm -f ~/agentiad_repro_tmp.zip && rm -rf /tmp/run_*"`
 
 ## Key Principles
    - NO git clone on shared servers.
