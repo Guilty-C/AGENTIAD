@@ -152,3 +152,5 @@ dist_run.stdout
 # ==== local notes / debug (do not commit) ====
 08_debug_rc.txt
 report.txt
+.trae/
+
