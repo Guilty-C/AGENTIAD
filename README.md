@@ -34,6 +34,27 @@ $env:HF_HOME = (Resolve-Path .\data\cache).Path
 $env:HF_DATASETS_CACHE = (Resolve-Path .\data\cache).Path
 ```
 
+## 离线/内网环境导出
+
+若需在无网环境使用数据，可先在有网环境导出：
+
+```powershell
+$env:MMAD_EXPORT_DIR = "data\MMAD_REAL"
+python .\scripts\export_mmad_offline.py
+```
+
+完成后将 `data\MMAD_REAL` 拷贝至目标机器即可。
+
+## 远端执行 (Zero-Pollution)
+
+本项目支持在共享服务器上进行“零污染”执行（不残留文件、不修改环境）。
+详细操作流程请参考 [REMOTE_EXECUTION_GUIDE.txt](REMOTE_EXECUTION_GUIDE.txt)。
+
+核心原则：
+1. 本地打包 (`agentiad_repro_tmp.zip`) 并上传。
+2. 远端 `/tmp` 目录下解压运行。
+3. 数据持久化存储在 `~/data/mmad`，其余产物运行后清理。
+
 ## 验收产物
 
 - `outputs/logs/env.json`
