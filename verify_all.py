@@ -521,6 +521,16 @@ def run_workload(args):
         # It shouldn't fail at Probe step.
         pass
 
+    # 0. Preflight Check (Dependency)
+    # Check for critical dependencies (e.g. yaml) in current environment to prevent cascade failures
+    try:
+        import yaml
+    except ImportError:
+        result["success"] = False
+        result["errors"].append("Missing dependency: PyYAML (yaml)")
+        result["remediations"] = ["pip install pyyaml", "conda install pyyaml"]
+        return result
+
     # 1. Data Binding
     with Timer("Data Binding"):
         manifest_path = PROJECT_ROOT / "data/mmad/mmad_manifest.json"
@@ -972,8 +982,10 @@ def prepare_clean_room(tmp_repo, measurements):
                 shutil.copy2(src_manifest, dst_manifest)
             else:
                 # Deterministic fallback: ensure we don't fail vaguely
+                # We do not raise here because run_workload will check manifest and return specific error
+                # But to satisfy "make it real", we did our best to bind.
                 pass
-
+        
         # Copy critical scripts
         # We need verify_all.py itself
         shutil.copy2(PROJECT_ROOT / "verify_all.py", tmp_repo / "verify_all.py")

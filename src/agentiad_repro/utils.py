@@ -14,7 +14,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 
-import yaml
+try:
+    import yaml
+except ImportError:
+    raise RuntimeError("PyYAML missing. Install: pip install pyyaml (or conda install pyyaml)")
 
 
 @dataclass(frozen=True)

@@ -12,7 +12,23 @@ Follow this workflow to run code remotely without altering the server environmen
    - Pack the repository excluding 'data' folder and outputs:
      PowerShell: `Compress-Archive -Path ".\src", ".\scripts", ".\dist", ".\configs", ".\*.py", ".\requirements.txt", ".\REMOTE_EXECUTION_GUIDE.txt" -DestinationPath ".\agentiad_repro_tmp.zip" -Force`
 
-## 2. Execution (Remote via SSH)
+## 2. Remote Setup (After git pull / Unzip)
+   After pulling or unzipping on the remote Linux server, run the following commands to ensure the environment is ready:
+
+   ```bash
+   conda activate agentiad
+   # Check for critical dependencies (especially PyYAML)
+   python -c "import yaml; print('yaml_ok')"
+   # If missing:
+   # conda install -y pyyaml
+   # OR
+   # pip install pyyaml
+   
+   # Run verification
+   python verify_all.py --mode strict_j
+   ```
+
+## 3. Execution (Remote via SSH)
    - Upload the zip (Enter password '060409' when prompted):
      `scp ".\agentiad_repro_tmp.zip" lrrelevant@10.35.13.38:~/`
    
