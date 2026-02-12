@@ -562,13 +562,14 @@ def run_workload(args):
         missing_deps.append("PyYAML (yaml)")
         missing_pkgs.append("pyyaml")
         
-    # Check L2 dependencies (torch, transformers, accelerate, datasets, PIL)
+    # Check L2 dependencies (torch, transformers, accelerate, datasets, PIL, pyarrow)
     l2_deps = [
         ("torch", "torch"),
         ("transformers", "transformers"),
         ("accelerate", "accelerate"),
         ("datasets", "datasets"),
-        ("PIL", "pillow")
+        ("PIL", "pillow"),
+        ("pyarrow", "pyarrow")
     ]
     
     for mod, pkg in l2_deps:
@@ -582,14 +583,13 @@ def run_workload(args):
         result["success"] = False
         result["errors"].append(f"Missing dependencies: {', '.join(missing_deps)}")
         
-        # Build precise remediations
-        rem_conda = f"conda install -y {' '.join(missing_pkgs)}"
-        # Add pip as fallback in conda command just in case
-        if "pillow" in missing_pkgs: rem_conda += " pip"
+        # Build precise remediations (Defaults to conda-forge for best compat)
+        rem_conda = f"conda install -y -c conda-forge {' '.join(missing_pkgs)}"
         
         rem_pip = f"python3 -m pip install {' '.join(missing_pkgs)}"
+        rem_pip_note = "Note: If pip fails on pyarrow/datasets due to missing cmake, use conda-forge or install build-essential."
         
-        remediations = [rem_conda, rem_pip]
+        remediations = [rem_conda, rem_pip, rem_pip_note]
         
         # Add env check remediation
         if "conda" not in sys.executable.lower() and sys.platform != "win32":
@@ -637,8 +637,8 @@ def run_workload(args):
                     result["errors"].append("Missing L2 dependencies: torch/transformers/accelerate/datasets/pillow")
                     # Generic remediation for probe failure if we can't be precise
                     result["remediations"] = [
-                        "conda install -y transformers accelerate datasets pillow",
-                        "python3 -m pip install transformers accelerate datasets pillow"
+                        "conda install -y -c conda-forge transformers accelerate datasets pyarrow pillow",
+                        "python3 -m pip install transformers accelerate datasets pyarrow pillow"
                     ]
                 else:
                     head_lines = "\n".join(stdout_str.splitlines()[:5])
@@ -1210,10 +1210,52 @@ def verify_j_strict():
     else: failed = True; acceptance["failed_gates"].append("J1")
     
     if r1 and r1["gates"].get("J2"):
-        acceptance["score"] += 1; acceptance["gates"]["J2"] = True
-    else: failed = True; acceptance["failed_gates"].append("J2")
-    
-    acceptance["score"] += 1; acceptance["gates"]["J3"] = True
+        # J2 is already calculated in R1 for trace fingerprints
+        # But J2 also requires Fail-B check (above).
+        # We will keep J2 if R1 fingerprint is OK, but we might overwrite if Fail-B failed?
+        # Actually, strict requirement usually splits J2 into "Fingerprint" and "Adapter Check".
+        # Let's assume J2 in acceptance refers to Fingerprint (from R1).
+        # And Fail-B contributes to J9 or J2-Fail-Check.
+        # But wait, user prompt says: "将 J2 定义为 “fail_b 行为符合预期”"
+        # So we should OVERWRITE J2 based on Fail-B logic?
+        # Or combine? "Fingerprint OK AND Fail-B OK"?
+        # Let's combine:
+        # J2 = (R1 Fingerprint OK) AND (Fail-B Adapter Check OK)
+        # We already set J2=True if Fail-B check passed above.
+        # Let's AND it with R1 check.
+        if not (r1 and r1["gates"].get("J2")):
+             acceptance["gates"]["J2"] = False
+             if "J2" not in acceptance["failed_gates"]: acceptance["failed_gates"].append("J2")
+             # Adjust score if we deducted it
+             # But score calc logic is sequential.
+             # Let's rewrite J2 score logic here.
+             pass
+    else: 
+        # R1 J2 failed
+        acceptance["gates"]["J2"] = False
+        acceptance["failed_gates"].append("J2")
+
+    # Re-evaluate J2 Score
+    if acceptance["gates"].get("J2"):
+        # Score already added? No, we need to be careful.
+        # Original code added +1 for J2 based on R1.
+        # We should check if we double counted or missed.
+        # Let's just reset J2 score bit.
+        # It's safer to just set score based on final J2 state.
+        pass
+
+    # Correct Score Recalculation (Clean Sweep)
+    acceptance["score"] = 0
+    if acceptance["gates"].get("J0"): acceptance["score"] += 1
+    if acceptance["gates"].get("J1"): acceptance["score"] += 2
+    if acceptance["gates"].get("J2"): acceptance["score"] += 1
+    if acceptance["gates"].get("J3"): acceptance["score"] += 1
+    if acceptance["gates"].get("J5"): acceptance["score"] += 1
+    if acceptance["gates"].get("J6"): acceptance["score"] += 2
+    if acceptance["gates"].get("J7"): acceptance["score"] += 1
+    if acceptance["gates"].get("J9"): acceptance["score"] += 1
+
+    acceptance["final_verdict"] = "PASS" if not failed else "FAIL"
     
     if r2 and r2["success"]:
         acceptance["score"] += 1; acceptance["gates"]["J5"] = True
@@ -1264,13 +1306,13 @@ def verify_j_strict():
     else:
          # Check attribution (errors should contain "Adapter Check Failed")
          errs = r_fail_b.get("errors", [])
-         if not any("Adapter Check Failed" in e for e in errs):
-             # Also allow old style if we fall back? No, task 2 requires attribution.
-             # Wait, our Fast Fail B implementation returns "Adapter Check Failed..."
-             print(f"J9-B Warning: Failure not attributed to adapter check? Errs: {errs}", file=sys.stderr)
-             # But if it failed, it's good for now. Strict check:
-             if not any("Adapter" in e for e in errs):
-                 j9_ok = False; print("J9-B Failed: Failure not attributed to Adapter", file=sys.stderr)
+         # Strict check: Must match specific error path
+         if any("Adapter Check Failed" in e for e in errs) and any("MISSING_ADAPTER" in e for e in errs):
+             # J2 Passed because fail_b behavior is correct
+             acceptance["gates"]["J2"] = True
+             acceptance["score"] += 1
+         else:
+             j9_ok = False; print(f"J9-B Failed: Failure not attributed to Adapter. Errs: {errs}", file=sys.stderr)
         
     if j9_ok:
         acceptance["gates"]["J9"] = True # No points in strict spec? 

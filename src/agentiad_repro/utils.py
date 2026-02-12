@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 try:
     import yaml
 except ImportError:
-    raise RuntimeError("PyYAML missing. Install: python -m pip install pyyaml (or conda install pyyaml)")
+    raise RuntimeError("PyYAML missing. Install: python3 -m pip install pyyaml (or conda install pyyaml)")
 
 
 @dataclass(frozen=True)
