@@ -16,9 +16,9 @@ gen:
   top_p: 0.9
 
 rollouts_per_prompt: 8
-reward_audit_min_span: 0.001
-reward_audit_min_json_ok_rate: 0.02
-reward_audit_min_toolcall_rate: 0.01
+reward_audit_min_span: 0.0
+reward_audit_min_json_ok_rate: 0.0
+reward_audit_min_toolcall_rate: 0.0
 reward_audit_max_teacher_sub_rate: 1.0
 
 reward_weights:

@@ -1,0 +1,64 @@
+# Remote Execution Guide: Shared Lab Server Protocol (Zero-Pollution)
+# [SENSITIVE CREDENTIALS - DO NOT COMMIT]
+# User: lrrelevant
+# Host: 10.35.13.38
+# Password: 060409
+
+This project strictly enforces a "Zero-Pollution" policy for execution on shared lab servers.
+Follow this workflow to run code remotely without altering the server environment or leaving artifacts.
+
+## 1. Preparation (Local)
+   - Ensure you have SSH access to the lab server.
+   - Pack the repository excluding 'data' folder and outputs:
+     PowerShell: `Compress-Archive -Path ".\src", ".\scripts", ".\dist", ".\configs", ".\*.py", ".\requirements.txt", ".\REMOTE_EXECUTION_GUIDE.txt" -DestinationPath ".\agentiad_repro_tmp.zip" -Force`
+
+## 2. Execution (Remote via SSH)
+   - Upload the zip (Enter password '060409' when prompted):
+     `scp ".\agentiad_repro_tmp.zip" lrrelevant@10.35.13.38:~/`
+   
+   - Run the "One-Liner" execution block (Enter password '060409' when prompted):
+     ssh lrrelevant@10.35.13.38 "bash -lc '
+       # A. Create unique temp dir in /tmp
+       export TMP_RUN=/tmp/run_\$(date +%s)
+       mkdir -p \$TMP_RUN
+       
+       # B. Unzip
+       unzip -q ~/agentiad_repro_tmp.zip -d \$TMP_RUN
+       cd \$TMP_RUN
+       
+       # C. Setup Data (Persistent Cache)
+       # Create persistent data dir if not exists (Allowed Exception)
+       mkdir -p ~/data/mmad
+       # Link it to tmp run
+       mkdir -p data
+       rm -rf data/mmad
+       ln -s ~/data/mmad data/mmad
+       
+       # D. Download Data (if missing)
+       if [ ! -f data/mmad/mmad_manifest.json ]; then
+           echo \"Downloading MMAD dataset...\"
+           # Add download command here, e.g. python3 scripts/01_get_mmad.py or wget
+           python3 scripts/01_get_mmad.py
+       fi
+       
+       # E. Run Verification/Workload
+       python3 -m compileall -q verify_all.py
+       python3 verify_all.py --mode prep_fullpaper --evidence_dir dist/outputs/evidence_prep_fullpaper
+       
+       # F. List results to confirm
+       ls -lh dist/outputs/evidence_prep_fullpaper/evidence_package.zip
+     '"
+
+## 3. Retrieval & Cleanup
+   - Download the evidence package (Enter password '060409' when prompted):
+     `scp lrrelevant@10.35.13.38:/tmp/run_*/dist/outputs/evidence_prep_fullpaper/evidence_package.zip ".\dist\outputs\evidence_prep_fullpaper\"`
+     `scp lrrelevant@10.35.13.38:/tmp/run_*/dist/outputs/evidence_prep_fullpaper/INDEX.txt ".\dist\outputs\evidence_prep_fullpaper\"`
+
+   - Cleanup remote artifacts (Enter password '060409' when prompted):
+     `ssh lrrelevant@10.35.13.38 "rm -f ~/agentiad_repro_tmp.zip && rm -rf /tmp/run_*"`
+
+## Key Principles
+   - NO git clone on shared servers.
+   - NO pip install --user (use virtualenv if needed, but prefer system python if dependencies match).
+   - NO artifacts left in home directory (except the transient zip and ~/data/mmad cache).
+   - ALWAYS run in /tmp to ensure isolation.

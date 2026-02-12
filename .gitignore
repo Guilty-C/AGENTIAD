@@ -136,3 +136,19 @@ _zip_verify/
 *.pickle
 *.h5
 *.hdf5
+# ==== local heavy / derived (do not commit) ====
+.venv/
+.venv_hf/
+__pycache__/
+data/
+outputs/
+tmp_verification/
+debug_*/
+debug_*.*
+verify_log*.txt
+dist_run.stdout
+*.jsonl
+*.zip
+# ==== local notes / debug (do not commit) ====
+08_debug_rc.txt
+report.txt

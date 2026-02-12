@@ -1,0 +1,117 @@
+Mini-real（真实 MMAD 子集）验收标准（DoD / Gates）
+版本：Master Checklist v2.0 口径（路 B：Mini-real）
+
+────────────────────────────────────────────────────────
+0) Mini-real 的目标（验收一句话）
+[ ] 真数据 + 真工具信号接上，形成真实 toolcall/tool_result 分布
+[ ] has_toolcall_rate_excl_synth > 0 且稳定
+[ ] baseline vs agent vs SFT/GRPO 对照表可产出（同口径，可 join）
+
+────────────────────────────────────────────────────────
+1) 硬门禁 A：数据绑定必须“真且可复现”
+A1. 数据资产与清单
+[ ] 本地离线 MMAD 数据可用，且存在 mmad_manifest.json（或等价清单）
+    - 清单应包含：split / sample_id / 图像路径 / 标注路径 / 类别等
+
+A2. 子集绑定（Mini-real 的“真”靠这一步）
+[ ] 固定导出 Mini-real 子集：subset_seed + subset_size + ids.txt（样本 id 列表）
+[ ] 任何后续阶段（06/08/09/10/评测表）必须严格只用 ids.txt 指定的样本集合
+
+A3. 数据完整性哈希（可审计指纹）
+[ ] 记录 data_mmad_sha256（manifest 文件 sha256 或数据包 sha256）
+[ ] ACCEPTANCE_JSON.measurements 必须包含：subset_seed / subset_size / data_mmad_sha256
+
+────────────────────────────────────────────────────────
+2) 硬门禁 B：真工具信号（非注入、非摆拍）
+B1. Trace 结构必须可回放、可审计
+[ ] trace 必含：
+    - messages（含 tool_call 与 tool_result）
+    - final JSON（可解析）
+    - 指纹字段（见第 6 节）
+
+B2. Mini-real 特殊要求：tool_result 必来自真实工具产物
+[ ] trace 中 tool_result 必须来自真实工具执行结果（非合成注入）
+[ ] 需可区分 synth vs real（如存在合成注入机制，则必须统计 excl_synth）
+
+B3. 核心健康指标：has_toolcall_rate_excl_synth
+[ ] 在 L2/验收统计中必须输出 has_toolcall_rate_excl_synth
+[ ] 门禁：has_toolcall_rate_excl_synth > 0
+
+────────────────────────────────────────────────────────
+3) 硬门禁 C：必须产出“可对照”的表（同口径、可 join）
+（表的 schema 必须对齐，至少含 sample_id / gt / pred / 关键统计字段）
+
+C1. Baseline 表（L1）
+[ ] 产出 outputs/tables/L1_baseline.csv（或等价产物）
+[ ] schema 与 L2/L4/L5 可 join 对比（以 sample_id 为键）
+
+C2. Agent 表（L2）
+[ ] 产出 outputs/tables/L2_agent.csv（或等价产物）
+[ ] 必含 has_toolcall_rate_excl_synth（可写在汇总 JSON 或表附加列）
+
+C3. SFT 表（L4）
+[ ] 产出 outputs/tables/L4_sft.csv（或等价产物）
+[ ] sanity：final JSON 合法；toolcall 率不为 0（Mini-real 尤其关键）
+
+C4. GRPO 表（L5）
+[ ] 产出 outputs/tables/L5_grpo.csv（或等价产物）
+[ ] 产出四列对照汇总（同口径同 split）：
+    baseline / agent / sft / grpo
+
+────────────────────────────────────────────────────────
+4) 硬门禁 D：L3 轨迹（SFT 数据）必须可训练且“干净”
+D1. trajectories 字段齐全
+[ ] 每条 JSONL 轨迹包含：
+    - messages（含 tool_call + tool_result）
+    - final JSON
+    - 指纹字段（见第 6 节）
+    - sample_id（与 ids.txt 对齐）
+
+D2. Validate 强卡口（0 errors）
+[ ] JSONL 全量可解析
+[ ] final JSON 全量可解析
+[ ] 工具顺序合法（遵循项目定义的自动机规则，如 PZ→CR）
+[ ] 门禁：validate_errors == 0
+
+D3. 空信号阻断
+[ ] 若真实工具信号接近 0（excl_synth 口径），必须阻断进入 L4/L5
+
+────────────────────────────────────────────────────────
+5) 稳定性口径（Mini-real 的第二个灵魂）
+（建议实现为多 seed 验收，例如 seeds = [0,1,2]）
+
+[ ] 多 seed 运行 06→08→09（必要时再跑 SFT 推理）
+[ ] 对每个 seed 统计 has_toolcall_rate_excl_synth
+[ ] 门禁 1：min(rate_by_seed) > 0
+[ ] 门禁 2：stability_range = max(rate)-min(rate) 足够小（例如 ≤ 0.10）
+[ ] 同口径对照表可重复产出（哈希一致或差异可解释）
+
+────────────────────────────────────────────────────────
+6) 指纹/可审计要求（避免“我跑过了”变玄学）
+所有关键产物（trace/jsonl/csv/snapshot/summary）至少记录：
+[ ] model_id
+[ ] seed
+[ ] prompt_hash（或 prompt 版本/模板 hash）
+[ ] config_sha256
+[ ] script_sha256
+[ ] data_mmad_sha256（或 manifest hash）
+[ ] subset_seed / subset_size
+[ ] ids.txt 的 sha256（可选但强烈建议）
+
+────────────────────────────────────────────────────────
+7) 证据包卫生（Evidence Package Hygiene）
+对每个阶段（06/08/09/…）：
+[ ] evidence_dir 最终只能包含：INDEX.txt + evidence_package.zip
+[ ] INDEX.txt 必含 zip 内各文件 sha256（以及 zip 自身 sha256 行）
+[ ] zip 内必须包含：
+    - 执行脚本原件（用于自证）
+    - 关键输入（如 ids.txt / config / manifest 摘要）
+    - 关键输出（traces / jsonl / tables / summary）
+    - 运行日志（stdout/stderr 或等价日志）
+[ ] verify_evidence_package：zip 内容与 INDEX 记录一致，且磁盘 INDEX 与 zip 内 INDEX 一致
+
+────────────────────────────────────────────────────────
+8) 最终验收输出（建议）
+[ ] 统一输出 ACCEPTANCE_JSON（含 gates/measurements/score/failed_gates/remediations）
+[ ] 统一输出 overall verdict（PASS/FAIL）
+[ ] 若 FAIL：remediations 必须给出可操作的修复路径（缺啥、在哪、怎么补）
