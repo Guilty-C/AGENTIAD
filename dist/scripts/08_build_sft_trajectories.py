@@ -1,6 +1,3 @@
-# [REMOTE EXECUTION DETECTED? CHECK GUIDELINES]
-# This project enforces a strict "Zero-Pollution" remote execution protocol for shared lab servers.
-# See REMOTE_EXECUTION_GUIDE.txt for the mandatory "Upload -> Tmp Run -> Cleanup" workflow.
 
 from __future__ import annotations
 
@@ -17,6 +14,9 @@ import contextlib
 import io
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+
+# Import SSOT
+from agentiad_repro.paper_contract import PaperContract
 
 ACCEPT_L3_SPEC = {
     "total": 10,
@@ -277,7 +277,28 @@ def _run_sft_build(args) -> int:
             skipped_final += 1
             continue
 
-        final_obj2, final_text = _canon_final_json(final_obj)
+        # Convert to Paper Contract Format for SFT Training
+        # This ensures the model learns the schema defined in PaperContract.SYSTEM_PROMPT
+        anomaly_present = (final_obj.get("anomaly") == "yes")
+        
+        if not anomaly_present:
+            top_anomaly = "none"
+            visual_descriptions = []
+        else:
+            top_anomaly = str(final_obj.get("defect_type") or "unknown")
+            if top_anomaly == "none":
+                 top_anomaly = "unknown"
+            visual_descriptions = [f"Observed {top_anomaly} in the region."]
+
+        contract_obj = {
+            "anomaly_present": anomaly_present,
+            "top_anomaly": top_anomaly,
+            "visual_descriptions": visual_descriptions
+        }
+
+        final_obj2, final_text = _canon_final_json(contract_obj)
+        final_content = f"{PaperContract.TAG_ANSWER_START}\n{final_text}\n{PaperContract.TAG_ANSWER_END}"
+        
         turns_any = trace.get("turns") if isinstance(trace, dict) else None
         turns = turns_any if isinstance(turns_any, list) else []
 
@@ -297,6 +318,7 @@ def _run_sft_build(args) -> int:
             tool_result = t.get("tool_result")
 
             if name == "global":
+                # Ensure global prompt is the Contract System Prompt
                 messages.append(
                     {
                         "role": "user",
@@ -308,8 +330,25 @@ def _run_sft_build(args) -> int:
                 continue
 
             if name == "pz":
-                messages.append({"role": "assistant", "name": "pz", "tool_call": tool_call})
-                messages.append({"role": "tool", "name": "pz.crop_image_normalized", "content": {"call": tool_call, "result": tool_result}})
+                # Enforce Contract: Tool Name & Args
+                bbox = None
+                if isinstance(tool_call, dict) and "arguments" in tool_call:
+                    bbox = tool_call["arguments"].get("bbox_2d") or tool_call["arguments"].get("bbox") or tool_call["arguments"].get("bbox_norm")
+                
+                if not bbox and isinstance(tool_result, dict):
+                    bbox = tool_result.get("bbox_2d") or tool_result.get("bbox")
+                
+                if not bbox:
+                     bbox = [0.0, 0.0, 1.0, 1.0]
+                     print(f"WARNING: Synthesizing bbox for sample {sample_id}", file=sys.stderr)
+
+                contract_tool_call = {
+                    "name": "crop_image_normalized",
+                    "arguments": {"bbox_2d": bbox, "target_image": 1}
+                }
+                
+                messages.append({"role": "assistant", "name": "pz", "tool_call": contract_tool_call})
+                messages.append({"role": "tool", "name": "crop_image_normalized", "content": {"call": contract_tool_call, "result": tool_result}})
                 messages.append(
                     {
                         "role": "user",
@@ -321,16 +360,22 @@ def _run_sft_build(args) -> int:
                 continue
 
             if name == "cr":
+                # Enforce Contract: Tool Name & Args
+                contract_tool_call = {
+                    "name": "query_image",
+                    "arguments": {}
+                }
+                
                 cr_imgs = [{"kind": "crop", "path": _safe_rel(project_root, crop_path)}]
                 if ref_path.exists():
                     cr_imgs.append({"kind": "ref", "path": _safe_rel(project_root, ref_path)})
-                messages.append({"role": "assistant", "name": "cr", "tool_call": tool_call})
-                messages.append({"role": "tool", "name": "cr.query_image", "content": {"call": tool_call, "result": tool_result}})
+                messages.append({"role": "assistant", "name": "cr", "tool_call": contract_tool_call})
+                messages.append({"role": "tool", "name": "query_image", "content": {"call": contract_tool_call, "result": tool_result}})
                 messages.append({"role": "user", "name": "cr", "content": {"prompt": prompt, "images": cr_imgs}})
                 messages.append({"role": "assistant", "name": "cr", "content": raw})
                 continue
 
-        messages.append({"role": "assistant", "name": "final", "content": final_text})
+        messages.append({"role": "assistant", "name": "final", "content": final_content})
 
         item = {
             "schema_version": "sft_trajectory_v1",
@@ -618,8 +663,6 @@ def _run_acceptance_audit(args) -> int:
         # Before any mkdir/resolve that might touch disk
         try:
             # We try to get absolute path string without creating it
-            # Note: resolve() might follow symlinks but we mainly care about the string content
-            # If the path doesn't exist, resolve() on Windows might still return absolute path
             p_temp = Path(raw_evidence_dir)
             if not p_temp.is_absolute():
                 p_temp = (Path.cwd() / p_temp)
@@ -886,11 +929,11 @@ def _run_acceptance_audit(args) -> int:
                 
                 def _is_pz(name: str) -> bool:
                     name = name.lower()
-                    return "pz" in name or "phase" in name
+                    return "pz" in name or "phase" in name or "crop" in name
                     
                 def _is_cr(name: str) -> bool:
                     name = name.lower()
-                    return "cr" in name or "check" in name
+                    return "cr" in name or "check" in name or "query" in name
                 
                 for it in items:
                     msgs = it.get("messages", [])

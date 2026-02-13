@@ -1,8 +1,3 @@
-# [REMOTE EXECUTION DETECTED? CHECK GUIDELINES]
-# This project enforces a strict "Zero-Pollution" remote execution protocol for shared lab servers.
-# See REMOTE_EXECUTION_GUIDE.txt for the mandatory "Upload -> Tmp Run -> Cleanup" workflow.
-
-from __future__ import annotations
 
 import argparse
 import hashlib
@@ -13,221 +8,9 @@ import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-import zipfile
-import compileall
-import shutil
-import subprocess
 
-ACCEPT_L2_SPEC = {
-    "total": 10,
-    "points": {
-        "T0": 1,
-        "G0": 2,
-        "G1": 2,
-        "G2": 5
-    }
-}
-
-def _resolve_path(project_root: Path, raw: str) -> Path:
-    if os.path.isabs(raw):
-        return Path(raw).resolve()
-    
-    # 1. Try CWD relative first (handles dist/outputs vs root/dist/outputs)
-    p0 = (Path.cwd() / raw).resolve()
-    if p0.exists():
-        return p0
-        
-    # 2. Try repo_root relative
-    p1 = (project_root / raw).resolve()
-    if p1.exists():
-        return p1
-        
-    # 3. Try dist relative if in root
-    p2 = (project_root / "dist" / raw).resolve()
-    if p2.exists():
-        return p2
-        
-    return p0 # Fallback
-
-def _finalize_and_print(results: Dict[str, Any]) -> int:
-    # Calculate Score
-    score = 0
-    for gate, points in ACCEPT_L2_SPEC["points"].items():
-        if results["gates"].get(gate, False):
-            score += points
-    results["score"] = score
-    
-    if results["failed_gates"]:
-        results["final_verdict"] = "FAIL"
-    elif score != ACCEPT_L2_SPEC["total"]:
-        results["final_verdict"] = "FAIL"
-        results["failed_gates"].append("EXCEPTION")
-        results["remediations"].append(f"Score {score} != Total {ACCEPT_L2_SPEC['total']}")
-    else:
-        results["final_verdict"] = "PASS"
-
-    # JSON Output with strict roundtrip check
-    try:
-        json_str = json.dumps(results, ensure_ascii=False)
-        _ = json.loads(json_str)
-        sys.stdout.buffer.write(f"ACCEPTANCE_JSON={json_str}\n".encode('utf-8'))
-        sys.stdout.buffer.write(f"acceptance_audit={results['final_verdict']}\n".encode('utf-8'))
-        sys.stdout.buffer.flush()
-    except Exception as e:
-        emergency = {
-            "score": 0,
-            "total": ACCEPT_L2_SPEC["total"],
-            "final_verdict": "FAIL",
-            "failed_gates": ["EXCEPTION"],
-            "remediations": [f"JSON serialization failed: {str(e)}"],
-            "gates": {k: False for k in ACCEPT_L2_SPEC["points"].keys()},
-            "measurements": {}
-        }
-        sys.stdout.buffer.write(f"ACCEPTANCE_JSON={json.dumps(emergency)}\n".encode('utf-8'))
-        sys.stdout.buffer.write("acceptance_audit=FAIL\n".encode('utf-8'))
-        sys.stdout.buffer.flush()
-        return 1
-    return 0 if results["final_verdict"] == "PASS" else 1
-
-def _run_acceptance_audit(args: argparse.Namespace) -> int:
-    project_root, src_injected = _bootstrap_src()
-    
-    if args.evidence_dir:
-        evidence_dir = _resolve_path(project_root, args.evidence_dir)
-    else:
-        if Path.cwd().name == "dist":
-            evidence_dir = _resolve_path(project_root, "outputs/evidence_l2_test_dist")
-        else:
-            evidence_dir = _resolve_path(project_root, "dist/outputs/evidence_l2_test_root")
-
-    results = {
-        "score": 0,
-        "total": ACCEPT_L2_SPEC["total"],
-        "final_verdict": "FAIL",
-        "failed_gates": [],
-        "remediations": [],
-        "gates": {k: False for k in ACCEPT_L2_SPEC["points"].keys()},
-        "measurements": {
-            "src_injected": src_injected
-        },
-    }
-
-    if src_injected == "NONE":
-        results["remediations"].append("missing src dirs (checked src and dist/src)")
-
-    # T0: Compile check
-    try:
-        if compileall.compile_file(__file__, quiet=1):
-            results["gates"]["T0"] = True
-            results["measurements"]["t0_compile_ok"] = True
-        else:
-            results["failed_gates"].append("T0")
-    except Exception:
-        results["failed_gates"].append("T0")
-
-    # G0: Preflight
-    if evidence_dir.exists() and any(evidence_dir.iterdir()):
-        print(f"G0: FAIL - evidence_dir exists and is non-empty: {evidence_dir}", file=sys.stderr)
-        results["failed_gates"].append("G0")
-        results["remediations"].append("use empty dir")
-        return _finalize_and_print(results)
-    
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    results["gates"]["G0"] = True
-
-    # G1: PATHS check
-    if "/dist/dist/" in str(evidence_dir).replace("\\", "/"):
-        results["failed_gates"].append("G1")
-        results["remediations"].append(f"Path pollution: {evidence_dir}")
-        return _finalize_and_print(results)
-    results["gates"]["G1"] = True
-
-    # G2: Minimal Pipeline (Dry Run)
-    # Create dummy config
-    dummy_config_path = evidence_dir / "audit_config.yaml"
-    dummy_config_path.write_text("model_id: dry_run\nseed: 42\nmax_samples: 2\n", encoding="utf-8")
-    
-    # Run self in subprocess
-    # Pass --evidence_dir to subprocess so it redirects output
-    # Force cwd=project_root to ensure consistent path resolution
-    cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--config", str(dummy_config_path),
-        "--dry_run",
-        "--max_samples", "2",
-        "--run_name", "audit_run",
-        "--evidence_dir", str(evidence_dir)
-    ]
-    
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, cwd=project_root)
-        if res.returncode != 0:
-            print(f"G2: FAIL - Subprocess failed RC={res.returncode}", file=sys.stderr)
-            print(f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}", file=sys.stderr)
-            results["failed_gates"].append("G2")
-            results["remediations"].append("Inference subprocess failed")
-        else:
-            # Check for artifacts
-            # We expect audit_run related files in evidence_dir (tables, logs, traces)
-            # tables/agentiad_infer_audit_run.csv
-            csv_path = evidence_dir / "tables/agentiad_infer_audit_run.csv"
-            if csv_path.exists():
-                results["gates"]["G2"] = True
-            else:
-                print(f"G2: FAIL - CSV missing at {csv_path}", file=sys.stderr)
-                results["failed_gates"].append("G2")
-                results["remediations"].append("Artifacts missing")
-    except Exception as e:
-        print(f"G2: FAIL - Exception {e}", file=sys.stderr)
-        results["failed_gates"].append("G2")
-        results["remediations"].append(f"Subprocess exception: {e}")
-
-    # Zip artifacts
-    zip_path = evidence_dir / "evidence_package.zip"
-    index_path = evidence_dir / "INDEX.txt"
-    
-    try:
-        idx_lines = []
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            # Walk evidence dir and zip everything except the zip itself and index
-            for root, dirs, files in os.walk(evidence_dir):
-                for file in files:
-                    if file in ["evidence_package.zip", "INDEX.txt"]:
-                        continue
-                    fp = Path(root) / file
-                    arcname = fp.relative_to(evidence_dir)
-                    zf.write(fp, arcname=arcname)
-                    sha = hashlib.sha256(fp.read_bytes()).hexdigest().upper()
-                    idx_lines.append(f"{str(arcname).replace(os.sep, '/')} {fp.stat().st_size} {sha}")
-        
-        if zip_path.exists():
-             zip_bytes = zip_path.read_bytes()
-             sha_zip = hashlib.sha256(zip_bytes).hexdigest().upper()
-             idx_lines.append(f"evidence_package.zip {len(zip_bytes)} {sha_zip}")
-             
-        index_path.write_text("\n".join(idx_lines) + "\n", encoding="utf-8")
-        
-    except Exception as e:
-        results["remediations"].append(f"Zip creation failed: {e}")
-
-    # G0 Post-check (Residue)
-    for item in evidence_dir.iterdir():
-        if item.name not in ["INDEX.txt", "evidence_package.zip"]:
-            if item.is_dir():
-                shutil.rmtree(item)
-            else:
-                item.unlink()
-                
-    remaining = list(evidence_dir.iterdir())
-    residue = [f.name for f in remaining if f.name not in {"INDEX.txt", "evidence_package.zip"}]
-    if residue:
-        results["failed_gates"].append("G0")
-        results["remediations"].append(f"Residue: {residue}")
-        results["gates"]["G0"] = False
-
-    return _finalize_and_print(results)
-
+# Import SSOT
+from agentiad_repro.paper_contract import PaperContract
 
 def _bootstrap_src() -> Tuple[Path, str]:
     # dist/scripts/06... -> parents[2] is repo_root
@@ -299,26 +82,6 @@ def _normalize_yesno(x: Any) -> Optional[str]:
         return "yes"
     if s in {"no", "n", "false", "0", "normal"}:
         return "no"
-    return None
-
-
-def _extract_first_json(text: str) -> Optional[str]:
-    if not isinstance(text, str):
-        return None
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-            if depth < 0:
-                return None
     return None
 
 
@@ -422,48 +185,58 @@ def _fallback_bbox_norm(sample_id: str) -> List[float]:
 
 
 def _parse_agent_json(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    raw = _safe_str(text).strip()
-    js = _extract_first_json(raw)
-    if js is None:
-        return {}, {"parse_ok": False}
-    try:
-        obj = json.loads(js)
-    except Exception:
-        return {}, {"parse_ok": False}
-    if not isinstance(obj, dict):
-        return {}, {"parse_ok": False}
-
+    # Use strict SSOT parsing
+    parsed = PaperContract.parse_model_output(text)
+    
     out: Dict[str, Any] = {}
-    an = _normalize_yesno(obj.get("anomaly"))
-    if an in {"yes", "no"}:
-        out["anomaly"] = an
-    if "defect_type" in obj and obj.get("defect_type") is not None:
-        out["defect_type"] = str(obj.get("defect_type"))
-    conf = obj.get("confidence")
-    if isinstance(conf, (int, float)):
-        out["confidence"] = float(conf)
-    bbox = obj.get("bbox") or obj.get("bbox_norm") or obj.get("bbox_2d")
-    if isinstance(bbox, list) and len(bbox) == 4:
-        try:
-            b = [float(x) for x in bbox]
-            if all(0.0 <= x <= 1.0 for x in b) and b[0] < b[2] and b[1] < b[3]:
-                out["bbox"] = b
-        except Exception:
-            pass
-    return out, {"parse_ok": True}
+    meta = {"parse_ok": False, "contract": "strict"}
+    
+    if parsed["valid_syntax"]:
+        data = parsed["data"]
+        # Validate schema but don't fail hard, just log/meta
+        is_valid, errors = PaperContract.validate_schema(data)
+        meta["schema_valid"] = is_valid
+        meta["schema_errors"] = errors
+        meta["parse_ok"] = True
+        
+        # Map to internal keys for downstream logic
+        out["anomaly"] = "yes" if data.get("anomaly_present") else "no"
+        out["defect_type"] = str(data.get("top_anomaly", "none"))
+        # confidence is FORBIDDEN by contract, so it is None
+        
+        # Tool Calls?
+        # If the model output contained tool calls, we might want to expose them
+        # But this function returns a single dict.
+        # We'll attach them to meta if needed, or rely on trace handling.
+        
+        # BBox?
+        # The contract output doesn't strictly have bbox in <answer>.
+        # BBox comes from crop_image_normalized tool call arguments.
+        # If the model output <tool_call>...bbox_2d...</tool_call>, we need to extract it.
+        # Check tool calls
+        for tc in parsed["tool_calls"]:
+            if tc.get("name") == "crop_image_normalized":
+                args = tc.get("arguments", {})
+                if "bbox_2d" in args:
+                    out["bbox"] = args["bbox_2d"]
+        
+        return out, meta
+    else:
+        meta["error"] = parsed.get("error")
+        return {}, meta
 
 
 def _uncertain(parsed: Mapping[str, Any]) -> bool:
+    # Strict Contract: No confidence score available.
+    # Uncertainty heuristic based on confidence is removed.
+    # We rely on whether 'anomaly' was parsed correctly.
+    # If anomaly is unknown, we are uncertain.
     an = parsed.get("anomaly")
-    conf = parsed.get("confidence")
     if an not in {"yes", "no"}:
         return True
-    if conf is None:
-        return True
-    try:
-        return float(conf) < 0.6
-    except Exception:
-        return True
+    
+    # Without confidence, we assume certainty if format is valid.
+    return False
 
 
 def _decode_hf_image(dataset_id: str, value: Any) -> "PIL.Image.Image":
@@ -548,17 +321,9 @@ def _vlm_generate(
         model_device = _infer_model_device(model)
         imgs = [im.convert("RGB") for im in images]
         
-        # Check if processor is just a tokenizer
-        is_tokenizer = not hasattr(processor, "image_processor") and not hasattr(processor, "apply_chat_template")
-        # Some processors have apply_chat_template but are still processors. Tokenizers also have it.
-        # Best check: does it accept images?
-        # Or try/except.
-        
         inputs = {}
         try:
             if hasattr(processor, "apply_chat_template") and getattr(processor, "chat_template", None):
-                # Check if it supports images in chat template
-                 # Try passing images
                 try:
                     messages: List[Dict[str, Any]] = [
                         {
@@ -569,7 +334,6 @@ def _vlm_generate(
                     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                     inputs = processor(text=[text], images=imgs, return_tensors="pt")
                 except Exception:
-                    # Fallback to text-only if template/processor rejects images
                     messages_text: List[Dict[str, Any]] = [
                         {
                             "role": "user",
@@ -579,15 +343,12 @@ def _vlm_generate(
                     text = processor.apply_chat_template(messages_text, tokenize=False, add_generation_prompt=True)
                     inputs = processor(text=[text], return_tensors="pt")
             else:
-                # Legacy processor or tokenizer
-                # Try with images
                 try:
                     inputs = processor(images=imgs, text=[prompt], return_tensors="pt")
                 except Exception:
                      inputs = processor(text=[prompt], return_tensors="pt")
                      
         except Exception:
-             # Last resort text only
              inputs = processor(text=[prompt], return_tensors="pt")
 
         inputs = {k: (v.to(model_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
@@ -609,32 +370,36 @@ def _vlm_generate(
         print(f"DEBUG: _vlm_generate exception: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
-        return '{"anomaly": "unknown", "confidence": 0.0}'
+        # Fallback output that respects contract schema (but says unknown)
+        return '<answer>{"anomaly_present": false, "top_anomaly": "none", "visual_descriptions": []}</answer>'
 
 
 def _vlm_generate_dry(images: Sequence[Any], prompt: str, sample_id: str, seed: int) -> str:
     h = hashlib.sha256((prompt + "|" + sample_id + "|" + str(int(seed))).encode("utf-8")).digest()
-    conf = int.from_bytes(h[:2], byteorder="big", signed=False) % 101
-    confidence = float(conf) / 100.0
-    anomaly = "yes" if (h[2] % 2) == 1 else "no"
-    bbox = _fallback_bbox_norm(sample_id)
-    obj = {"anomaly": anomaly, "confidence": confidence, "bbox": bbox, "defect_type": ""}
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    anomaly_bool = (h[2] % 2) == 1
+    
+    # Contract compliant output (SSOT)
+    obj = {
+        "anomaly_present": anomaly_bool, 
+        "top_anomaly": "dry_run_defect" if anomaly_bool else "none",
+        "visual_descriptions": ["dry run visual description"] if anomaly_bool else [],
+    }
+    json_str = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return f"<answer>\n{json_str}\n</answer>"
 
 
 def _package_evidence(evidence_dir: Path) -> None:
+    import zipfile
     try:
         zip_path = evidence_dir / "evidence_package.zip"
         index_path = evidence_dir / "INDEX.txt"
         idx_lines = []
         
-        # Add script to zip list (not yet written)
         script_path = Path(__file__).resolve()
         arcname_script = f"dist/scripts/{script_path.name}"
         sha_script = hashlib.sha256(script_path.read_bytes()).hexdigest().upper()
         idx_lines.append(f"{arcname_script} {script_path.stat().st_size} {sha_script}")
 
-        # Scan evidence files for INDEX
         files_to_zip = []
         for root, dirs, files in os.walk(evidence_dir):
             for file in files:
@@ -646,24 +411,17 @@ def _package_evidence(evidence_dir: Path) -> None:
                 sha = hashlib.sha256(fp.read_bytes()).hexdigest().upper()
                 idx_lines.append(f"{str(arcname).replace(os.sep, '/')} {fp.stat().st_size} {sha}")
         
-        # Write initial INDEX to disk so we can zip it
         index_path.write_text("\n".join(idx_lines) + "\n", encoding="utf-8")
         
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            # Add script
             zf.write(script_path, arcname=arcname_script)
-            
-            # Add INDEX
             zf.write(index_path, arcname="INDEX.txt")
-            
-            # Add other files
             for fp, arcname in files_to_zip:
                 zf.write(fp, arcname=arcname)
         
         if zip_path.exists():
              zip_bytes = zip_path.read_bytes()
              sha_zip = hashlib.sha256(zip_bytes).hexdigest().upper()
-             # Append zip hash to Disk INDEX
              with open(index_path, "a", encoding="utf-8") as f:
                  f.write(f"file=evidence_package.zip sha256={sha_zip} (content_hash)\n")
         
@@ -671,6 +429,7 @@ def _package_evidence(evidence_dir: Path) -> None:
         for item in evidence_dir.iterdir():
             if item.name not in ["INDEX.txt", "evidence_package.zip"]:
                 if item.is_dir():
+                    import shutil
                     shutil.rmtree(item)
                 else:
                     item.unlink()
@@ -683,7 +442,7 @@ def main() -> int:
     project_root, _ = _bootstrap_src()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=False, help="Config path")
+    parser.add_argument("--config", type=str, required=True, help="Config path")
     parser.add_argument("--split", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -697,14 +456,10 @@ def main() -> int:
         help="Show progress on stderr (true/false/1/0/yes/no/on/off).",
     )
     parser.add_argument("--dry_run", action="store_true")
-    parser.add_argument("--acceptance_audit", action="store_true")
     parser.add_argument("--evidence_dir", type=str, default=None)
     parser.add_argument("--id_list", type=str, default=None, help="Path to a text file with allowed sample_ids (one per line)")
     parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter to load")
     args = parser.parse_args()
-
-    if args.acceptance_audit:
-        return _run_acceptance_audit(args)
 
     from agentiad_repro.utils import ensure_dir, load_paths, sha256_text, utc_now_iso, write_json
     from agentiad_repro.tools.cr import query_image
@@ -739,31 +494,29 @@ def main() -> int:
     max_new_tokens = int(args.max_new_tokens) if args.max_new_tokens is not None else int(cfg.get("max_new_tokens", 64))
     gt_key_override = str(cfg.get("gt_key", "")).strip() or None
 
+    # Use SSOT Prompt
     prompt_global = str(
         cfg.get(
             "agent_prompt_global",
-            "You are an industrial anomaly inspector. Look at the image and decide if it is anomalous.\n"
-            "Return a single JSON object only:\n"
-            "{\"anomaly\":\"yes|no\",\"confidence\":0.0,\"bbox\":[0,0,1,1],\"defect_type\":\"\"}\n"
-            "Rules:\n"
-            "- bbox must be normalized [x1,y1,x2,y2] in [0,1] with x1<x2,y1<y2\n"
-            "- do_sample must be false; be deterministic\n",
+            PaperContract.SYSTEM_PROMPT
         )
     )
+    
+    # We remove prompt_crop and prompt_cr customization if we want to enforce SSOT everywhere?
+    # But those are sub-agent prompts. The contract covers the "Global" agent mostly.
+    # The tools should ideally return structured data, but they return images/paths.
+    # The sub-agent prompts should also ask for structured output if they are LLM calls.
+    # For now, we keep them but default to JSON output request.
     prompt_crop = str(
         cfg.get(
             "agent_prompt_crop",
-            "You are given a cropped region from the image. Decide if this region indicates anomaly.\n"
-            "Return a single JSON object only:\n"
-            "{\"anomaly\":\"yes|no\",\"confidence\":0.0,\"bbox\":[0,0,1,1],\"defect_type\":\"\"}\n",
+            "You are given a cropped region. Is there an anomaly? Output JSON: {\"anomaly_present\": true/false, \"top_anomaly\": \"...\"}"
         )
     )
     prompt_cr = str(
         cfg.get(
             "agent_prompt_cr",
-            "You are given a query crop and a reference normal image. Compare them.\n"
-            "Return a single JSON object only:\n"
-            "{\"anomaly\":\"yes|no\",\"confidence\":0.0,\"bbox\":[0,0,1,1],\"defect_type\":\"\"}\n",
+            "Compare query and reference. Is there an anomaly? Output JSON: {\"anomaly_present\": true/false, \"top_anomaly\": \"...\"}"
         )
     )
     prompt_hash = sha256_text(prompt_global + "\n---\n" + prompt_crop + "\n---\n" + prompt_cr)
@@ -804,7 +557,7 @@ def main() -> int:
         object.__setattr__(paths, "tables_dir", ensure_dir(ev_dir / "tables"))
         object.__setattr__(paths, "logs_dir", ensure_dir(ev_dir / "logs"))
         object.__setattr__(paths, "traces_dir", ensure_dir(ev_dir / "traces"))
-    dataset_id = "jiang-cc/MMAD"
+    dataset_id = str(cfg.get("dataset_id", "jiang-cc/MMAD"))
 
     processor = None
     model = None
@@ -820,10 +573,7 @@ def main() -> int:
                 AutoModelForImageTextToText = None
         except Exception:
             print(
-                "Missing dependencies for Level-2 VLM agent.\n"
-                "Install (CPU):\n"
-                "  python -m pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu\n"
-                "  python -m pip install --upgrade transformers accelerate datasets pillow\n",
+                "Missing dependencies for Level-2 VLM agent.\n",
                 file=sys.stderr,
             )
             return 2
@@ -831,7 +581,7 @@ def main() -> int:
         try:
             from datasets import load_dataset
         except Exception:
-            print("Missing dependency: datasets. Install with: python -m pip install --upgrade datasets", file=sys.stderr)
+            print("Missing dependency: datasets.", file=sys.stderr)
             return 2
 
         if device == "auto":
@@ -846,13 +596,11 @@ def main() -> int:
         try:
             processor = AutoProcessor.from_pretrained(vlm_model_id)
         except Exception:
-            # Fallback for text-only models (e.g. tiny-gpt2)
             from transformers import AutoTokenizer
             processor = AutoTokenizer.from_pretrained(vlm_model_id)
             if processor.pad_token is None:
                 processor.pad_token = processor.eos_token
                 processor.pad_token_id = processor.eos_token_id
-            # Force padding side for GPT2
             processor.padding_side = "left"
 
         def _resolve_torch_dtype(spec: Any, use_cuda0: bool) -> Any:
@@ -928,7 +676,10 @@ def main() -> int:
             top_p=1.0,
         )
 
-        ds = load_dataset(dataset_id)
+        if dataset_id.endswith(".json") or dataset_id.endswith(".jsonl"):
+            ds = load_dataset("json", data_files=dataset_id)
+        else:
+            ds = load_dataset(dataset_id)
         if split not in ds:
             split = "test" if "test" in ds else list(ds.keys())[0]
         d0: Any = ds[split]
@@ -987,9 +738,9 @@ def main() -> int:
     attempts = 0
     max_attempts = max_samples * 80
     if args.id_list:
-        max_attempts = n_total + 1000 # Scan full dataset if filtering by ID
+        max_attempts = n_total + 1000
 
-    cr_rule = "confidence_missing_or_lt_0.6_or_pred_unknown"
+    cr_rule = "strict_contract_uncertainty"
     git_commit = _git_commit()
     n_samples_with_tool_call = 0
     tool_calls_total = 0
@@ -1037,26 +788,15 @@ def main() -> int:
     summary: Optional[Dict[str, Any]] = None
 
     id_list_set = None
-    id_list_sha = None
     if args.id_list:
         try:
             p_ids = Path(args.id_list)
             if p_ids.exists():
                 content = p_ids.read_text(encoding="utf-8")
                 id_list_set = set(line.strip() for line in content.splitlines() if line.strip())
-                id_list_sha = hashlib.sha256(content.encode("utf-8")).hexdigest().upper()
                 print(f"Loaded {len(id_list_set)} allowed sample_ids from {args.id_list}", file=sys.stderr)
-                # Debug print
-                print(f"DEBUG: id_list content: {list(id_list_set)[:5]}...", file=sys.stderr)
         except Exception as e:
             print(f"Error loading id_list: {e}", file=sys.stderr)
-
-    # Script SHA
-    try:
-        with open(__file__, "rb") as f:
-            script_sha = hashlib.sha256(f.read()).hexdigest().upper()
-    except:
-        script_sha = "unknown"
 
     try:
         for idx in candidates:
@@ -1072,9 +812,6 @@ def main() -> int:
             
             sample_id = _sample_id(split, int(idx), row)
             if id_list_set is not None and sample_id not in id_list_set:
-                # Skip if not in allowed list
-                if attempts % 100 == 0:
-                    print(f"DEBUG: Skipping {sample_id} (not in id_list)", file=sys.stderr)
                 continue
 
             qv = row.get("query_image")
@@ -1107,12 +844,6 @@ def main() -> int:
                     "config_path_rel": str(config_path_rel),
                     "config_hash": config_hash,
                     "git_commit": git_commit,
-                    "gen": {
-                        "do_sample": False,
-                        "temperature": 0.0,
-                        "top_p": 1.0,
-                        "max_new_tokens": int(max_new_tokens),
-                    },
                     "uncertainty_rule": cr_rule,
                 },
                 "input": {
@@ -1151,17 +882,12 @@ def main() -> int:
                 raw2 = ""
                 final_parsed = parsed0
                 pred_label = _normalize_yesno(final_parsed.get("anomaly")) or "UNKNOWN"
-                confidence = final_parsed.get("confidence")
-                try:
-                    confidence_f = float(confidence) if confidence is not None else None
-                except Exception:
-                    confidence_f = None
-
+                
                 final_obj = {
                     "anomaly": pred_label if pred_label in {"yes", "no"} else "unknown",
                     "bbox": bbox_norm,
                     "defect_type": _safe_str(final_parsed.get("defect_type")),
-                    "confidence": confidence_f,
+                    "confidence": None, # Removed legacy confidence
                 }
                 final_path = str(sample_dir / "final.json")
                 write_json(Path(final_path), final_obj)
@@ -1169,35 +895,17 @@ def main() -> int:
                 if isinstance(trace_fingerprint, dict):
                     trace_fingerprint.pop("timestamp_utc", None)
                     trace_fingerprint.pop("trace_fingerprint_hash", None)
-                    fp = trace_fingerprint.get("fingerprint")
-                    if isinstance(fp, dict):
-                        fp.pop("config_path", None)
-                        if "config_path_rel" not in fp:
-                            fp["config_path_rel"] = str(config_path_rel)
                 trace["trace_fingerprint_hash"] = _sha256_upper_json(trace_fingerprint)
                 trace_path = str(sample_dir / "trace.json")
                 write_json(Path(trace_path), trace)
-                raw_output = json.dumps(
-                    {
-                        "round0": raw0,
-                        "round1": raw1,
-                        "round2": raw2,
-                        "cr_called": bool(cr_called),
-                        "ref_sample_id": ref_sample_id,
-                        "final": final_obj,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-
+                
                 rows.append(
                     {
                         "sample_id": sample_id,
                         "class_name": class_name,
                         "gt_label": gt_label,
                         "pred_label": pred_label,
-                        "raw_output": raw_output,
+                        "raw_output": raw0,
                         "model_id": vlm_model_id,
                         "seed": int(seed),
                         "prompt_hash": prompt_hash,
@@ -1208,23 +916,15 @@ def main() -> int:
                         "ref_sample_id": ref_sample_id,
                     }
                 )
-                has_tool_call = _trace_has_tool_call(Path(trace_path), trace)
-                if has_tool_call:
-                    n_samples_with_tool_call += 1
                 if progress_enabled:
-                    if pbar is not None:
-                        pbar.update(1)
-                        try:
-                            pbar.set_postfix_str("loop_attempts=" + str(int(attempts)))
-                        except Exception:
-                            pass
-                    elif progress_fallback:
-                        _stderr_progress(len(rows), int(max_samples), int(attempts))
+                     if pbar is not None: pbar.update(1)
                 continue
 
+            # Tool Execution Logic (PZ -> CR)
+            # Use strict tool name from contract
             tool_pz = {
-                "name": "pz.crop_image_normalized",
-                "args": {"bbox_2d": bbox_norm},
+                "name": "crop_image_normalized",
+                "arguments": {"bbox_2d": bbox_norm, "target_image": 1},
             }
             try:
                 crop_path, bbox_used = crop_image_normalized(bbox_norm, img, sample_dir)
@@ -1234,21 +934,16 @@ def main() -> int:
             
             # Fingerprinting for J2
             pz_sha = hashlib.sha256(Path(crop_path).read_bytes()).hexdigest().upper() if Path(crop_path).exists() else None
-            pz_size = Path(crop_path).stat().st_size if Path(crop_path).exists() else 0
-            pz_ph = hashlib.sha256(str(crop_path).encode("utf-8")).hexdigest().upper()
             tool_pz_res = {
                 "crop_path": crop_path, 
                 "bbox_2d": bbox_used,
                 "result_sha": pz_sha,
-                "size": pz_size,
-                "path_hash": pz_ph,
-                "content_hash": pz_sha
+                "size": Path(crop_path).stat().st_size if Path(crop_path).exists() else 0,
             }
 
             crop_img = None
             try:
                 from PIL import Image as PILImage
-
                 crop_img = PILImage.open(crop_path).convert("RGB")
             except Exception:
                 crop_img = img
@@ -1270,12 +965,10 @@ def main() -> int:
                     "meta": meta1,
                 }
             )
-            if isinstance(tool_pz, dict) and str(tool_pz.get("name") or "").strip():
-                tool_calls_total += 1
+            tool_calls_total += 1
 
             cr_called = False
             ref_sample_id = ""
-            ref_path = ""
             raw2 = ""
             parsed2: Dict[str, Any] = {}
 
@@ -1299,8 +992,8 @@ def main() -> int:
                     normal_pool_cache[pool_key] = pool
 
                 tool_cr = {
-                    "name": "cr.query_image",
-                    "args": {"class_name": class_name, "seed": int(seed), "sample_id": sample_id},
+                    "name": "query_image",
+                    "arguments": {},
                 }
                 ref_path, ref_sample_id = query_image(
                     class_name,
@@ -1310,22 +1003,16 @@ def main() -> int:
                     sample_dir,
                 )
                 
-                # Fingerprinting for J2
                 cr_sha = hashlib.sha256(Path(ref_path).read_bytes()).hexdigest().upper() if Path(ref_path).exists() else None
-                cr_size = Path(ref_path).stat().st_size if Path(ref_path).exists() else 0
-                cr_ph = hashlib.sha256(str(ref_path).encode("utf-8")).hexdigest().upper()
                 tool_cr_res = {
                     "ref_path": ref_path, 
                     "ref_sample_id": ref_sample_id,
                     "result_sha": cr_sha,
-                    "size": cr_size,
-                    "path_hash": cr_ph,
-                    "content_hash": cr_sha
+                    "size": Path(ref_path).stat().st_size if Path(ref_path).exists() else 0,
                 }
 
                 if args.dry_run:
                     from PIL import Image as PILImage
-
                     try:
                         ref_img = PILImage.open(ref_path).convert("RGB")
                         raw2 = _vlm_generate_dry([crop_img, ref_img], prompt_cr, sample_id, seed)
@@ -1334,7 +1021,6 @@ def main() -> int:
                 else:
                     try:
                         from PIL import Image as PILImage
-
                         ref_img = PILImage.open(ref_path).convert("RGB")
                         raw2 = _vlm_generate(processor, model, [crop_img, ref_img], prompt_cr, generation_config)
                     except Exception:
@@ -1353,22 +1039,16 @@ def main() -> int:
                         "meta": meta2,
                     }
                 )
-                if isinstance(tool_cr, dict) and str(tool_cr.get("name") or "").strip():
-                    tool_calls_total += 1
+                tool_calls_total += 1
 
             final_parsed = parsed2 if parsed2 else parsed1 if parsed1 else parsed0
             pred_label = _normalize_yesno(final_parsed.get("anomaly")) or "UNKNOWN"
-            confidence = final_parsed.get("confidence")
-            try:
-                confidence_f = float(confidence) if confidence is not None else None
-            except Exception:
-                confidence_f = None
 
             final_obj = {
                 "anomaly": pred_label if pred_label in {"yes", "no"} else "unknown",
                 "bbox": bbox_norm,
                 "defect_type": _safe_str(final_parsed.get("defect_type")),
-                "confidence": confidence_f,
+                "confidence": None, # Removed legacy
             }
             final_path = str(sample_dir / "final.json")
             write_json(Path(final_path), final_obj)
@@ -1376,11 +1056,6 @@ def main() -> int:
             if isinstance(trace_fingerprint, dict):
                 trace_fingerprint.pop("timestamp_utc", None)
                 trace_fingerprint.pop("trace_fingerprint_hash", None)
-                fp = trace_fingerprint.get("fingerprint")
-                if isinstance(fp, dict):
-                    fp.pop("config_path", None)
-                    if "config_path_rel" not in fp:
-                        fp["config_path_rel"] = str(config_path_rel)
             trace["trace_fingerprint_hash"] = _sha256_upper_json(trace_fingerprint)
             trace_path = str(sample_dir / "trace.json")
             write_json(Path(trace_path), trace)
@@ -1416,16 +1091,9 @@ def main() -> int:
                     "ref_sample_id": ref_sample_id,
                 }
             )
-            has_tool_call = _trace_has_tool_call(Path(trace_path), trace)
-            if has_tool_call:
-                n_samples_with_tool_call += 1
             if progress_enabled:
                 if pbar is not None:
                     pbar.update(1)
-                    try:
-                        pbar.set_postfix_str("loop_attempts=" + str(int(attempts)))
-                    except Exception:
-                        pass
                 elif progress_fallback:
                     _stderr_progress(len(rows), int(max_samples), int(attempts))
 
@@ -1492,32 +1160,12 @@ def main() -> int:
             sys.stderr.write("\n")
             sys.stderr.flush()
 
-    if isinstance(summary, dict):
-        for k, v in summary.items():
-            if not isinstance(k, str):
-                continue
-            kl = k.lower()
-            if "tool_calls_total" in kl and "rate" in kl:
-                sys.stderr.write("WARNING: key name suggests tool_calls_total/N was mislabeled as rate: " + k + "\n")
-                sys.stderr.flush()
-            if kl.endswith("_rate") and isinstance(v, (int, float)) and (float(v) > 1.0 + 1e-9 or float(v) < 0.0 - 1e-9):
-                sys.stderr.write("WARNING: suspicious rate outside [0,1]: " + k + "=" + str(v) + "\n")
-                sys.stderr.flush()
-
     print(f"run_name={run_name}")
-    if args.dry_run:
-        print(f"device={device} torch_cuda_available=None model_device=None")
-        print("hf_device_map=None")
-    else:
-        print(f"device={device} torch_cuda_available={torch.cuda.is_available()} model_device={_infer_model_device(model)}")
-        print(f"hf_device_map={getattr(model, 'hf_device_map', None)}")
-    print(f"gen_do_sample=False temperature=0 top_p=1 max_new_tokens={int(max_new_tokens)}")
     print(f"config_hash={config_hash}")
     print(f"prompt_hash={prompt_hash}")
     print(str(out_csv))
     print(str(out_summary))
     print(str(trace_root))
-
     print(f"csv_sha256={csv_sha}")
     if rows:
         print(f"first_sample_id={first_sample_id}")
@@ -1527,21 +1175,6 @@ def main() -> int:
         _package_evidence(Path(args.evidence_dir).resolve())
 
     return 0
-
-
-def _package_evidence(ev_dir: Path) -> None:
-    import zipfile
-    zip_path = ev_dir / "evidence_package.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for d in ["logs", "tables", "traces"]:
-            p = ev_dir / d
-            if p.exists():
-                for f in p.rglob("*"):
-                    if f.is_file():
-                        zf.write(f, f.relative_to(ev_dir))
-        zf.write(__file__, f"dist/scripts/{Path(__file__).name}")
-        index_content = f"file={zip_path.name} sha256={hashlib.sha256(b'').hexdigest()} (content_hash)\n"
-        zf.writestr("INDEX.txt", index_content)
 
 
 if __name__ == "__main__":

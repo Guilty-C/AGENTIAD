@@ -14,6 +14,7 @@ import argparse
 import time
 from pathlib import Path
 import pathlib
+import re
 
 # Paths
 PROJECT_ROOT = Path(__file__).parent.resolve()
@@ -45,6 +46,13 @@ class Timer:
             self.measurements[self.key] = round(self.duration, 2)
 
 def get_file_sha256(p):
+    """
+    Compute SHA256 of a file.
+    
+    Self-hash policy:
+    The EXPECTED_SHA_VERIFY_ALL line is stripped to allow deterministic self-verification.
+    This does NOT affect hashing of any other file.
+    """
     if p.name == "verify_all.py":
         with open(p, "rb") as f:
             lines = f.readlines()
@@ -185,54 +193,6 @@ def verify_evidence_zip_optimized(zip_path, script_name, expected_trace_count=No
             
     return True, "OK", t.duration
 
-def prepare_clean_room(dest, measurements=None):
-    with Timer("Clean Room Prep", measurements, "clean_room_prep_sec"):
-        if dest.exists():
-            # Use shell rmdir for speed/permission on Windows?
-            # Or just ignore if exists? No, clean room must be clean.
-            # But "ensure empty" is better than full delete if possible.
-            # For simplicity, delete.
-            # Optimization: If we use junctions, maybe we don't need to delete `data`?
-            # But we should be safe.
-            shutil.rmtree(dest)
-        dest.mkdir(parents=True, exist_ok=True)
-        
-        # Copy core files ONLY (Task A)
-        # Avoid copying entire dist/ which includes outputs
-        (dest / "dist/scripts").mkdir(parents=True, exist_ok=True)
-        shutil.copytree(PROJECT_ROOT / "dist/scripts", dest / "dist/scripts", dirs_exist_ok=True)
-        
-        if (PROJECT_ROOT / "dist/configs").exists():
-            (dest / "dist/configs").mkdir(parents=True, exist_ok=True)
-            shutil.copytree(PROJECT_ROOT / "dist/configs", dest / "dist/configs", dirs_exist_ok=True)
-            
-        shutil.copytree(PROJECT_ROOT / "src", dest / "src")
-        shutil.copy(VERIFY_SCRIPT, dest / "verify_all.py")
-        
-        # Ensure outputs dir is empty
-        (dest / "dist/outputs").mkdir(parents=True, exist_ok=True)
-        
-        # Symlink Data (Optimization A)
-        data_src = PROJECT_ROOT / "data"
-        data_dst = dest / "data"
-        if os.name == "nt":
-            cmd = ["cmd", "/c", "mklink", "/J", str(data_dst), str(data_src)]
-            res = subprocess.run(cmd, capture_output=True, shell=True)
-            if res.returncode != 0:
-                print(f"[CleanRoom] Junction failed, fallback copy. Err: {res.stderr.decode()}", file=sys.stderr)
-                shutil.copytree(data_src, data_dst)
-            else:
-                print("[CleanRoom] Data Junction created.", file=sys.stderr)
-        else:
-            os.symlink(data_src, data_dst)
-            
-        # Verify Manifest Existence (Task A)
-        manifest_path = data_dst / "mmad/mmad_manifest.json"
-        if not manifest_path.exists():
-             print(f"[CleanRoom] FATAL: Manifest not found at {manifest_path}", file=sys.stderr)
-             # We should probably raise error or exit, but prepare_clean_room is void.
-             # Strict J requires FAIL.
-             raise RuntimeError(f"Clean Room Data Link Failed: Missing {manifest_path}")
 
 def run_workload(args):
     work_dir = Path(args.output_dir).resolve()
@@ -660,7 +620,7 @@ def run_workload(args):
         if not valid_ids:
             # Should not happen if probe_ok is True, but defensive
             result["success"] = False; result["errors"].append("No valid IDs found from probe run (ids.txt empty)"); return result
-
+        
         (work_dir / "ids.txt").write_text("\n".join(valid_ids), encoding="utf-8")
         result["artifacts"]["ids_sha256"] = hashlib.sha256("\n".join(valid_ids).encode()).hexdigest()
 
@@ -1099,12 +1059,53 @@ def prepare_clean_room(tmp_repo, measurements):
                 shutil.copytree(src, dst, dirs_exist_ok=True)
         
         copy_tree(PROJECT_ROOT / "src", tmp_repo / "src")
-        copy_tree(PROJECT_ROOT / "dist", tmp_repo / "dist")
+        
+        # Copy dist/scripts and dist/configs explicitly, avoiding dist/outputs
+        copy_tree(PROJECT_ROOT / "dist/scripts", tmp_repo / "dist/scripts")
+        copy_tree(PROJECT_ROOT / "dist/configs", tmp_repo / "dist/configs")
         
         # Create execution marker for J0
         (tmp_repo / ".clean_room_marker").touch()
 
-def verify_j_strict():
+def compute_score(gates):
+    """
+    Deterministic scoring function.
+    Total Score: 10
+    """
+    score = 0
+    failed_gates = []
+    
+    # Weights definition
+    weights = {
+        "J0": 1,
+        "J1": 2,
+        "J2": 1,
+        "J3": 1,
+        "J5": 1,
+        "J6": 2,
+        "J7": 1,
+        "J9": 1
+    }
+    
+    # Calculate score based on standard gates
+    for gate, weight in weights.items():
+        if gates.get(gate):
+            score += weight
+        else:
+            # Only mark as failed if explicitly False or missing (if we expect it)
+            # Actually, if it's missing it defaults to False/0 points.
+            # We should check if we attempted the gate.
+            # But for strict_j, we run all.
+            failed_gates.append(gate)
+            
+    # Check JC_contract_runtime (0 points, but affects verdict)
+    if "JC_contract_runtime" in gates and not gates["JC_contract_runtime"]:
+        failed_gates.append("JC_contract_runtime")
+        
+    final_verdict = "PASS" if not failed_gates else "FAIL"
+    return score, sorted(failed_gates), final_verdict
+
+def _verify_j_strict_core(args):
     print("Running Case J-STRICT_MINIREAL (Optimized)...", file=sys.stderr)
     
     measurements = {
@@ -1129,8 +1130,15 @@ def verify_j_strict():
         cmd = [sys.executable, "verify_all.py", "--mode", "workload", "--output-dir", name]
         if "seeds" in kwargs:
             for s in kwargs["seeds"]: cmd.extend(["--seed", str(s)])
-        if "max_samples" in kwargs:
-            cmd.extend(["--max-samples", str(kwargs["max_samples"])])
+        
+        # Priority: kwargs > args.max_samples
+        ms = kwargs.get("max_samples")
+        if ms is None and args.max_samples is not None:
+            ms = args.max_samples
+            
+        if ms is not None:
+            cmd.extend(["--max-samples", str(ms)])
+
         if kwargs.get("allow_flags"): cmd.append("--allow-flags")
         if kwargs.get("no_adapter"): cmd.append("--no-adapter")
         if kwargs.get("sentinel_ref"):
@@ -1169,6 +1177,138 @@ def verify_j_strict():
             if str(p_tmp).lower() not in str(p_exec).lower():
                  r1["success"] = False
                  r1["errors"].append(f"J0 Fail: Execution path {exec_path} not in {tmp_repo}")
+
+    # ---------------------------------------------------------
+    # Task A: Audit-Grade Validation (Strict Reuse)
+    # ---------------------------------------------------------
+    if r1 and r1.get("success", False):
+        print("[Strict] Running Audit-Grade Validators on Run1...", file=sys.stderr)
+        
+        # Ensure Contract is available FROM CLEAN ROOM (tmp_repo/src)
+        clean_src = tmp_repo / "src"
+        if str(clean_src) not in sys.path:
+            sys.path.insert(0, str(clean_src))
+            
+        # Remove project root from path to be safe
+        if str(PROJECT_ROOT / "src") in sys.path:
+            sys.path.remove(str(PROJECT_ROOT / "src"))
+            
+        def hard_fail(label, reason, snippet=None):
+            print(f"FAIL: {reason} in {label}", file=sys.stderr)
+            s_trunc = ""
+            if snippet:
+                s_trunc = str(snippet)
+                if len(s_trunc) > 200: s_trunc = s_trunc[:200] + "..."
+                print(f"Snippet: {s_trunc}", file=sys.stderr)
+            
+            payload = {
+                "success": False,
+                "mode": "strict_j",
+                "failed_gate": reason,
+                "label": label,
+                "snippet": s_trunc
+            }
+            print(f"ACCEPTANCE_JSON={json.dumps(payload)}")
+            print("acceptance_audit=FAIL")
+            sys.exit(1)
+            
+        def soft_record(label, reason, snippet=None):
+            return f"Contract Violation in {label}: {reason}"
+
+        def strict_fail(label, reason, snippet=None):
+            if args.strict_contract:
+                hard_fail(label, reason, snippet)
+            else:
+                # This function is used by callbacks that expect to fail immediately or raise.
+                # However, our refactored callers now expect strict_fail to behave like hard_fail if needed.
+                # But for soft mode, they need to append to contract_failures.
+                # To support existing callback signature, we must raise if we can't return.
+                # BUT, we want to avoid raising RuntimeError.
+                # Let's change the pattern: callers should pass a list to append to?
+                # Or we raise a special SoftFailure exception that we catch locally.
+                raise RuntimeError(soft_record(label, reason, snippet))
+
+        # Helper to run validation and catch soft failures
+        contract_failures = []
+        contract_available = False
+        PaperContract = None
+        
+        try:
+            from agentiad_repro.paper_contract import PaperContract
+            contract_available = True
+        except ImportError:
+             msg = "Import PaperContract failed"
+             if args.strict_contract:
+                 hard_fail("validator_import", msg, "Could not import PaperContract from clean room")
+             else:
+                 contract_available = False
+                 contract_failures.append(soft_record("validator_import", msg))
+
+        if contract_available:
+            # Iterate over seeds in Run1
+            run1_dir = tmp_repo / "run1"
+            for seed_dir in run1_dir.glob("seed_*"):
+                # 1. Validate Trace Raw Output (06)
+                ev_zip = seed_dir / "ev_06/evidence_package.zip"
+                if ev_zip.exists():
+                    try:
+                        with zipfile.ZipFile(ev_zip, "r") as zf:
+                            traces = [n for n in zf.namelist() if n.endswith("trace.json")]
+                            for tn in traces:
+                                try:
+                                    data = json.load(zf.open(tn))
+                                    validate_trace_raw_output(data, f"{seed_dir.name}/{tn}", strict_fail, PaperContract)
+                                except RuntimeError as e:
+                                    contract_failures.append(str(e))
+                    except Exception as e:
+                         if args.strict_contract:
+                             strict_fail(f"{seed_dir.name} Trace Zip", f"Exception processing zip: {e}")
+                         else:
+                             contract_failures.append(f"Exception processing zip {seed_dir.name}: {e}")
+
+                # 2. Validate SFT Messages (08/L3)
+                l3_jsonl = seed_dir / "l3.jsonl"
+                if l3_jsonl.exists():
+                    try:
+                        lines = l3_jsonl.read_text(encoding="utf-8").splitlines()
+                        for i, line in enumerate(lines):
+                            try:
+                                item = json.loads(line)
+                                validate_sft_messages(item, i, strict_fail, PaperContract)
+                            except json.JSONDecodeError:
+                                if args.strict_contract:
+                                    strict_fail(f"{seed_dir.name} SFT L{i}", "Invalid JSON")
+                                else:
+                                    contract_failures.append(f"Invalid JSON in {seed_dir.name} SFT L{i}")
+                            except RuntimeError as e:
+                                contract_failures.append(str(e))
+                    except Exception as e:
+                        if args.strict_contract:
+                            strict_fail(f"{seed_dir.name} SFT", f"Exception processing jsonl: {e}")
+                        else:
+                            contract_failures.append(f"Exception processing jsonl {seed_dir.name}: {e}")
+
+        # Gate Logic
+        if not contract_failures:
+            # We need to initialize 'acceptance' if we want to modify it, or wait until after r1 processing?
+            # Actually, r1 IS the result dict for now. We should modify r1 or defer.
+            # However, standard flow constructs 'acceptance' from r1 later.
+            # We'll attach these to r1 for now, and then ensure they propagate.
+            r1["gates"] = r1.get("gates", {})
+            r1["gates"]["JC_contract_runtime"] = True
+        else:
+            r1["gates"] = r1.get("gates", {})
+            r1["gates"]["JC_contract_runtime"] = False
+            r1["errors"] = r1.get("errors", [])
+            
+            # Summarize errors (limit to first 5 unique)
+            unique_errs = sorted(list(set(contract_failures)))
+            r1["errors"].extend([f"[Contract] {e}" for e in unique_errs[:5]])
+            if len(unique_errs) > 5:
+                r1["errors"].append(f"... and {len(unique_errs)-5} more contract violations.")
+
+
+
     
     # Run 2: Sentinel Determinism (pass run1 path relative to tmp_repo)
     r2 = run_inner("run2", timer_key="run2_duration_sec", seeds=[0], sentinel_ref="run1")
@@ -1184,150 +1324,125 @@ def verify_j_strict():
             
     total_timer.__exit__(None, None, None)
     
+    # ---------------------------------------------------------
+    # Final Aggregation & Scoring
+    # ---------------------------------------------------------
     acceptance = {
         "total": 10,
         "score": 0,
         "final_verdict": "FAIL",
         "failed_gates": [],
         "gates": {},
-        "measurements": measurements
+        "measurements": measurements,
+        "errors": []
     }
     
-    failed = False
+    # Aggregate errors
+    for r in [r1, r2, r_fail_a, r_fail_b]:
+        if r and "errors" in r:
+            acceptance["errors"].extend(r["errors"])
+            
+    # Deduplicate errors
+    acceptance["errors"] = sorted(list(set(acceptance["errors"])))
     
+    # Propagate JC_contract_runtime from Run1
+    if r1 and "gates" in r1 and "JC_contract_runtime" in r1["gates"]:
+        acceptance["gates"]["JC_contract_runtime"] = r1["gates"]["JC_contract_runtime"]
+    
+    # J0: Clean Room & Execution Path
+    # r1["success"] check implies J0 check passed in run_inner + execution path check
     if r1 and r1.get("success", False):
-        acceptance["score"] += 1; acceptance["gates"]["J0"] = True
-    elif r1 and not r1.get("success", False) and not any("J0 Fail" in e for e in r1.get("errors", [])):
-        # If failure is NOT due to J0, we can say J0 passed (Clean Room verified)
-        # But J0 requires "run1 成功即算" in original text, but strict text says "verify execution path".
-        # We checked execution path above. If r1["errors"] doesn't contain "J0 Fail", then J0 is OK.
-        acceptance["score"] += 1; acceptance["gates"]["J0"] = True
-    else: failed = True; acceptance["failed_gates"].append("J0")
-    
-    # J1 Check: no allow flags used
+        acceptance["gates"]["J0"] = True
+    elif r1 and not any("J0 Fail" in e for e in r1.get("errors", [])):
+        # If success=False but not due to J0, we credit J0
+        acceptance["gates"]["J0"] = True
+    else:
+        acceptance["gates"]["J0"] = False
+
+    # J1: Allow Flags (Run1)
     if r1 and not r1["artifacts"].get("allow_flags_used"):
-        acceptance["score"] += 2; acceptance["gates"]["J1"] = True
-    else: failed = True; acceptance["failed_gates"].append("J1")
-    
-    if r1 and r1["gates"].get("J2"):
-        # J2 is already calculated in R1 for trace fingerprints
-        # But J2 also requires Fail-B check (above).
-        # We will keep J2 if R1 fingerprint is OK, but we might overwrite if Fail-B failed?
-        # Actually, strict requirement usually splits J2 into "Fingerprint" and "Adapter Check".
-        # Let's assume J2 in acceptance refers to Fingerprint (from R1).
-        # And Fail-B contributes to J9 or J2-Fail-Check.
-        # But wait, user prompt says: "将 J2 定义为 “fail_b 行为符合预期”"
-        # So we should OVERWRITE J2 based on Fail-B logic?
-        # Or combine? "Fingerprint OK AND Fail-B OK"?
-        # Let's combine:
-        # J2 = (R1 Fingerprint OK) AND (Fail-B Adapter Check OK)
-        # We already set J2=True if Fail-B check passed above.
-        # Let's AND it with R1 check.
-        if not (r1 and r1["gates"].get("J2")):
-             acceptance["gates"]["J2"] = False
-             if "J2" not in acceptance["failed_gates"]: acceptance["failed_gates"].append("J2")
-             # Adjust score if we deducted it
-             # But score calc logic is sequential.
-             # Let's rewrite J2 score logic here.
-             pass
-    else: 
-        # R1 J2 failed
-        acceptance["gates"]["J2"] = False
-        acceptance["failed_gates"].append("J2")
+        acceptance["gates"]["J1"] = True
+    else:
+        acceptance["gates"]["J1"] = False
+        
+    # J3: Evidence Completeness
+    if r1 and not any("J3 Fail" in e for e in r1.get("errors", [])) and not any("Missing zip" in e for e in r1.get("errors", [])):
+         acceptance["gates"]["J3"] = True
+    else:
+         acceptance["gates"]["J3"] = False
 
-    # Re-evaluate J2 Score
-    if acceptance["gates"].get("J2"):
-        # Score already added? No, we need to be careful.
-        # Original code added +1 for J2 based on R1.
-        # We should check if we double counted or missed.
-        # Let's just reset J2 score bit.
-        # It's safer to just set score based on final J2 state.
-        pass
+    # J5: Sentinel Determinism
+    if r2 and r2.get("success", False):
+        acceptance["gates"]["J5"] = True
+    else:
+        acceptance["gates"]["J5"] = False
 
-    # Correct Score Recalculation (Clean Sweep)
-    acceptance["score"] = 0
-    if acceptance["gates"].get("J0"): acceptance["score"] += 1
-    if acceptance["gates"].get("J1"): acceptance["score"] += 2
-    if acceptance["gates"].get("J2"): acceptance["score"] += 1
-    if acceptance["gates"].get("J3"): acceptance["score"] += 1
-    if acceptance["gates"].get("J5"): acceptance["score"] += 1
-    if acceptance["gates"].get("J6"): acceptance["score"] += 2
-    if acceptance["gates"].get("J7"): acceptance["score"] += 1
-    if acceptance["gates"].get("J9"): acceptance["score"] += 1
-
-    acceptance["final_verdict"] = "PASS" if not failed else "FAIL"
-    
-    if r2 and r2["success"]:
-        acceptance["score"] += 1; acceptance["gates"]["J5"] = True
-    else: failed = True; acceptance["failed_gates"].append("J5")
-    
     # J6: Effect Gate
     j6_pass = False
     if r1:
-        # A) Table Hash Change (Agent vs SFT)
         th = r1["artifacts"].get("table_hashes", {})
+        # A) Hash Change
         if th.get("agent") and th.get("sft") and th["agent"] != th["sft"]:
             j6_pass = True
         
-        # C) Snapshot metrics (lora_delta)
+        # B/C) Snapshot metrics
         if not j6_pass and "lora_delta" in r1["artifacts"]:
             try:
-                delta = float(r1["artifacts"]["lora_delta"])
-                measurements["lora_delta"] = delta
-                if delta > 1e-7: # Conservative epsilon
+                if float(r1["artifacts"]["lora_delta"]) > 1e-7:
                     j6_pass = True
             except: pass
             
-        # D) Strict Fail Remediation
-        if not j6_pass:
-            acceptance["remediations"] = ["Increase training steps/LR or change sampling to ensure model changes."]
-    
     if j6_pass:
-        acceptance["score"] += 2; acceptance["gates"]["J6"] = True
-    else: failed = True; acceptance["failed_gates"].append("J6")
-    
-    if r1 and r1.get("success", False) and r1["artifacts"].get("reward_audit") == "PASS":
-        acceptance["score"] += 1; acceptance["gates"]["J7"] = True
-    elif r1 and r1["artifacts"].get("reward_audit") == "PASS":
-        # Even if success is False (e.g. J0/J3 fail), if reward audit passed, we might give credit?
-        # But usually failed run means invalid results.
-        # Strict J7 requires "run1 artifacts reward_audit == PASS"
-        acceptance["score"] += 1; acceptance["gates"]["J7"] = True
-    else: failed = True; acceptance["failed_gates"].append("J7")
-    
-    j9_ok = True
-    # Fail A: allow flags detected in artifacts or gates
-    if not (r_fail_a and r_fail_a["artifacts"].get("allow_flags_used")):
-        j9_ok = False; print("J9-A Failed: allow flags not detected", file=sys.stderr)
-    
-    # Fail B check: Should fail, and should be attributable
-    if not (r_fail_b and not r_fail_b["success"]):
-         j9_ok = False; print("J9-B Failed: Workload succeeded despite no adapter", file=sys.stderr)
+        acceptance["gates"]["J6"] = True
     else:
-         # Check attribution (errors should contain "Adapter Check Failed")
+        acceptance["gates"]["J6"] = False
+        acceptance["remediations"] = ["Increase training steps/LR or change sampling to ensure model changes."]
+
+    # J7: Reward Audit
+    if r1 and r1["artifacts"].get("reward_audit") == "PASS":
+        acceptance["gates"]["J7"] = True
+    else:
+        acceptance["gates"]["J7"] = False
+
+    # J9 / Fail Checks
+    # Fail A: allow flags detected
+    fail_a_ok = (r_fail_a and r_fail_a["artifacts"].get("allow_flags_used"))
+    
+    # Fail B: Adapter Check
+    fail_b_ok = False
+    if r_fail_b and not r_fail_b["success"]:
          errs = r_fail_b.get("errors", [])
-         # Strict check: Must match specific error path
          if any("Adapter Check Failed" in e for e in errs) and any("MISSING_ADAPTER" in e for e in errs):
-             # J2 Passed because fail_b behavior is correct
-             acceptance["gates"]["J2"] = True
-             acceptance["score"] += 1
-         else:
-             j9_ok = False; print(f"J9-B Failed: Failure not attributed to Adapter. Errs: {errs}", file=sys.stderr)
-        
-    if j9_ok:
-        acceptance["gates"]["J9"] = True # No points in strict spec? 
-        # Wait, strict spec total is 10.
-        # J0(1) + J1(2) + J2(1) + J3(1) + J5(1) + J6(2) + J7(1) = 9.
-        # J9 must be 1 point.
-        acceptance["score"] += 1
+             fail_b_ok = True
+             
+    if fail_a_ok and fail_b_ok:
+        acceptance["gates"]["J9"] = True
     else:
-        failed = True; acceptance["failed_gates"].append("J9")
+        acceptance["gates"]["J9"] = False
+        if not fail_a_ok: acceptance["errors"].append("J9 Fail: Fail-A (Allow Flags) not detected")
+        if not fail_b_ok: acceptance["errors"].append("J9 Fail: Fail-B (Adapter Check) not verified")
+
+    # J2: Fingerprints (R1) AND Adapter Check (Fail-B)
+    # Combining requirement logic
+    r1_fingerprint_ok = r1 and r1["gates"].get("J2", False)
+    if r1_fingerprint_ok and fail_b_ok:
+        acceptance["gates"]["J2"] = True
+    else:
+        acceptance["gates"]["J2"] = False
+        if not r1_fingerprint_ok: acceptance["errors"].append("J2 Fail: Missing/Invalid Trace Fingerprints in Run1")
+
+    # COMPUTE SCORE
+    score, failed_gates, verdict = compute_score(acceptance["gates"])
     
-    acceptance["final_verdict"] = "PASS" if not failed else "FAIL"
+    acceptance["score"] = score
+    acceptance["failed_gates"] = failed_gates
+    acceptance["final_verdict"] = verdict
     
     print(f"ACCEPTANCE_JSON={json.dumps(acceptance, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}")
-    print(f"acceptance_audit={acceptance['final_verdict']}")
-    if failed: sys.exit(1)
+    print(f"acceptance_audit={verdict}")
+    
+    if verdict == "FAIL":
+        sys.exit(1)
 
 
 def _emit_evidence_pack(out_dir, payload_files):
@@ -1569,12 +1684,14 @@ def run_prep_fullpaper(args):
         "invariants": [
             # Exact tool names (no namespaces allowed in paper spec)
             {"file": "06_run_agentiad_infer.py", "must_contain": ['"name": "crop_image_normalized"', '"name": "query_image"'], "forbidden": ["pz.crop_image", "cr.query_image"]},
-            # XML Pattern
-            {"file": "06_run_agentiad_infer.py", "must_contain": ["<tool_call>", "</tool_call>"]},
+            # XML Pattern (via Contract)
+            {"file": "06_run_agentiad_infer.py", "must_contain": ["PaperContract.parse_model_output"]},
             # Output Schema
             {"file": "06_run_agentiad_infer.py", "must_contain": ["anomaly_present", "top_anomaly", "visual_descriptions"]},
             # Normal Constraint
-            {"file": "06_run_agentiad_infer.py", "must_contain": ['top_anomaly="none"', 'visual_descriptions=[]']},
+            {"file": "06_run_agentiad_infer.py", "must_contain": ['"top_anomaly":', '"visual_descriptions":']},
+            # SFT Builder
+            {"file": "08_build_sft_trajectories.py", "must_contain": ["top_anomaly", "visual_descriptions", "crop_image_normalized"]},
             # GRPO Scripts
             {"file": "10_build_grpo_rollouts_toy.py", "must_contain": ["grpo_rollout_v1", "ASSISTANT(final):"]},
             {"file": "10_train_grpo_toy.py", "must_contain": ["reward_weights"]}
@@ -1691,7 +1808,9 @@ def run_prep_fullpaper(args):
     if health_ids_path.exists() and health_ids_path.stat().st_size > 0:
         health_ev_dir = work_dir / "health_ev_06"
         health_cfg = work_dir / "health_config.yaml"
-        health_cfg.write_text("model_id: distilgpt2\nrun_name: healthcheck\n", encoding="utf-8")
+        # Force local dataset usage for G3 to ensure ID match
+        dataset_path = str(manifest_path).replace("\\", "/")
+        health_cfg.write_text(f"model_id: distilgpt2\nrun_name: healthcheck\ndataset_id: {dataset_path}\n", encoding="utf-8")
         
         cmd_health = [
             sys.executable, str(L2_SCRIPT),
@@ -1791,6 +1910,406 @@ def run_prep_fullpaper(args):
         sys.exit(1)
 
 
+
+# ----------------------------------------------------------------------
+# Shared Validators (Audit-Grade)
+# ----------------------------------------------------------------------
+
+def extract_xml_tag_content(text, tag_name):
+    pattern = f"<{tag_name}>(.*?)</{tag_name}>"
+    return re.findall(pattern, text, re.DOTALL)
+
+def validate_sft_messages(item, i, fail_func, Contract):
+    """
+    Policy:
+    Tool role messages may be dict (strict contract call) or str (free-form tool output).
+    Only explicit call dictionaries are contract-validated.
+    """
+    msgs = item.get("messages", [])
+    if not isinstance(msgs, list):
+        fail_func(f"SFT item {i}", "messages is not a list", msgs)
+    if not msgs:
+        fail_func(f"SFT item {i}", "SFT item has no messages")
+        
+    answer_count = 0
+    # Validate all messages in the conversation
+    for m_idx, msg in enumerate(msgs):
+        if not isinstance(msg, dict):
+            fail_func(f"SFT item {i} msg {m_idx}", "message is not a dict", msg)
+        role = msg.get("role")
+        content = msg.get("content")
+        
+        # Check Assistant Messages
+        if role == "assistant":
+            has_answer = False
+            has_tool_dict = False
+            has_tool_list = False
+            has_tool_xml = False
+            
+            # Check <answer>
+            if isinstance(content, str) and "<answer>" in content:
+                has_answer = True
+                answer_count += 1
+                parsed = Contract.parse_model_output(content)
+                if not parsed["valid_syntax"]:
+                    fail_func(f"SFT item {i} msg {m_idx}", f"Invalid XML/JSON: {parsed.get('error')}", content)
+                
+                is_valid, errs = Contract.validate_schema(parsed["data"])
+                if not is_valid:
+                    fail_func(f"SFT item {i} msg {m_idx}", f"Schema violation: {errs}", json.dumps(parsed['data']))
+
+                # Strict Contract Enforcement (Abnormal Case)
+                data = parsed["data"]
+                if data.get("anomaly_present") is True:
+                    if not data.get("top_anomaly") or not isinstance(data.get("top_anomaly"), str) or not data.get("top_anomaly").strip():
+                        fail_func(f"SFT item {i} msg {m_idx}", "anomaly_present=True but top_anomaly is empty/invalid", json.dumps(data))
+                    
+                    vd = data.get("visual_descriptions")
+                    if not isinstance(vd, list) or not all(isinstance(x, str) for x in vd):
+                        fail_func(f"SFT item {i} msg {m_idx}", "anomaly_present=True but visual_descriptions is not list[str]", json.dumps(data))
+                else:
+                    # Normal Case Enforcement
+                    if data.get("top_anomaly") != "none":
+                        fail_func(f"SFT item {i} msg {m_idx}", "anomaly_present=False but top_anomaly != 'none'", json.dumps(data))
+                    if data.get("visual_descriptions") != []:
+                        fail_func(f"SFT item {i} msg {m_idx}", "anomaly_present=False but visual_descriptions != []", json.dumps(data))
+
+            # Check Tool Calls (Assistant)
+            # 1. tool_call (dict)
+            if "tool_call" in msg:
+                tc = msg["tool_call"]
+                if not isinstance(tc, dict):
+                    fail_func(f"SFT item {i} msg {m_idx}", "msg['tool_call'] is present but not a dict", str(tc))
+                has_tool_dict = True
+                is_valid, errs = Contract.validate_tool_call(tc)
+                if not is_valid:
+                    fail_func(f"SFT item {i} msg {m_idx}", f"Tool Call violation: {errs}", json.dumps(tc))
+            
+            # 2. tool_calls (list)
+            if "tool_calls" in msg:
+                tcs = msg["tool_calls"]
+                # Strict: must be list
+                if not isinstance(tcs, list):
+                    fail_func(f"SFT item {i} msg {m_idx}", "tool_calls exists but is not a list", str(tcs))
+                
+                if len(tcs) > 0:
+                    has_tool_list = True
+                    for idx, tc in enumerate(tcs):
+                        if not isinstance(tc, dict):
+                            fail_func(f"SFT item {i} msg {m_idx}", f"tool_calls[{idx}] is not a dict", str(tc))
+                        is_valid, errs = Contract.validate_tool_call(tc)
+                        if not is_valid:
+                            fail_func(f"SFT item {i} msg {m_idx}", f"Tool Call (list) violation: {errs}", json.dumps(tc))
+                else:
+                        # Empty list does not count as has_tool_list, but is valid JSON structure.
+                        pass 
+                
+            # 3. XML tool calls in content
+            if isinstance(content, str):
+                # Use local helper to robustly find all tag contents
+                xml_tcs_str = extract_xml_tag_content(content, "tool_call")
+                if xml_tcs_str:
+                    has_tool_xml = True
+                    for tc_str in xml_tcs_str:
+                        try:
+                            tc = json.loads(tc_str)
+                            is_valid, errs = Contract.validate_tool_call(tc)
+                            if not is_valid:
+                                fail_func(f"SFT item {i} msg {m_idx}", f"XML Tool Call violation: {errs}", tc_str)
+                        except json.JSONDecodeError:
+                            fail_func(f"SFT item {i} msg {m_idx}", "XML Tool Call content is not valid JSON", tc_str)
+            
+            # Enforce: Assistant message must have <answer> OR be a tool call
+            if not (has_answer or has_tool_dict or has_tool_list or has_tool_xml):
+                fail_func(f"SFT item {i} msg {m_idx}", "Assistant message without <answer> or <tool_call>", content)
+
+        # Check Tool Role Messages
+        if role == "tool":
+            # Policy: Allow dict (strict) or str (flexible)
+            if isinstance(content, dict):
+                if "call" not in content:
+                    fail_func(f"SFT item {i} msg {m_idx}", "Tool role message dict missing 'call' key", json.dumps(content))
+                
+                tc = content["call"]
+                if not isinstance(tc, dict):
+                    fail_func(f"SFT item {i} msg {m_idx}", "Tool role content['call'] must be dict", str(tc))
+                        
+                is_valid, errs = Contract.validate_tool_call(tc)
+                if not is_valid:
+                    fail_func(f"SFT item {i} msg {m_idx}", f"Tool Role message has invalid 'call' schema: {errs}", json.dumps(tc))
+
+            elif isinstance(content, str):
+                # If string contains XML tool call, validate it
+                xml_tcs_str = extract_xml_tag_content(content, "tool_call")
+                if xml_tcs_str:
+                    for tc_str in xml_tcs_str:
+                        try:
+                            tc = json.loads(tc_str)
+                            is_valid, errs = Contract.validate_tool_call(tc)
+                            if not is_valid:
+                                fail_func(f"SFT item {i} msg {m_idx}", f"Tool Role XML Call violation: {errs}", tc_str)
+                        except json.JSONDecodeError:
+                            fail_func(f"SFT item {i} msg {m_idx}", "Tool Role XML Call content is not valid JSON", tc_str)
+            else:
+                fail_func(f"SFT item {i} msg {m_idx}", "Tool role message content must be dict or string", str(content))
+
+    if answer_count == 0:
+        fail_func(f"SFT item {i}", "No <answer> found in assistant messages")
+
+def validate_trace_raw_output(trace_obj, trace_name, fail_func, Contract):
+    turns = trace_obj.get("turns", [])
+    for t_idx, turn in enumerate(turns):
+        raw = turn.get("raw_output", "")
+        
+        # Validate <answer> if present
+        if "<answer>" in raw:
+            parsed = Contract.parse_model_output(raw)
+            if parsed["valid_syntax"]:
+                is_valid, errs = Contract.validate_schema(parsed["data"])
+                if not is_valid:
+                    fail_func(f"{trace_name} turn {t_idx}", f"Schema validation failed: {errs}", raw)
+            else:
+                fail_func(f"{trace_name} turn {t_idx}", f"Parse failed: {parsed.get('error')}", raw)
+        
+        # Validate <tool_call> if present
+        if "<tool_call>" in raw:
+            xml_tcs_str = extract_xml_tag_content(raw, "tool_call")
+            for tc_str in xml_tcs_str:
+                try:
+                    tc = json.loads(tc_str)
+                    is_valid, errs = Contract.validate_tool_call(tc)
+                    if not is_valid:
+                        fail_func(f"{trace_name} turn {t_idx}", f"Trace XML Tool Call violation: {errs}", tc_str)
+                except json.JSONDecodeError:
+                    fail_func(f"{trace_name} turn {t_idx}", "Trace XML Tool Call content is not valid JSON", tc_str)
+
+def run_contract_smoke(args):
+    print("[ContractSmoke] Verifying Single Source of Truth Enforcement...", file=sys.stderr)
+    
+    # Ensure we can import from src
+    if str(PROJECT_ROOT / "src") not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+    
+    from agentiad_repro.paper_contract import PaperContract
+    import re
+
+    # 1. Setup
+    work_dir = Path(args.output_dir).resolve()
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    cfg_path = work_dir / "smoke_config.yaml"
+    cfg_path.write_text("model_id: smoke_test\nrun_name: smoke\n", encoding="utf-8")
+    
+    ev_dir = work_dir / "evidence"
+    
+    # Local helpers
+    def fail(label, reason, snippet=None):
+        print(f"FAIL: {reason} in {label}", file=sys.stderr)
+        s_trunc = ""
+        if snippet:
+            s_trunc = str(snippet)
+            if len(s_trunc) > 200: s_trunc = s_trunc[:200] + "..."
+            print(f"Snippet: {s_trunc}", file=sys.stderr)
+            
+        payload = {
+            "success": False,
+            "mode": "contract_smoke",
+            "failed_gate": reason,
+            "label": label,
+            "snippet": s_trunc
+        }
+        print(f"ACCEPTANCE_JSON={json.dumps(payload)}")
+        print("acceptance_audit=FAIL")
+        sys.exit(1)
+
+    # 2. Run Dry Run Inference
+    ms = args.max_samples if args.max_samples is not None else 2
+    
+    cmd = [
+        sys.executable, str(L2_SCRIPT),
+        "--config", str(cfg_path),
+        "--run_name", "smoke",
+        "--max_samples", str(ms),
+        "--dry_run",
+        "--evidence_dir", str(ev_dir)
+    ]
+    
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(PROJECT_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+
+    print(f"[ContractSmoke] Running inference: {' '.join(cmd)}", file=sys.stderr)
+    res = run_cmd(cmd, env_overrides=env, stream_output=False)
+    if res.returncode != 0:
+        fail("Inference", f"Inference script crashed. RC={res.returncode}")
+        
+    zip_path = ev_dir / "evidence_package.zip"
+    if not zip_path.exists():
+        fail("Evidence", "No evidence package produced.")
+        
+    found_contract_answer = False
+    
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        traces = [n for n in zf.namelist() if n.endswith("trace.json")]
+        if not traces:
+            fail("Evidence", "No traces found.")
+            
+        for tn in traces:
+            data = json.load(zf.open(tn))
+            
+            # Check for answer existence globally
+            turns = data.get("turns", [])
+            for turn in turns:
+                if "<answer>" in turn.get("raw_output", ""):
+                    found_contract_answer = True
+            
+            # Apply Trace Validation
+            validate_trace_raw_output(data, tn, fail, PaperContract)
+
+    if not found_contract_answer:
+        fail("Evidence", "Output does NOT contain <answer> tags.")
+        
+    # 5. Run 08 (SFT Build) Smoke Test
+    print("[ContractSmoke] Running SFT Build (08) on smoke traces...", file=sys.stderr)
+    smoke_trace_dir = work_dir / "smoke_traces"
+    smoke_trace_dir.mkdir(parents=True, exist_ok=True)
+    
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(smoke_trace_dir)
+        
+    # Adapt directory structure for 08: expect <trace_dir>/<run_name>/<sample_id>
+    # 06 zip has traces/<sample_id> or just <sample_id>?
+    # Usually traces/<sample_id>
+    
+    src_traces = smoke_trace_dir / "traces"
+    dst_run_dir = smoke_trace_dir / "smoke"
+    
+    if src_traces.exists():
+        # Check if run_name dir exists inside
+        src_run_dir = src_traces / "smoke"
+        if src_run_dir.exists():
+            # Case A: traces/smoke/sample_id -> Move traces/smoke to smoke_trace_dir/smoke
+            if dst_run_dir.exists(): shutil.rmtree(dst_run_dir)
+            shutil.move(src_run_dir, dst_run_dir)
+            try: shutil.rmtree(src_traces)
+            except: pass
+        else:
+            # Case B: traces/sample_id -> Rename traces to smoke
+            if dst_run_dir.exists(): shutil.rmtree(dst_run_dir)
+            shutil.move(src_traces, dst_run_dir)
+    else:
+        # Case C: flat extraction (unlikely if zipped with dir)
+        # Check if we have sample_id dirs at root
+        pass
+
+    sft_out = work_dir / "smoke_sft.jsonl"
+    
+    cmd_08 = [
+        sys.executable, str(L3_SCRIPT),
+        "--config", str(cfg_path),
+        "--run_name", "smoke",
+        "--trace_dir", str(smoke_trace_dir),
+        "--out_jsonl", str(sft_out)
+    ]
+    
+    env_08 = env.copy()
+    # 08 needs src in PYTHONPATH too? Yes.
+    
+    print(f"[ContractSmoke] Running 08: {' '.join(cmd_08)}", file=sys.stderr)
+    res_08 = run_cmd(cmd_08, env_overrides=env_08, stream_output=False)
+    if res_08.returncode != 0:
+        err_msg = res_08.stderr.decode('utf-8', errors='replace')
+        fail("SFT Build", f"08 script crashed. RC={res_08.returncode}", err_msg)
+        
+    if not sft_out.exists():
+        fail("SFT Build", "08 did not produce output jsonl.")
+        
+    # Check SFT content
+    sft_lines = sft_out.read_text(encoding="utf-8").splitlines()
+    if not sft_lines:
+        fail("SFT Content", "SFT output is empty.")
+    
+    for i, line in enumerate(sft_lines):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            fail("SFT Content", f"SFT line {i} is not valid JSON.", line)
+            
+        msgs = item.get("messages", [])
+            
+        validate_sft_messages(item, i, fail, PaperContract)
+
+    print("PASS: 08 SFT Build smoke test passed (Runtime Schema & Tool Validation).", file=sys.stderr)
+
+    # 6. Grep Gates (Static Analysis)
+    print("[ContractSmoke] Running Static Analysis (Grep Gates)...", file=sys.stderr)
+    
+    # Gate 1: Check 08 script for legacy schema construction
+    # We search for explicit key usage in dict construction
+    content_08 = L3_SCRIPT.read_text(encoding="utf-8")
+    
+    # We use regex to find "description": or "confidence": 
+    # but excluding comments is hard. We'll do simple string check.
+    # We expect these keys to be ABSENT in the contract object.
+    # But they might be present in "final_obj" which is legacy? 
+    # "final_obj" keys are "defect_type", "confidence", "anomaly".
+    # "description" was used in legacy contract. 
+    # So "description": should DEFINITELY not appear.
+    # Loosened Gate: Check for '"description":' specifically in context of construction
+    if '"description":' in content_08:
+         # Check if it's commented out or harmless
+         # But strict grep is brittle.
+         # Let's rely on runtime validation for this, but warn if found.
+         # The prompt says "Prefer banning legacy KEYS IN OUTPUT (runtime) rather than banning literal substrings in source."
+         # So we demote this to a warning unless it looks really bad.
+         print("WARN: Found 'description' key in 08 script. Ensure it is not used in contract output.", file=sys.stderr)
+         # sys.exit(1) # DISABLED strict failure
+
+    if '"confidence":' in content_08:
+         print("WARN: Found 'confidence' key in 08 script. Ensure it is not used in contract output.", file=sys.stderr)
+         # sys.exit(1) # DISABLED strict failure
+         
+    # Gate 2: Check for bbox_2d in crop_image_normalized
+    # We check if "bbox_2d" is present in the same block as "crop_image_normalized"
+    # Heuristic: Check if "bbox_2d" appears in 08 script (it should, I added it)
+    if "bbox_2d" not in content_08:
+         fail("Static Gate", "'bbox_2d' not found in 08 script. Tool contract violation.")
+         
+    print("PASS: Contract Smoke Test Passed (Tags Found + Schema Valid + Static Gates)", file=sys.stderr)
+    print(f"ACCEPTANCE_JSON={json.dumps({'success': True, 'mode': 'contract_smoke', 'score_10': 10, 'failed_gates': []})}")
+    print("acceptance_audit=PASS")
+
+
+
+def verify_j_strict(args):
+    def hard_fail(label, reason, snippet=None):
+        print(f"FAIL: {reason} in {label}", file=sys.stderr)
+        s_trunc = ""
+        if snippet:
+            s_trunc = str(snippet)
+            if len(s_trunc) > 200: s_trunc = s_trunc[:200] + "..."
+            print(f"Snippet: {s_trunc}", file=sys.stderr)
+        
+        payload = {
+            "success": False,
+            "mode": "strict_j",
+            "failed_gate": reason,
+            "label": label,
+            "snippet": s_trunc
+        }
+        print(f"ACCEPTANCE_JSON={json.dumps(payload)}")
+        print("acceptance_audit=FAIL")
+        sys.exit(1)
+
+    try:
+        _verify_j_strict_core(args)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"ERROR: Uncaught exception: {type(e).__name__}: {e}", file=sys.stderr)
+        hard_fail("unexpected_exception", f"Uncaught exception: {e}", str(e))
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -1802,6 +2321,7 @@ if __name__ == "__main__":
     parser.add_argument("--allow-flags", action="store_true")
     parser.add_argument("--no-adapter", action="store_true")
     parser.add_argument("--sentinel-ref", help="Path to reference run for sentinel check")
+    parser.add_argument("--strict-contract", action="store_true", help="Fail strict_j immediately on contract violation")
     
     args, unknown = parser.parse_known_args()
     
@@ -1812,7 +2332,7 @@ if __name__ == "__main__":
         print(f"WORKLOAD_RESULT={json.dumps(res)}")
     elif args.mode == "prep_fullpaper":
         run_prep_fullpaper(args)
+    elif args.mode == "contract_smoke":
+        run_contract_smoke(args)
     else:
-        verify_j_strict()
-
-
+        verify_j_strict(args)
