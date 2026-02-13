@@ -544,9 +544,9 @@ def run_workload(args):
         result["errors"].append(f"Missing dependencies: {', '.join(missing_deps)}")
         
         # Build precise remediations (Defaults to conda-forge for best compat)
-        rem_conda = f"conda install -y -c conda-forge {' '.join(missing_pkgs)}"
-        
-        rem_pip = f"python3 -m pip install {' '.join(missing_pkgs)}"
+        pkg_list = " ".join(missing_pkgs)
+        rem_conda = f"conda install -y -c conda-forge {pkg_list}"
+        rem_pip = f"python3 -m pip install {pkg_list}"
         rem_pip_note = "Note: If pip fails on pyarrow/datasets due to missing cmake, use conda-forge or install build-essential."
         
         remediations = [rem_conda, rem_pip, rem_pip_note]
@@ -594,11 +594,13 @@ def run_workload(args):
                 stdout_str = probe_res.stdout.decode('utf-8', errors='replace') if probe_res else ""
                 
                 if "Missing dependencies for Level-2 VLM agent" in stdout_str:
-                    result["errors"].append("Missing L2 dependencies: torch/transformers/accelerate/datasets/pillow")
-                    # Generic remediation for probe failure if we can't be precise
+                    result["errors"].append("Missing L2 dependencies: torch/transformers/accelerate/datasets/pillow/pyarrow")
+                    # Generic remediation for probe failure if we can't be precise (assume full set)
+                    pkg_list = "torch transformers accelerate datasets pillow pyarrow"
                     result["remediations"] = [
-                        "conda install -y -c conda-forge transformers accelerate datasets pyarrow pillow",
-                        "python3 -m pip install transformers accelerate datasets pyarrow pillow"
+                        f"conda install -y -c conda-forge {pkg_list}",
+                        f"python3 -m pip install {pkg_list}",
+                        "Note: If pip fails on pyarrow/datasets due to missing cmake, use conda-forge or install build-essential."
                     ]
                 else:
                     head_lines = "\n".join(stdout_str.splitlines()[:5])
