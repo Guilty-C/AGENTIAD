@@ -1168,6 +1168,14 @@ def _verify_j_strict_core(args):
     r1 = run_inner("run1", timer_key="run1_duration_sec", seeds=[0, 1, 2])
     print(f"DEBUG: r1 result: {json.dumps(r1) if r1 else 'None'}", file=sys.stderr)
     
+    # Check for early exit condition: Missing Dependencies in Run1
+    deps_missing = False
+    if r1 and not r1.get("success", False):
+        errs = r1.get("errors", [])
+        if any("Missing dependencies" in e for e in errs) or any("Missing L2 dependencies" in e for e in errs):
+            deps_missing = True
+            print("[Strict] Run1 failed due to missing dependencies. Skipping Run2 Sentinel.", file=sys.stderr)
+    
     # J0 Check: execution_path must be in tmp_repo
     if r1:
         exec_path = r1.get("artifacts", {}).get("execution_path", "")
@@ -1313,8 +1321,12 @@ def _verify_j_strict_core(args):
 
     
     # Run 2: Sentinel Determinism (pass run1 path relative to tmp_repo)
-    r2 = run_inner("run2", timer_key="run2_duration_sec", seeds=[0], sentinel_ref="run1")
-    print(f"DEBUG: r2 result: {json.dumps(r2) if r2 else 'None'}", file=sys.stderr)
+    if deps_missing:
+        r2 = {"success": False, "errors": ["SKIPPED: deps missing"], "skipped": True}
+        print("DEBUG: r2 skipped due to deps missing in run1", file=sys.stderr)
+    else:
+        r2 = run_inner("run2", timer_key="run2_duration_sec", seeds=[0], sentinel_ref="run1")
+        print(f"DEBUG: r2 result: {json.dumps(r2) if r2 else 'None'}", file=sys.stderr)
     
     r_fail_a = run_inner("fail_a", timer_key="fail_a_duration_sec", seeds=[0], max_samples=1, allow_flags=True)
     r_fail_b = run_inner("fail_b", timer_key="fail_b_duration_sec", seeds=[0], max_samples=1, no_adapter=True)
@@ -1346,6 +1358,16 @@ def _verify_j_strict_core(args):
             
     # Deduplicate errors
     acceptance["errors"] = sorted(list(set(acceptance["errors"])))
+    
+    # Prioritize Dependency Errors
+    if deps_missing:
+        # Move dependency errors to front
+        dep_errs = [e for e in acceptance["errors"] if "Missing dependencies" in e or "Missing L2 dependencies" in e]
+        other_errs = [e for e in acceptance["errors"] if e not in dep_errs]
+        acceptance["errors"] = dep_errs + other_errs
+        
+        # Add skipped metadata
+        acceptance["skipped"] = {"run2": "deps_missing"}
     
     # Propagate JC_contract_runtime from Run1
     if r1 and "gates" in r1 and "JC_contract_runtime" in r1["gates"]:
