@@ -505,24 +505,18 @@ def run_workload(args):
         # It shouldn't fail at Probe step.
         pass
 
-    # 0. Preflight Check (Dependency)
-    # Check for critical dependencies (e.g. yaml) in current environment to prevent cascade failures
-    # Expanded to include L2 dependencies for strict_j stability
+    # 0. Preflight Check (Dependency) - Strict Mode
+    # Use python -c import to verify environment integrity per requirements
     missing_deps = []
-    missing_pkgs = []
     
-    # Check Python env
-    if "conda" not in sys.executable.lower() and "venv" not in sys.executable.lower() and sys.platform != "win32":
-         # Just a warning or remediation hint if system python is used
-         pass
-
+    # Check PyYAML first (critical for config loading)
     try:
-        import yaml
-    except ImportError:
-        missing_deps.append("PyYAML (yaml)")
-        missing_pkgs.append("pyyaml")
-        
-    # Check L2 dependencies (torch, transformers, accelerate, datasets, PIL, pyarrow)
+        subprocess.check_call([sys.executable, "-c", "import yaml"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        missing_deps.append("PyYAML")
+
+    # Check L2 dependencies strictly
+    # (import_name, display_name)
     l2_deps = [
         ("torch", "torch"),
         ("transformers", "transformers"),
@@ -534,29 +528,25 @@ def run_workload(args):
     
     for mod, pkg in l2_deps:
         try:
-            __import__(mod)
-        except ImportError:
-            missing_deps.append(f"{mod} ({pkg})")
-            missing_pkgs.append(pkg)
-            
+            subprocess.check_call([sys.executable, "-c", f"import {mod}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            missing_deps.append(pkg)
+
     if missing_deps:
         result["success"] = False
-        result["errors"].append(f"Missing dependencies: {', '.join(missing_deps)}")
+        result["gates"]["J4_DEPENDENCIES"] = False
+        # Use exact error string requested
+        result["errors"].append(f"Missing L2 dependencies: {', '.join(missing_deps)}")
         
-        # Build precise remediations (Defaults to conda-forge for best compat)
-        pkg_list = " ".join(missing_pkgs)
-        rem_conda = f"conda install -y -c conda-forge {pkg_list}"
-        rem_pip = f"python3 -m pip install {pkg_list}"
-        rem_pip_note = "Note: If pip fails on pyarrow/datasets due to missing cmake, use conda-forge or install build-essential."
-        
-        remediations = [rem_conda, rem_pip, rem_pip_note]
-        
-        # Add env check remediation
-        if "conda" not in sys.executable.lower() and sys.platform != "win32":
-            remediations.append("source ~/miniconda3/etc/profile.d/conda.sh && conda activate agentiad")
-            
-        result["remediations"] = remediations
+        # Strict single remediation
+        pkg_list = "torch transformers accelerate datasets pillow pyarrow"
+        result["remediations"] = [
+            f"conda install -y -c conda-forge {pkg_list}"
+        ]
         return result
+    
+    # If passed, mark J4 as True
+    result["gates"]["J4_DEPENDENCIES"] = True
 
     # 1. Data Binding
     with Timer("Data Binding"):
@@ -1083,6 +1073,7 @@ def compute_score(gates):
         "J1": 2,
         "J2": 1,
         "J3": 1,
+        "J4_DEPENDENCIES": 0, # Informational / Blocker
         "J5": 1,
         "J6": 2,
         "J7": 1,
@@ -1110,6 +1101,61 @@ def compute_score(gates):
 def _verify_j_strict_core(args):
     print("Running Case J-STRICT_MINIREAL (Optimized)...", file=sys.stderr)
     
+    # ---------------------------------------------------------
+    # 0. Strict Dependency Preflight (Gate J4)
+    # Must fail BEFORE any clean room prep or workload execution
+    # ---------------------------------------------------------
+    deps_missing = False
+    
+    # Check L2 dependencies strictly (slash format for error string)
+    # import_name -> display_name (but strict requirement wants fixed string)
+    l2_deps_checks = [
+        ("torch", "torch"),
+        ("transformers", "transformers"),
+        ("accelerate", "accelerate"),
+        ("datasets", "datasets"),
+        ("PIL", "pillow"),
+        ("pyarrow", "pyarrow")
+    ]
+    
+    missing_pkgs = []
+    for mod, pkg in l2_deps_checks:
+        try:
+            subprocess.check_call([sys.executable, "-c", f"import {mod}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            missing_pkgs.append(pkg)
+            deps_missing = True
+
+    if deps_missing:
+        # Construct deterministic failure payload immediately
+        print("[Strict] Dependency Preflight Failed. Aborting.", file=sys.stderr)
+        
+        # Strict Format Requirement: slash format
+        error_str = "Missing L2 dependencies: torch/transformers/accelerate/datasets/pillow/pyarrow"
+        
+        acceptance = {
+            "total": 10,
+            "score": 0,
+            "final_verdict": "FAIL",
+            "failed_gates": ["J4_DEPENDENCIES"],
+            "gates": {"J4_DEPENDENCIES": False},
+            "measurements": {"clean_room_prep_sec": 0.0},
+            "errors": [error_str],
+            "skipped": {"run2": "deps_missing"},
+            "remediations": [
+                "conda install -y -c conda-forge torch transformers accelerate datasets pillow pyarrow"
+            ]
+        }
+        
+        # Internal Self-Check
+        if acceptance["failed_gates"] != ["J4_DEPENDENCIES"]:
+            print("FATAL: Logic Error. failed_gates != ['J4_DEPENDENCIES']", file=sys.stderr)
+            sys.exit(1)
+            
+        print(f"ACCEPTANCE_JSON={json.dumps(acceptance, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}")
+        print("acceptance_audit=FAIL")
+        sys.exit(1)
+
     measurements = {
         "clean_room_prep_sec": 0.0,
         "run1_duration_sec": 0.0,
@@ -1167,14 +1213,6 @@ def _verify_j_strict_core(args):
 
     r1 = run_inner("run1", timer_key="run1_duration_sec", seeds=[0, 1, 2])
     print(f"DEBUG: r1 result: {json.dumps(r1) if r1 else 'None'}", file=sys.stderr)
-    
-    # Check for early exit condition: Missing Dependencies in Run1
-    deps_missing = False
-    if r1 and not r1.get("success", False):
-        errs = r1.get("errors", [])
-        if any("Missing dependencies" in e for e in errs) or any("Missing L2 dependencies" in e for e in errs):
-            deps_missing = True
-            print("[Strict] Run1 failed due to missing dependencies. Skipping Run2 Sentinel.", file=sys.stderr)
     
     # J0 Check: execution_path must be in tmp_repo
     if r1:
@@ -1321,12 +1359,8 @@ def _verify_j_strict_core(args):
 
     
     # Run 2: Sentinel Determinism (pass run1 path relative to tmp_repo)
-    if deps_missing:
-        r2 = {"success": False, "errors": ["SKIPPED: deps missing"], "skipped": True}
-        print("DEBUG: r2 skipped due to deps missing in run1", file=sys.stderr)
-    else:
-        r2 = run_inner("run2", timer_key="run2_duration_sec", seeds=[0], sentinel_ref="run1")
-        print(f"DEBUG: r2 result: {json.dumps(r2) if r2 else 'None'}", file=sys.stderr)
+    r2 = run_inner("run2", timer_key="run2_duration_sec", seeds=[0], sentinel_ref="run1")
+    print(f"DEBUG: r2 result: {json.dumps(r2) if r2 else 'None'}", file=sys.stderr)
     
     r_fail_a = run_inner("fail_a", timer_key="fail_a_duration_sec", seeds=[0], max_samples=1, allow_flags=True)
     r_fail_b = run_inner("fail_b", timer_key="fail_b_duration_sec", seeds=[0], max_samples=1, no_adapter=True)
@@ -1359,20 +1393,19 @@ def _verify_j_strict_core(args):
     # Deduplicate errors
     acceptance["errors"] = sorted(list(set(acceptance["errors"])))
     
-    # Prioritize Dependency Errors
-    if deps_missing:
-        # Move dependency errors to front
-        dep_errs = [e for e in acceptance["errors"] if "Missing dependencies" in e or "Missing L2 dependencies" in e]
-        other_errs = [e for e in acceptance["errors"] if e not in dep_errs]
-        acceptance["errors"] = dep_errs + other_errs
-        
-        # Add skipped metadata
-        acceptance["skipped"] = {"run2": "deps_missing"}
-    
     # Propagate JC_contract_runtime from Run1
     if r1 and "gates" in r1 and "JC_contract_runtime" in r1["gates"]:
         acceptance["gates"]["JC_contract_runtime"] = r1["gates"]["JC_contract_runtime"]
-    
+
+    # Propagate J4_DEPENDENCIES from Run1
+    if r1 and "gates" in r1 and "J4_DEPENDENCIES" in r1["gates"]:
+        acceptance["gates"]["J4_DEPENDENCIES"] = r1["gates"]["J4_DEPENDENCIES"]
+    else:
+        # Default to False if not present (implies run1 failed before checking or didn't report)
+        # But if r1 skipped due to something else? 
+        # Actually if deps check passed, it sets True.
+        acceptance["gates"]["J4_DEPENDENCIES"] = False
+
     # J0: Clean Room & Execution Path
     # r1["success"] check implies J0 check passed in run_inner + execution path check
     if r1 and r1.get("success", False):
@@ -1465,6 +1498,7 @@ def _verify_j_strict_core(args):
     print(f"ACCEPTANCE_JSON={json.dumps(acceptance, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}")
     print(f"acceptance_audit={verdict}")
     
+    # Strict Exit Code Enforcement
     if verdict == "FAIL":
         sys.exit(1)
 
