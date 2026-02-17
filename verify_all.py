@@ -1180,3 +1180,49 @@ def run_workload(args):
         "measurements": res.measurements,
         "remediations": res.remediations
     }
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="AgentIAD Reproduction Verification Orchestrator")
+    parser.add_argument("--mode", type=str, default="default", help="Execution mode")
+    parser.add_argument("--max-samples", type=int, default=2, dest="max_samples", help="Max samples per stage")
+    parser.add_argument("--strict-contract", action="store_true", dest="strict_contract", help="Enforce strict contract")
+    parser.add_argument("--output-dir", type=str, default=None, dest="output_dir", help="Output directory")
+    parser.add_argument("--allow-flags", action="store_true", dest="allow_flags", help="Allow unsafe flags")
+    parser.add_argument("--no-adapter", action="store_true", dest="no_adapter", help="Skip adapter checks")
+    parser.add_argument("--sentinel-ref", type=str, default="", dest="sentinel_ref", help="Sentinel reference directory")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Random seeds")
+    return parser
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if args.output_dir is None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        args.output_dir = f"outputs/workload_{timestamp}"
+
+    try:
+        res = run_workload(args)
+    except Exception as e:
+        res = {
+            "success": False,
+            "errors": [f"Unhandled Exception: {str(e)}"]
+        }
+
+    if isinstance(res, dict):
+        payload = res
+    else:
+        payload = {
+            "success": getattr(res, "success", False),
+            "gates": getattr(res, "gates", {}),
+            "artifacts": getattr(res, "artifacts", {}),
+            "errors": getattr(res, "errors", []),
+            "measurements": getattr(res, "measurements", {}),
+        }
+    
+    print("WORKLOAD_RESULT=" + json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    
+    sys.exit(0 if payload.get("success", False) else 1)
+
+if __name__ == "__main__":
+    main()
