@@ -20,10 +20,41 @@ if (REPO_ROOT / "src").exists() and str(REPO_ROOT / "src") not in sys.path:
 
 
 # Import SSOT
-try:
-    from agentiad_repro.paper_contract import PaperContract
-except ModuleNotFoundError:
-    from paper_contract import PaperContract
+import importlib.util
+
+def _load_paper_contract_cls():
+    # Try normal imports first (fast path)
+    try:
+        from agentiad_repro.paper_contract import PaperContract  # type: ignore
+        return PaperContract
+    except Exception:
+        pass
+
+    # File-location fallback (robust path-based import)
+    candidates = [
+        REPO_ROOT / "paper_contract.py",
+        REPO_ROOT / "agentiad_repro" / "paper_contract.py",
+        REPO_ROOT / "src" / "agentiad_repro" / "paper_contract.py",
+        REPO_ROOT / "dist" / "src" / "agentiad_repro" / "paper_contract.py",
+        REPO_ROOT / "dist" / "paper_contract.py",
+    ]
+
+    for p in candidates:
+        if p.exists():
+            spec = importlib.util.spec_from_file_location("agentiad_repro__paper_contract", str(p))
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+                if hasattr(mod, "PaperContract"):
+                    return getattr(mod, "PaperContract")
+
+    # Hard fail with diagnostic paths
+    tried = "\n".join(str(x) for x in candidates)
+    raise ModuleNotFoundError(
+        "PaperContract not found. Tried imports and these paths:\n" + tried
+    )
+
+PaperContract = _load_paper_contract_cls()
 
 
 def _read_text(path: Path) -> str:
