@@ -1,0 +1,12 @@
+{
+  "dataset_split_hash": "80d5b9c7c81ecfa454f9a2ef8ffeca8b754ba709052d591b84099a929c7c6446",
+  "git_info": {
+    "branch": "main",
+    "commit": "5d23958ad1a544b5071a2a3c868adc90d7d931a8"
+  },
+  "model_id": "openai/clip-vit-base-patch32",
+  "pip_freeze": "accelerate==1.12.0\naiohappyeyeballs==2.6.1\naiohttp==3.13.3\naiosignal==1.4.0\nattrs==25.4.0\ncertifi==2026.1.4\ncharset-normalizer==3.4.4\ncolorama==0.4.6\ndatasets==2.19.2\ndill==0.3.8\nfilelock==3.20.3\nfrozenlist==1.8.0\nfsspec==2024.3.1\nhuggingface_hub==0.36.2\nidna==3.11\nJinja2==3.1.6\nMarkupSafe==2.1.5\nmpmath==1.3.0\nmultidict==6.7.0\nmultiprocess==0.70.16\nnetworkx==3.6.1\nnumpy==2.4.0\npackaging==25.0\npandas==2.2.2\npeft==0.18.1\npillow==10.4.0\npropcache==0.4.1\npsutil==7.2.1\npyarrow==22.0.0\npyarrow-hotfix==0.7\npython-dateutil==2.9.0.post0\npytz==2025.2\nPyYAML==6.0.2\nregex==2025.11.3\nrequests==2.32.5\nsafetensors==0.7.0\nsix==1.17.0\nsympy==1.14.0\ntokenizers==0.22.2\ntorch==2.10.0\ntqdm==4.66.5\ntransformers==4.57.6\ntyping_extensions==4.15.0\ntzdata==2025.3\nurllib3==2.6.3\nuv==0.9.26\nxxhash==3.6.0\nyarl==1.22.0\n",
+  "prompt_template_hash": "bb348765a45690163589f02627be93fad0d94db4e3451c9cb06c2e06251758bd",
+  "seeds": 0,
+  "tool_enable_config_hash": "c7e9e85059111c0792f45a3c214dda74cc7574282a9626bf8edbb9da48c6edd3"
+}
