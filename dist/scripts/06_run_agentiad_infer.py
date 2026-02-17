@@ -200,7 +200,20 @@ def _parse_agent_json(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         meta["parse_ok"] = True
         
         # Map to internal keys for downstream logic
-        out["anomaly"] = "yes" if data.get("anomaly_present") else "no"
+        ap = data.get("anomaly_present")
+        if ap is None:
+            out["anomaly"] = "unknown"
+        elif isinstance(ap, bool):
+            out["anomaly"] = "yes" if ap else "no"
+        else:
+            s = str(ap).strip().lower()
+            if s in {"yes", "true", "1"}:
+                out["anomaly"] = "yes"
+            elif s in {"no", "false", "0"}:
+                out["anomaly"] = "no"
+            else:
+                out["anomaly"] = "unknown"
+
         out["defect_type"] = str(data.get("top_anomaly", "none"))
         # confidence is FORBIDDEN by contract, so it is None
         
@@ -316,6 +329,9 @@ def _vlm_generate(
     generation_config: Any,
 ) -> str:
     try:
+        if model is None:
+            return '<answer>{"anomaly_present": "unknown", "top_anomaly": "offline_fallback", "visual_descriptions": []}</answer>'
+
         import torch
 
         model_device = _infer_model_device(model)
@@ -371,7 +387,7 @@ def _vlm_generate(
         import traceback
         traceback.print_exc()
         # Fallback output that respects contract schema (but says unknown)
-        return '<answer>{"anomaly_present": false, "top_anomaly": "none", "visual_descriptions": []}</answer>'
+        return '<answer>{"anomaly_present": "unknown", "top_anomaly": "execution_error", "visual_descriptions": []}</answer>'
 
 
 def _vlm_generate_dry(images: Sequence[Any], prompt: str, sample_id: str, seed: int) -> str:
@@ -459,6 +475,7 @@ def main() -> int:
     parser.add_argument("--evidence_dir", type=str, default=None)
     parser.add_argument("--id_list", type=str, default=None, help="Path to a text file with allowed sample_ids (one per line)")
     parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter to load")
+    parser.add_argument("--local_files_only", type=str, default=None, help="Force local files only (true/false/1/0)")
     args = parser.parse_args()
 
     from agentiad_repro.utils import ensure_dir, load_paths, sha256_text, utc_now_iso, write_json
@@ -566,7 +583,7 @@ def main() -> int:
     if not args.dry_run:
         try:
             import torch
-            from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
+            from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig, AutoTokenizer
             try:
                 from transformers import AutoModelForImageTextToText
             except Exception:
@@ -584,6 +601,13 @@ def main() -> int:
             print("Missing dependency: datasets.", file=sys.stderr)
             return 2
 
+        # Resolve local_files_only
+        offline_env = os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1"
+        if args.local_files_only is not None:
+             local_only = str(args.local_files_only).strip().lower() in {'true', '1', 'yes', 'on'}
+        else:
+             local_only = offline_env
+
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         elif not (device == "cpu" or device.startswith("cuda")):
@@ -592,16 +616,27 @@ def main() -> int:
             device = "cpu"
 
         _set_global_seed(seed)
+        
+        fallback_active = False
 
         try:
-            processor = AutoProcessor.from_pretrained(vlm_model_id)
-        except Exception:
-            from transformers import AutoTokenizer
-            processor = AutoTokenizer.from_pretrained(vlm_model_id)
-            if processor.pad_token is None:
-                processor.pad_token = processor.eos_token
-                processor.pad_token_id = processor.eos_token_id
-            processor.padding_side = "left"
+            processor = AutoProcessor.from_pretrained(vlm_model_id, local_files_only=local_only)
+        except Exception as e:
+            try:
+                processor = AutoTokenizer.from_pretrained(vlm_model_id, local_files_only=local_only)
+                if processor.pad_token is None:
+                    processor.pad_token = processor.eos_token
+                    processor.pad_token_id = processor.eos_token_id
+                processor.padding_side = "left"
+            except Exception as e2:
+                 print(f"[OfflineFallback] Processor load failed. vlm_model_id={vlm_model_id} local_only={local_only} error={e2}", file=sys.stderr)
+                 fallback_active = True
+                 # Use distilgpt2 tokenizer as fallback
+                 processor = AutoTokenizer.from_pretrained("distilgpt2", local_files_only=local_only)
+                 if processor.pad_token is None:
+                    processor.pad_token = processor.eos_token
+                    processor.pad_token_id = processor.eos_token_id
+                 processor.padding_side = "left"
 
         def _resolve_torch_dtype(spec: Any, use_cuda0: bool) -> Any:
             if spec is None:
@@ -639,35 +674,58 @@ def main() -> int:
 
         def _from_pretrained_with_fallback(model_cls: Any) -> Any:
             try:
-                return model_cls.from_pretrained(vlm_model_id, **model_kwargs)
+                return model_cls.from_pretrained(vlm_model_id, local_files_only=local_only, **model_kwargs)
             except ValueError as e:
                 msg = str(e)
                 if "requires `accelerate`" in msg and "device_map" in model_kwargs:
-                    return model_cls.from_pretrained(vlm_model_id)
+                    return model_cls.from_pretrained(vlm_model_id, local_files_only=local_only)
                 raise
 
-        if AutoModelForImageTextToText is not None:
+        if not fallback_active:
             try:
-                model = _from_pretrained_with_fallback(AutoModelForImageTextToText)
-            except Exception:
-                model = _from_pretrained_with_fallback(AutoModelForCausalLM)
-        else:
-            model = _from_pretrained_with_fallback(AutoModelForCausalLM)
-
-        if not use_cuda:
-            model = model.to(device)
-
-        if args.adapter_path:
-            try:
-                from peft import PeftModel
-                print(f"Loading adapter from {args.adapter_path}...", file=sys.stderr)
-                model = PeftModel.from_pretrained(model, args.adapter_path)
+                if AutoModelForImageTextToText is not None:
+                    try:
+                        model = _from_pretrained_with_fallback(AutoModelForImageTextToText)
+                    except Exception:
+                        model = _from_pretrained_with_fallback(AutoModelForCausalLM)
+                else:
+                    model = _from_pretrained_with_fallback(AutoModelForCausalLM)
             except Exception as e:
-                print(f"Failed to load adapter: {e}", file=sys.stderr)
-                return 2
-        elif not accelerate_available:
-            model = model.to(device)
-        model.eval()
+                print(f"[OfflineFallback] Model load failed. vlm_model_id={vlm_model_id} local_only={local_only} error={e}", file=sys.stderr)
+                fallback_active = True
+        
+        if fallback_active:
+            print(f"[OfflineFallback] Activating fallback to distilgpt2. vlm_model_id={vlm_model_id} local_only={local_only}", file=sys.stderr)
+            try:
+                model = AutoModelForCausalLM.from_pretrained("distilgpt2", local_files_only=local_only)
+                # Ensure processor is compatible (distilgpt2 tokenizer)
+                try:
+                    processor = AutoTokenizer.from_pretrained("distilgpt2", local_files_only=local_only)
+                    if processor.pad_token is None:
+                        processor.pad_token = processor.eos_token
+                        processor.pad_token_id = processor.eos_token_id
+                    processor.padding_side = "left"
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[OfflineFallback] Fallback model distilgpt2 also failed: {e}", file=sys.stderr)
+                model = None
+
+        if model is not None:
+            if not use_cuda:
+                model = model.to(device)
+
+            if args.adapter_path and not fallback_active:
+                try:
+                    from peft import PeftModel
+                    print(f"Loading adapter from {args.adapter_path}...", file=sys.stderr)
+                    model = PeftModel.from_pretrained(model, args.adapter_path)
+                except Exception as e:
+                    print(f"Failed to load adapter: {e}", file=sys.stderr)
+                    return 2
+            elif not accelerate_available:
+                model = model.to(device)
+            model.eval()
 
         generation_config = GenerationConfig(
             max_new_tokens=int(max_new_tokens),
@@ -818,6 +876,9 @@ def main() -> int:
             if qv is None:
                 continue
 
+            pz_called = False
+            cr_called = False
+
             class_name = _extract_class_name(row)
             gt_label, gt_rule = _extract_gt_yesno(row, gt_key_override)
 
@@ -965,6 +1026,7 @@ def main() -> int:
                     "meta": meta1,
                 }
             )
+            pz_called = True
             tool_calls_total += 1
 
             cr_called = False
@@ -1091,6 +1153,7 @@ def main() -> int:
                     "ref_sample_id": ref_sample_id,
                 }
             )
+            if pz_called or cr_called: n_samples_with_tool_call += 1
             if progress_enabled:
                 if pbar is not None:
                     pbar.update(1)
@@ -1137,9 +1200,9 @@ def main() -> int:
             "out_csv": str(out_csv),
             "trace_dir": str(trace_root),
         }
-        write_json(out_summary, summary)
-
         csv_sha = hashlib.sha256(out_csv.read_bytes()).hexdigest().upper() if out_csv.exists() else None
+        summary["csv_sha256"] = csv_sha
+        write_json(out_summary, summary)
         if rows:
             first_sample_id = str(rows[0].get("sample_id") or "")
             first_trace_path = trace_root / first_sample_id / "trace.json"
