@@ -616,7 +616,7 @@ def _run_sft_build(args) -> int:
         if out_jsonl_path.exists():
             extra.append((out_jsonl_path, out_jsonl_path.name))
             
-        _emit_minimal_evidence(res, ev_dir, Path(__file__), extra_files=extra, zip_name="evidence_l3_real.zip")
+        _emit_minimal_evidence(res, ev_dir, Path(__file__), extra_files=extra, zip_name="evidence_package.zip")
         print(f"Evidence generated at {ev_dir}")
 
     return 0
