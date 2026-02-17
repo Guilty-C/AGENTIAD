@@ -17,13 +17,19 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 # Bootstrap src path
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if (REPO_ROOT / "dist" / "src").exists() and str(REPO_ROOT / "dist" / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "dist" / "src"))
 if (REPO_ROOT / "src").exists() and str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
+
 # Import SSOT
-from agentiad_repro.paper_contract import PaperContract
+try:
+    from agentiad_repro.paper_contract import PaperContract
+except ModuleNotFoundError:
+    from paper_contract import PaperContract
 
 ACCEPT_L3_SPEC = {
     "total": 10,
