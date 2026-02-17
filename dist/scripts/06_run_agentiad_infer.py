@@ -1,40 +1,24 @@
 
+import sys
+from pathlib import Path
 import argparse
 import hashlib
 import json
 import os
 import random
 import re
-import sys
-from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+# Bootstrap src path
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if (REPO_ROOT / "dist" / "src").exists() and str(REPO_ROOT / "dist" / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "dist" / "src"))
+if (REPO_ROOT / "src").exists() and str(REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
 
 # Import SSOT
 from agentiad_repro.paper_contract import PaperContract
-
-def _bootstrap_src() -> Tuple[Path, str]:
-    # dist/scripts/06... -> parents[2] is repo_root
-    project_root = Path(__file__).resolve().parents[2]
-    
-    src_candidates = [
-        project_root / "src",
-        project_root / "dist/src"
-    ]
-    
-    injected = "NONE"
-    for p in src_candidates:
-        if p.exists():
-            if str(p) not in sys.path:
-                sys.path.insert(0, str(p))
-            
-            # Record which one we used
-            if p == project_root / "src":
-                injected = "repo_root/src"
-            else:
-                injected = "repo_root/dist/src"
-            break
-            
-    return project_root, injected
 
 
 def _read_text(path: Path) -> str:
@@ -455,7 +439,7 @@ def _package_evidence(evidence_dir: Path) -> None:
 
 
 def main() -> int:
-    project_root, _ = _bootstrap_src()
+    project_root = REPO_ROOT
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Config path")

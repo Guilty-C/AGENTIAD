@@ -1,19 +1,26 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 import argparse
 import hashlib
 import json
 import os
-import sys
 import shutil
 import zipfile
 import datetime
 import compileall
 import contextlib
 import io
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+
+# Bootstrap src path
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if (REPO_ROOT / "dist" / "src").exists() and str(REPO_ROOT / "dist" / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "dist" / "src"))
+if (REPO_ROOT / "src").exists() and str(REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Import SSOT
 from agentiad_repro.paper_contract import PaperContract
@@ -33,22 +40,7 @@ ACCEPT_L3_SPEC = {
 }
 
 
-def _bootstrap_src() -> Path:
-    # dist/scripts/08... -> parents[2] is repo_root
-    project_root = Path(__file__).resolve().parents[2]
-    
-    src_candidates = [
-        project_root / "src",
-        project_root / "dist/src"
-    ]
-    
-    for p in src_candidates:
-        if p.exists():
-            if str(p) not in sys.path:
-                sys.path.insert(0, str(p))
-            break
-            
-    return project_root
+
 
 
 def _read_text(path: Path) -> str:
@@ -257,7 +249,7 @@ def _normalize_assistant_content(content: str) -> str:
 
 
 def _run_sft_build(args) -> int:
-    project_root = _bootstrap_src()
+    project_root = REPO_ROOT
     
     from agentiad_repro.utils import get_env_snapshot, load_paths, sha256_text
 
@@ -760,7 +752,7 @@ def _emit_minimal_evidence(
 
 
 def _run_acceptance_audit(args) -> int:
-    project_root = _bootstrap_src()
+    project_root = REPO_ROOT
     script_path = Path(__file__).resolve()
     
     # 0. Initial Results Structure
@@ -1189,7 +1181,7 @@ def _run_acceptance_audit(args) -> int:
 
 
 def main() -> int:
-    project_root = _bootstrap_src()
+    project_root = REPO_ROOT
 
     parser = argparse.ArgumentParser()
     # Modified to allow config to be optional for audit (checked manually)
