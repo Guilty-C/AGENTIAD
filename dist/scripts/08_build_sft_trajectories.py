@@ -310,13 +310,11 @@ def _collect_traces_for_zip(trace_root: Path, items: List[Dict[str, Any]]) -> Li
         
     # Fail-fast if any traces are missing
     if missing_traces:
-        print(f"FATAL: Missing trace.json for samples: {missing_traces}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"Missing trace.json for samples: {missing_traces}")
         
     # Fail-fast if count mismatch
     if len(collected) != len(items):
-        print(f"FATAL: Trace count mismatch! Collected {len(collected)} != Expected {len(items)}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"Trace count mismatch! Collected {len(collected)} != Expected {len(items)}")
                     
     return collected
 
@@ -366,19 +364,10 @@ def _run_sft_build(args) -> int:
     else:
         # Safety Valve: Protect against accidental full-dataset runs locally (Soft Fallback)
         if eff_max_samples is None and not args.allow_full_dataset:
-            print(f"WARNING: Full dataset inference requested (max_samples=None) but traces are missing at {trace_root}.", file=sys.stderr)
-            print(f"         Defaulting to safe limit to avoid expensive local run. To run full dataset, use --allow_full_dataset.", file=sys.stderr)
-            
-            # Fallback to audit_max_samples (default 5) or config max_samples or 50
-            fallback = args.audit_max_samples if args.audit_max_samples else 50
-            if cfg.get("max_samples"):
-                try:
-                    fallback = int(cfg.get("max_samples"))
-                except Exception:
-                    pass
-            
-            eff_max_samples = fallback
-            print(f"         [Safety Valve] Falling back to max_samples={eff_max_samples}", file=sys.stderr)
+            print(f"FATAL: Full dataset inference requested (max_samples=None) but traces are missing at {trace_root}.", file=sys.stderr)
+            print(f"       Implicit full-dataset runs are prohibited for safety.", file=sys.stderr)
+            print(f"       Remediation: Explicitly pass --max_samples N (for partial run) or --allow_full_dataset (for full run).", file=sys.stderr)
+            return 2
 
         # For L2 inference, if eff_max_samples is None, we need to pass a large number
         # because the L2 script expects an int. But only for normal mode.
@@ -439,10 +428,10 @@ def _run_sft_build(args) -> int:
         turns_any = trace_obj.get("turns")
         turns: List[Any] = turns_any if isinstance(turns_any, list) else []
         has_tool_turn = any(
-            isinstance(t, dict) and (
-                (isinstance(t.get("tool_call"), dict) and t.get("tool_call")) or 
-                str(t.get("name") or "") in {"pz", "cr"}
-            )
+            isinstance(t, dict) and 
+            isinstance(t.get("tool_call"), dict) and 
+            t.get("tool_call") and
+            (t["tool_call"].get("name") in PaperContract.ALLOWED_TOOLS)
             for t in turns
         )
         if require_tool and not has_tool_turn:
