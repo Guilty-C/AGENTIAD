@@ -288,6 +288,7 @@ def _normalize_assistant_content(content: str) -> str:
 def _collect_traces_for_zip(trace_root: Path, items: List[Dict[str, Any]]) -> List[Tuple[Path, str]]:
     collected: List[Tuple[Path, str]] = []
     run_name = trace_root.name
+    missing_traces = []
     
     # We iterate items to ensure we only include traces for the trajectories we generated
     # This aligns the count with N_written
@@ -296,22 +297,26 @@ def _collect_traces_for_zip(trace_root: Path, items: List[Dict[str, Any]]) -> Li
         if not sample_id:
             continue
             
-        src_dir = trace_root / sample_id
-        if src_dir.exists() and src_dir.is_dir():
-            # Recursively collect all files in the source directory for zipping
-            # We do NOT copy them to ev_dir to avoid pollution and long paths
-            for root, dirs, files in os.walk(src_dir):
-                for f in files:
-                    fp = Path(root) / f
-                    # arcname: traces/<run_name>/<sample_id>/<rel_path>
-                    # This structure matches what verify_all expects (it unzips to tmp_unzip, 
-                    # then looks for tmp_unzip/traces if it exists)
-                    try:
-                        rel = fp.relative_to(src_dir)
-                        arcname = f"traces/{run_name}/{sample_id}/{str(rel).replace(os.sep, '/')}"
-                        collected.append((fp, arcname))
-                    except ValueError:
-                        pass
+        # Hard Guarantee: trace.json must exist
+        trace_json_path = trace_root / sample_id / "trace.json"
+        if not trace_json_path.exists():
+            missing_traces.append(sample_id)
+            continue
+            
+        # Only collect trace.json (and optional final.json if needed, but keeping it minimal)
+        # Structure: traces/<run_name>/<sample_id>/trace.json
+        arcname = f"traces/{run_name}/{sample_id}/trace.json"
+        collected.append((trace_json_path, arcname))
+        
+    # Fail-fast if any traces are missing
+    if missing_traces:
+        print(f"FATAL: Missing trace.json for samples: {missing_traces}", file=sys.stderr)
+        sys.exit(1)
+        
+    # Fail-fast if count mismatch
+    if len(collected) != len(items):
+        print(f"FATAL: Trace count mismatch! Collected {len(collected)} != Expected {len(items)}", file=sys.stderr)
+        sys.exit(1)
                     
     return collected
 
