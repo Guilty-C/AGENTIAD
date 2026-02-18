@@ -274,9 +274,11 @@ def _normalize_assistant_content(content: str) -> str:
     final_obj = {
         "anomaly_present": False,
         "top_anomaly": "none",
-        "visual_descriptions": [],
-        "_debug_content": safe_debug_str
+        "visual_descriptions": []
     }
+    
+    # Debug info to stderr only - strictly no pollution in SFT data
+    print(f"[NORMALIZE_DEBUG] {safe_debug_str}", file=sys.stderr)
 
     # 5. Emit Canonical JSON
     canonical_json = json.dumps(final_obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1162,14 +1164,6 @@ def _run_acceptance_audit(args) -> int:
                 n_pz_cr_pairs = 0
                 n_pz_before_cr_valid = 0
                 
-                def _is_pz(name: str) -> bool:
-                    name = name.lower()
-                    return "pz" in name or "phase" in name or "crop" in name
-                    
-                def _is_cr(name: str) -> bool:
-                    name = name.lower()
-                    return "cr" in name or "check" in name or "query" in name
-                
                 for it in items:
                     msgs = it.get("messages", [])
                     tool_calls = []
@@ -1179,9 +1173,12 @@ def _run_acceptance_audit(args) -> int:
                     for i, m in enumerate(msgs):
                         if m.get("role") == "assistant" and "tool_call" in m:
                             has_tool = True
-                            t_name = m.get("name", "")
-                            if not t_name and isinstance(m.get("tool_call"), dict):
-                                 t_name = m["tool_call"].get("function", {}).get("name", "")
+                            # Strict Contract Extraction
+                            t_name = ""
+                            tc = m.get("tool_call")
+                            if isinstance(tc, dict):
+                                t_name = tc.get("name", "")
+                            
                             tool_calls.append({"name": t_name, "idx": i})
                             
                             if i + 1 >= len(msgs) or msgs[i+1].get("role") != "tool":
@@ -1197,9 +1194,10 @@ def _run_acceptance_audit(args) -> int:
                     
                     for tc in tool_calls:
                         name = tc["name"]
-                        if first_pz_idx == -1 and _is_pz(name):
+                        # Strict Contract Matching (No Fuzzy Logic)
+                        if first_pz_idx == -1 and name == "crop_image_normalized":
                             first_pz_idx = tc["idx"]
-                        if first_cr_idx == -1 and _is_cr(name):
+                        if first_cr_idx == -1 and name == "query_image":
                             first_cr_idx = tc["idx"]
                             
                     if first_pz_idx != -1 and first_cr_idx != -1:
