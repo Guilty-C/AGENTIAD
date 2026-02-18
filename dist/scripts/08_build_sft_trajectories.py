@@ -285,13 +285,9 @@ def _normalize_assistant_content(content: str) -> str:
     return f"{PaperContract.TAG_ANSWER_START}\n{canonical_json}\n{PaperContract.TAG_ANSWER_END}"
 
 
-def _copy_and_collect_traces(trace_root: Path, ev_dir: Path, items: List[Dict[str, Any]]) -> List[Tuple[Path, str]]:
+def _collect_traces_for_zip(trace_root: Path, items: List[Dict[str, Any]]) -> List[Tuple[Path, str]]:
     collected: List[Tuple[Path, str]] = []
     run_name = trace_root.name
-    
-    # Target: ev_dir/traces/<run_name>
-    target_base = ev_dir / "traces" / run_name
-    target_base.mkdir(parents=True, exist_ok=True)
     
     # We iterate items to ensure we only include traces for the trajectories we generated
     # This aligns the count with N_written
@@ -300,21 +296,22 @@ def _copy_and_collect_traces(trace_root: Path, ev_dir: Path, items: List[Dict[st
         if not sample_id:
             continue
             
-        src = trace_root / sample_id
-        if src.exists() and src.is_dir():
-            dst = target_base / sample_id
-            if dst.exists():
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
-            
-            # Recursively collect all files in the copied directory for zipping
-            for root, dirs, files in os.walk(dst):
+        src_dir = trace_root / sample_id
+        if src_dir.exists() and src_dir.is_dir():
+            # Recursively collect all files in the source directory for zipping
+            # We do NOT copy them to ev_dir to avoid pollution and long paths
+            for root, dirs, files in os.walk(src_dir):
                 for f in files:
                     fp = Path(root) / f
-                    # arcname should be relative to ev_dir to maintain structure in zip
-                    # e.g. traces/run_name/sample_id/trace.json
-                    rel = fp.relative_to(ev_dir)
-                    collected.append((fp, str(rel).replace(os.sep, "/")))
+                    # arcname: traces/<run_name>/<sample_id>/<rel_path>
+                    # This structure matches what verify_all expects (it unzips to tmp_unzip, 
+                    # then looks for tmp_unzip/traces if it exists)
+                    try:
+                        rel = fp.relative_to(src_dir)
+                        arcname = f"traces/{run_name}/{sample_id}/{str(rel).replace(os.sep, '/')}"
+                        collected.append((fp, arcname))
+                    except ValueError:
+                        pass
                     
     return collected
 
@@ -651,7 +648,7 @@ def _run_sft_build(args) -> int:
             extra.append((out_jsonl_path, out_jsonl_path.name))
             
         # Copy and collect traces to match verify_all expectations
-        trace_extras = _copy_and_collect_traces(trace_root, ev_dir, items)
+        trace_extras = _collect_traces_for_zip(trace_root, items)
         extra.extend(trace_extras)
             
         _emit_minimal_evidence(res, ev_dir, Path(__file__), extra_files=extra, zip_name="evidence_package.zip")
