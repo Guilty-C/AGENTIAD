@@ -628,9 +628,46 @@ class AgentInfer06(Stage):
                     # CMD_FAILED already recorded by helper
                     return
                 
+                # Task B: Parse L2_RESULT_JSON for effective_n
+                l2_effective_n = None
+                if cmd_res and cmd_res.stderr:
+                    try:
+                        # Scan stderr for "L2_RESULT_JSON="
+                        for line in cmd_res.stderr.decode("utf-8", errors="replace").splitlines():
+                            if line.strip().startswith("L2_RESULT_JSON="):
+                                json_str = line.strip()[len("L2_RESULT_JSON="):]
+                                l2_data = json.loads(json_str)
+                                if "effective_n" in l2_data:
+                                    l2_effective_n = int(l2_data["effective_n"])
+                                    res.artifacts[f"seed_{seed}_l2_effective_n"] = l2_effective_n
+                                    # Also record skip info for audit
+                                    if "n_skipped" in l2_data:
+                                         res.artifacts[f"seed_{seed}_l2_skipped"] = l2_data["n_skipped"]
+                                    if "skip_reasons" in l2_data:
+                                         res.artifacts[f"seed_{seed}_l2_skip_reasons"] = l2_data["skip_reasons"]
+                                    
+                                    # Audit check: mismatch between requested and effective
+                                    if "n_requested_ids" in l2_data:
+                                        n_req = int(l2_data["n_requested_ids"])
+                                        if n_req != l2_effective_n:
+                                            res.artifacts["evidence_checks"].append({
+                                                "stage": f"S{seed}-06",
+                                                "stable_stage": "AgentInfer06",
+                                                "label": f"S{seed}-06",
+                                                "code": "EFFECTIVE_N_MISMATCH",
+                                                "msg": f"Requested {n_req} != Effective {l2_effective_n} (Skipped {l2_data.get('n_skipped', 0)})"
+                                            })
+                                break
+                    except Exception as e:
+                        print(f"Warning: Failed to parse L2_RESULT_JSON: {e}", file=sys.stderr)
+
                 eff_max = ctx.get_effective_max_samples()
                 subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
                 
+                # If Phase 1 and we have effective_n, use it for strict J3
+                if ctx.phase1_baseline and l2_effective_n is not None:
+                     subset_size = l2_effective_n
+
                 code, msg, dur = Evidence.verify_zip(ev_06 / "evidence_package.zip", "06_run_agentiad_infer.py", expected_trace_count=subset_size)
                 res.artifacts["evidence_checks"].append({
                     "stage": f"S{seed}-06", 

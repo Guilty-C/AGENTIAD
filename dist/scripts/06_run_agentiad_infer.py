@@ -893,6 +893,13 @@ def main() -> int:
         except Exception as e:
             print(f"Error loading id_list: {e}", file=sys.stderr)
 
+    # Audit Counters
+    n_requested_ids = len(id_list_set) if id_list_set is not None else n_total
+    n_attempted = 0
+    n_success = 0
+    n_skipped = 0
+    skip_reasons: Dict[str, int] = {}
+
     try:
         for idx in candidates:
             if len(rows) >= max_samples:
@@ -900,28 +907,45 @@ def main() -> int:
             attempts += 1
             if attempts > max_attempts:
                 break
-
+            
+            n_attempted += 1
             row = d0[int(idx)]
             if not isinstance(row, dict):
+                n_skipped += 1
+                skip_reasons["invalid_row"] = skip_reasons.get("invalid_row", 0) + 1
                 continue
             
             sample_id = _sample_id(split, int(idx), row)
             if id_list_set is not None and sample_id not in id_list_set:
+                # Not counted as skipped if filtered by explicit ID list
+                # Wait, n_attempted should reflect "attempted from candidates"
+                # If filtered by list, it's skipped from processing.
+                # Let's count it as "filtered_id" but not generic "skipped" error?
+                # Actually, loop continues.
+                # Let's adjust n_attempted to mean "entered critical section"
+                # If we filter by ID, we technically didn't attempt inference.
+                n_attempted -= 1
                 continue
-
+            
+            # Now we are committed to this sample
+            
             qv = row.get("query_image")
             if qv is None:
+                n_skipped += 1
+                skip_reasons["missing_image_key"] = skip_reasons.get("missing_image_key", 0) + 1
                 continue
 
             pz_called = False
             cr_called = False
-
+            
             class_name = _extract_class_name(row)
             gt_label, gt_rule = _extract_gt_yesno(row, gt_key_override)
 
             try:
                 img = _decode_hf_image(dataset_id, qv).convert("RGB")
-            except Exception:
+            except Exception as e:
+                n_skipped += 1
+                skip_reasons["image_load_error"] = skip_reasons.get("image_load_error", 0) + 1
                 continue
 
             sample_dir = ensure_dir(trace_root / sample_id)
@@ -953,10 +977,16 @@ def main() -> int:
                 "turns": [],
             }
 
-            if args.dry_run:
-                raw0 = _vlm_generate_dry([img], prompt_global, sample_id, seed)
-            else:
-                raw0 = _vlm_generate(processor, model, [img], prompt_global, generation_config)
+            try:
+                if args.dry_run:
+                    raw0 = _vlm_generate_dry([img], prompt_global, sample_id, seed)
+                else:
+                    raw0 = _vlm_generate(processor, model, [img], prompt_global, generation_config)
+            except Exception as e:
+                n_skipped += 1
+                skip_reasons["inference_exception"] = skip_reasons.get("inference_exception", 0) + 1
+                continue
+                
             parsed0, meta0 = _parse_agent_json(raw0)
             trace["turns"].append(
                 {
@@ -1014,6 +1044,7 @@ def main() -> int:
                         "ref_sample_id": ref_sample_id,
                     }
                 )
+                n_success += 1
                 if progress_enabled:
                      if pbar is not None: pbar.update(1)
                 continue
@@ -1124,6 +1155,7 @@ def main() -> int:
                         raw2 = _vlm_generate(processor, model, [crop_img, ref_img], prompt_cr, generation_config)
                     except Exception:
                         raw2 = _vlm_generate(processor, model, [crop_img], prompt_cr, generation_config)
+                    
 
                 parsed2, meta2 = _parse_agent_json(raw2)
                 trace["turns"].append(
@@ -1136,6 +1168,7 @@ def main() -> int:
                         "raw_output": raw2,
                         "parsed": parsed2,
                         "meta": meta2,
+                        "ref_sample_id": ref_sample_id
                     }
                 )
                 tool_calls_total += 1
@@ -1190,6 +1223,7 @@ def main() -> int:
                     "ref_sample_id": ref_sample_id,
                 }
             )
+            n_success += 1
             if pz_called or cr_called: n_samples_with_tool_call += 1
             if progress_enabled:
                 if pbar is not None:
@@ -1231,6 +1265,12 @@ def main() -> int:
             "split": split,
             "max_samples": int(max_samples),
             "N": int(len(rows)),
+            "effective_n": int(n_success),
+            "n_requested_ids": int(n_requested_ids),
+            "n_attempted": int(n_attempted),
+            "n_success": int(n_success),
+            "n_skipped": int(n_skipped),
+            "skip_reasons": skip_reasons,
             "toolcall_rate": (float(n_samples_with_tool_call) / float(len(rows))) if rows else 0.0,
             "tool_calls_total": int(tool_calls_total),
             "uncertainty_rule": cr_rule,
@@ -1271,6 +1311,12 @@ def main() -> int:
         "csv_sha256": csv_sha,
         "first_sample_id": first_sample_id if rows else None,
         "first_trace_fingerprint_hash": first_hash if rows else None,
+        "effective_n": int(n_success),
+        "n_requested_ids": int(n_requested_ids),
+        "n_attempted": int(n_attempted),
+        "n_success": int(n_success),
+        "n_skipped": int(n_skipped),
+        "skip_reasons": skip_reasons,
     }
 
     # Log readable summary to stderr (Audit/Debug)
