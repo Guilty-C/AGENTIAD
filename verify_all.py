@@ -914,31 +914,46 @@ class Phase1Metrics(Stage):
         import numpy as np
         
         all_dfs = []
+        agg_dir = ctx.work_dir / "aggregate"
+        agg_dir.mkdir(parents=True, exist_ok=True)
+        
         for seed in ctx.seeds:
             s_dir = ctx.work_dir / f"seed_{seed}"
+            # Ensure per-seed output directory exists
+            s_dir.mkdir(parents=True, exist_ok=True)
+
             tables_dir = s_dir / "ev_06" / "tables"
-            if not tables_dir.exists(): continue
+            if not tables_dir.exists():
+                # Only error if we expected this seed to run
+                continue
             
-            csv_files = list(tables_dir.glob("agent_pzcr_*.csv"))
-            if not csv_files: continue
-            csv_path = csv_files[0]
+            # Robust location: agentiad_infer_mr_s{seed}.csv
+            csv_name = f"agentiad_infer_mr_s{seed}.csv"
+            csv_path = tables_dir / csv_name
+            
+            if not csv_path.exists():
+                res.errors.append(f"Metrics CSV missing for seed {seed}: {csv_path}")
+                continue
             
             try:
                 df = pd.read_csv(csv_path)
                 df["seed"] = seed
                 all_dfs.append(df)
                 
-                target_csv = ctx.work_dir / f"baseline_metrics_s{seed}.csv"
+                # Copy to stable layout
+                target_csv = s_dir / "baseline_metrics.csv"
                 shutil.copy(csv_path, target_csv)
                 
-                if "class_name" in df.columns:
-                     # Calculate accuracy per class
-                     # acc = correct / count
+                # Per-class
+                if "class_name" in df.columns and "correct" in df.columns:
                      per_class = df.groupby("class_name").agg(
                          acc=("correct", "mean"),
                          count=("correct", "count")
                      ).reset_index()
-                     per_class.to_csv(ctx.work_dir / f"baseline_per_class_s{seed}.csv", index=False)
+                     per_class.to_csv(s_dir / "baseline_per_class.csv", index=False)
+                else:
+                     # Minimal fallback
+                     (s_dir / "baseline_per_class.csv").write_text("class_name,acc,count\n", encoding="utf-8")
 
             except Exception as e:
                 res.errors.append(f"Metrics Aggregation Seed {seed} failed: {e}")
@@ -947,28 +962,61 @@ class Phase1Metrics(Stage):
             res.errors.append("No metrics CSVs found for aggregation")
             return
 
+        # Aggregation
         seed_accs = []
         for df in all_dfs:
              if "correct" in df.columns:
                  acc = df["correct"].mean()
                  seed_accs.append(acc)
         
+        mean_acc = 0.0
+        std_acc = 0.0
         if seed_accs:
-            mean_acc = np.mean(seed_accs)
-            std_acc = np.std(seed_accs)
+            mean_acc = float(np.mean(seed_accs))
+            std_acc = float(np.std(seed_accs))
             
-            agg_df = pd.DataFrame([{
-                "metric": "accuracy",
-                "mean": mean_acc,
-                "std": std_acc,
-                "seeds": len(seed_accs)
-            }])
-            agg_df.to_csv(ctx.work_dir / "metrics_mean_std.csv", index=False)
+        agg_df = pd.DataFrame([{
+            "metric": "accuracy",
+            "mean": mean_acc,
+            "std": std_acc,
+            "seeds": len(seed_accs)
+        }])
+        agg_csv = agg_dir / "metrics_mean_std.csv"
+        agg_df.to_csv(agg_csv, index=False)
+        
+        res.artifacts["phase1_metrics"] = {
+            "accuracy_mean": mean_acc,
+            "accuracy_std": std_acc
+        }
+        
+        # Evidence Zip for Aggregate
+        self._package_aggregate(agg_dir, [agg_csv])
+
+    def _package_aggregate(self, agg_dir: Path, files: List[Path]):
+        try:
+            zip_path = agg_dir / "evidence_package.zip"
+            index_path = agg_dir / "INDEX.txt"
+            idx_lines = []
             
-            res.artifacts["phase1_metrics"] = {
-                "accuracy_mean": float(mean_acc),
-                "accuracy_std": float(std_acc)
-            }
+            for fp in files:
+                if not fp.exists(): continue
+                sha = hashlib.sha256(fp.read_bytes()).hexdigest().upper()
+                size = fp.stat().st_size
+                idx_lines.append(f"{fp.name} {size} {sha}")
+            
+            index_path.write_text("\n".join(idx_lines) + "\n", encoding="utf-8")
+            
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for fp in files:
+                    if fp.exists(): zf.write(fp, arcname=fp.name)
+                zf.write(index_path, arcname="INDEX.txt")
+                
+            if zip_path.exists():
+                sha_zip = hashlib.sha256(zip_path.read_bytes()).hexdigest().upper()
+                with open(index_path, "a", encoding="utf-8") as f:
+                    f.write(f"file=evidence_package.zip sha256={sha_zip} (content_hash)\n")
+        except Exception as e:
+            print(f"Aggregate packaging failed: {e}", file=sys.stderr)
 
 class GateEvaluator:
     @staticmethod
