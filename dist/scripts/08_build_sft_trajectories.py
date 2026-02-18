@@ -364,14 +364,21 @@ def _run_sft_build(args) -> int:
         print(f"Traces found at {trace_root}, skipping L2 inference.", file=sys.stderr)
         rc = 0
     else:
-        # Safety Valve: Protect against accidental full-dataset runs locally
+        # Safety Valve: Protect against accidental full-dataset runs locally (Soft Fallback)
         if eff_max_samples is None and not args.allow_full_dataset:
-            print(f"FATAL: Full dataset inference requested (max_samples=None) but traces are missing at {trace_root}.", file=sys.stderr)
-            print(f"       This is a potentially expensive operation. Please:", file=sys.stderr)
-            print(f"       1. Run with explicit limit: --max_samples N", file=sys.stderr)
-            print(f"       2. OR confirm full run: --allow_full_dataset", file=sys.stderr)
-            print(f"       3. OR run on remote infrastructure.", file=sys.stderr)
-            return 2
+            print(f"WARNING: Full dataset inference requested (max_samples=None) but traces are missing at {trace_root}.", file=sys.stderr)
+            print(f"         Defaulting to safe limit to avoid expensive local run. To run full dataset, use --allow_full_dataset.", file=sys.stderr)
+            
+            # Fallback to audit_max_samples (default 5) or config max_samples or 50
+            fallback = args.audit_max_samples if args.audit_max_samples else 50
+            if cfg.get("max_samples"):
+                try:
+                    fallback = int(cfg.get("max_samples"))
+                except Exception:
+                    pass
+            
+            eff_max_samples = fallback
+            print(f"         [Safety Valve] Falling back to max_samples={eff_max_samples}", file=sys.stderr)
 
         # For L2 inference, if eff_max_samples is None, we need to pass a large number
         # because the L2 script expects an int. But only for normal mode.
@@ -432,7 +439,10 @@ def _run_sft_build(args) -> int:
         turns_any = trace_obj.get("turns")
         turns: List[Any] = turns_any if isinstance(turns_any, list) else []
         has_tool_turn = any(
-            isinstance(t, dict) and str(t.get("name") or "") in {"pz", "cr"}
+            isinstance(t, dict) and (
+                (isinstance(t.get("tool_call"), dict) and t.get("tool_call")) or 
+                str(t.get("name") or "") in {"pz", "cr"}
+            )
             for t in turns
         )
         if require_tool and not has_tool_turn:
