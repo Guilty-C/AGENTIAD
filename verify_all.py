@@ -669,13 +669,27 @@ class AgentInfer06(Stage):
                                     if "n_requested_ids" in l2_data:
                                         n_req = int(l2_data["n_requested_ids"])
                                         if n_req != l2_effective_n:
+                                            n_skipped = int(l2_data.get("n_skipped", 0))
+                                            skip_reasons = l2_data.get("skip_reasons", {})
                                             res.artifacts["evidence_checks"].append({
                                                 "stage": f"S{seed}-06",
                                                 "stable_stage": "AgentInfer06",
                                                 "label": f"S{seed}-06",
                                                 "code": "EFFECTIVE_N_MISMATCH",
-                                                "msg": f"Requested {n_req} != Effective {l2_effective_n} (Skipped {l2_data.get('n_skipped', 0)})"
+                                                "msg": f"Requested {n_req} != Effective {l2_effective_n} (Skipped {n_skipped}; Reasons={skip_reasons})"
                                             })
+                                            if ctx.phase1_baseline:
+                                                res.success = False
+                                                res.gates["J3"] = False
+                                                res.errors.append(
+                                                    f"Phase1 dataset completeness failure: effective_n ({l2_effective_n}) != n_requested_ids ({n_req}); n_skipped={n_skipped}, skip_reasons={skip_reasons}. This is a data availability issue, not a model failure."
+                                                )
+                                                remediation = (
+                                                    "ensure MMAD assets are fully present locally / HF cache contains required files; "
+                                                    "avoid HF_*_OFFLINE=1 unless cache complete; re-run dataset sync"
+                                                )
+                                                if remediation not in res.remediations:
+                                                    res.remediations.append(remediation)
                                 break
                     except Exception as e:
                         print(f"Warning: Failed to parse L2_RESULT_JSON: {e}", file=sys.stderr)
@@ -1236,6 +1250,10 @@ class GateEvaluator:
         coverage_ok = True
         if res.artifacts["evidence_checks"]:
              coverage_ok = all(check["code"] != "TRACE_COUNT_MISMATCH" for check in res.artifacts["evidence_checks"])
+             if ctx.phase1_baseline:
+                 coverage_ok = coverage_ok and all(
+                     check.get("code") != "EFFECTIVE_N_MISMATCH" for check in res.artifacts["evidence_checks"]
+                 )
         res.gates["J3"] = coverage_ok
 
         # J1: Flags (Checked per stage)
