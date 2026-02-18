@@ -355,19 +355,24 @@ def _run_sft_build(args) -> int:
 
     # Determine effective max_samples (handle None -> infinite)
     # Default is None (process all), unless restricted
-    eff_max_samples = int(args.max_samples) if args.max_samples is not None else 999999
+    eff_max_samples = int(args.max_samples) if args.max_samples is not None else None
     
-    print(f"audit_max_samples_effective={args.audit_max_samples}")
+    print(f"[L3] max_samples={args.max_samples} eff_max_samples={eff_max_samples} audit_max_samples={args.audit_max_samples} acceptance_audit={args.acceptance_audit}", file=sys.stderr)
 
     trace_root = (paths.traces_dir / run_name).resolve()
     if trace_root.exists() and any(trace_root.iterdir()):
         print(f"Traces found at {trace_root}, skipping L2 inference.")
         rc = 0
     else:
+        # For L2 inference, if eff_max_samples is None, we need to pass a large number
+        # because the L2 script expects an int. But only for normal mode.
+        # In acceptance_audit mode, max_samples will be set to audit_max_samples (int).
+        l2_max_samples = eff_max_samples if eff_max_samples is not None else 10**9
+        
         rc = _run_l2_infer(
             project_root=project_root,
             config_path=cfg_path,
-            max_samples=eff_max_samples,
+            max_samples=l2_max_samples,
             seed=int(args.seed),
             run_name=run_name,
             out_split=split,
@@ -396,7 +401,7 @@ def _run_sft_build(args) -> int:
     allow_skip = bool(args.allow_skip)
     
     # Use effective limit for loop
-    limit_samples = eff_max_samples
+    limit_samples = eff_max_samples if eff_max_samples is not None else float('inf')
 
     skipped_trace = 0
     skipped_final = 0
@@ -1285,11 +1290,17 @@ def main() -> int:
     # Audit args
     parser.add_argument("--acceptance_audit", action="store_true")
     parser.add_argument("--evidence_dir", type=str, default=None)
-    parser.add_argument("--audit_max_samples", type=int, default=None)
+    parser.add_argument("--audit_max_samples", type=int, default=5)
     
     args = parser.parse_args()
     
     if args.acceptance_audit:
+        # Defensive check for audit default
+        if not isinstance(args.audit_max_samples, int) or args.audit_max_samples <= 0:
+             print("WARNING: audit_max_samples invalid, defaulting to 5", file=sys.stderr)
+             args.audit_max_samples = 5
+        # Enforce deterministic small run for audit
+        args.max_samples = args.audit_max_samples
         return _run_acceptance_audit(args)
     else:
         if not args.config:
