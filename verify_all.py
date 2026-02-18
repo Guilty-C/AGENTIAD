@@ -988,6 +988,29 @@ class GRPOInfer(Stage):
             if code != "OK": res.success = False; res.errors.append(f"GRPOInfer Evidence: {msg}")
 
 class Phase1Metrics(Stage):
+    @staticmethod
+    def _normalize_yesno(x: Any) -> str:
+        if x is None:
+            return ""
+        s = str(x).strip().lower()
+        if s in {"yes", "y", "true", "1", "anomaly", "abnormal"}:
+            return "yes"
+        if s in {"no", "n", "false", "0", "normal"}:
+            return "no"
+        return ""
+
+    @classmethod
+    def _resolve_correct_series(cls, df):
+        import pandas as pd
+
+        if "correct" in df.columns:
+            return pd.to_numeric(df["correct"], errors="coerce").fillna(0.0)
+        if "gt_label" in df.columns and "pred_label" in df.columns:
+            gt = df["gt_label"].map(cls._normalize_yesno)
+            pred = df["pred_label"].map(cls._normalize_yesno)
+            return (gt == pred).astype(float)
+        return None
+
     def execute(self, ctx: StageContext, res: StageResult):
         if not ctx.phase1_baseline or not res.success: return
         
@@ -1019,6 +1042,15 @@ class Phase1Metrics(Stage):
                     
                     with zf.open(csv_name) as f:
                         df = pd.read_csv(f)
+
+                correct_series = self._resolve_correct_series(df)
+                if correct_series is None:
+                    res.errors.append(
+                        f"Phase1Metrics seed {seed} missing accuracy fields: need 'correct' or ('gt_label' and 'pred_label')"
+                    )
+                    continue
+                if "correct" not in df.columns:
+                    df["correct"] = correct_series
                 
                 df["seed"] = seed
                 all_dfs.append(df)
@@ -1048,10 +1080,13 @@ class Phase1Metrics(Stage):
         # Aggregation
         seed_accs = []
         for df in all_dfs:
-             if "correct" in df.columns:
-                 acc = df["correct"].mean()
-                 seed_accs.append(acc)
-        
+             correct_series = self._resolve_correct_series(df)
+             if correct_series is None:
+                 res.errors.append("Phase1Metrics aggregation missing accuracy fields in one seed dataframe")
+                 continue
+             acc = correct_series.mean()
+             seed_accs.append(acc)
+
         mean_acc = 0.0
         std_acc = 0.0
         if seed_accs:

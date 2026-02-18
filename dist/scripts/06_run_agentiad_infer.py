@@ -149,6 +149,42 @@ def _extract_class_name(row: Mapping[str, Any]) -> str:
     return ""
 
 
+class ImageLoadError(Exception):
+    def __init__(self, reason: str, message: str, detail: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.reason = reason
+        self.detail = detail or {}
+
+
+def _image_loader_env_snapshot() -> Dict[str, Any]:
+    hf_home = os.environ.get("HF_HOME") or os.environ.get("HUGGINGFACE_HUB_CACHE") or str(Path.home() / ".cache" / "huggingface")
+    return {
+        "TRANSFORMERS_OFFLINE": os.environ.get("TRANSFORMERS_OFFLINE", ""),
+        "HF_DATASETS_OFFLINE": os.environ.get("HF_DATASETS_OFFLINE", ""),
+        "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", ""),
+        "HF_HOME": hf_home,
+    }
+
+
+def _extract_image_candidates(row: Mapping[str, Any]) -> List[Tuple[str, Any]]:
+    out: List[Tuple[str, Any]] = []
+    for key in ["query_image", "image", "img", "image_path", "path", "file_path", "image_file", "image_bytes", "bytes"]:
+        if key in row and row.get(key) is not None:
+            out.append((key, row.get(key)))
+    return out
+
+
+def _classify_image_error(exc: Exception) -> str:
+    msg = str(exc).lower()
+    if "cannot identify image file" in msg or "truncated" in msg or "decoder" in msg:
+        return "decode_error"
+    if isinstance(exc, FileNotFoundError):
+        return "missing_file"
+    if isinstance(exc, TypeError):
+        return "unsupported_image_value"
+    return "image_load_error_other"
+
+
 def _git_commit() -> Optional[str]:
     try:
         import subprocess
@@ -280,45 +316,82 @@ def _decode_hf_image(dataset_id: str, value: Any) -> "PIL.Image.Image":
     from PIL import Image as PILImage
 
     if value is None:
-        raise ValueError("image is None")
+        raise ImageLoadError("no_image_field", "image is None")
     if hasattr(value, "save"):
         return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return PILImage.open(io.BytesIO(bytes(value)))
+        except Exception as e:
+            raise ImageLoadError("bad_bytes", f"Failed to decode bytes image: {type(e).__name__}: {e}") from e
     if isinstance(value, dict):
         if "bytes" in value and value["bytes"] is not None:
-            return PILImage.open(io.BytesIO(value["bytes"]))
+            try:
+                return PILImage.open(io.BytesIO(value["bytes"]))
+            except Exception as e:
+                raise ImageLoadError("bad_bytes", f"Failed to decode dict bytes image: {type(e).__name__}: {e}") from e
         if "path" in value and value["path"]:
             p = _Path(value["path"])
             if p.exists():
-                return PILImage.open(p)
+                try:
+                    return PILImage.open(p)
+                except Exception as e:
+                    raise ImageLoadError("decode_error", f"Failed to decode local path image: {type(e).__name__}: {e}", {"path": str(p)}) from e
+            raise ImageLoadError("missing_file", f"Local image path missing: {p}", {"path": str(p)})
     if not isinstance(value, str):
-        raise TypeError(f"Unsupported image type: {type(value)}")
+        raise ImageLoadError("unsupported_image_value", f"Unsupported image type: {type(value)}")
 
     p = _Path(value)
     if p.exists():
-        return PILImage.open(p)
+        try:
+            return PILImage.open(p)
+        except Exception as e:
+            raise ImageLoadError("decode_error", f"Failed to decode local image: {type(e).__name__}: {e}", {"path": str(p)}) from e
 
     try:
         from huggingface_hub import hf_hub_download
         from huggingface_hub.utils import EntryNotFoundError
     except Exception as e:
-        raise RuntimeError("huggingface_hub is required to fetch images.") from e
+        raise ImageLoadError("hub_unavailable", f"huggingface_hub import failed: {type(e).__name__}: {e}") from e
 
     if value.startswith("MVTec-AD/"):
         rev = _os.environ.get("MMAD_MVTEC_AD_REVISION") or "e88b7bd615ad582b0a7e8238066a9fb293a072b4"
-        local_path = hf_hub_download(repo_id=dataset_id, repo_type="dataset", filename=value, revision=rev)
-        return PILImage.open(local_path)
+        try:
+            local_path = hf_hub_download(repo_id=dataset_id, repo_type="dataset", filename=value, revision=rev)
+            return PILImage.open(local_path)
+        except Exception as e:
+            raise ImageLoadError("hub_download_error", f"HF download failed: {type(e).__name__}: {e}", {"filename": value, "revision": rev}) from e
 
     if value.startswith("DS-MVTec/"):
         rev = _os.environ.get("MMAD_ASSET_REVISION") or "f1ad11c07452dff1e023a0df1093e40701d22cab"
-        local_path = hf_hub_download(repo_id=dataset_id, repo_type="dataset", filename=value, revision=rev)
-        return PILImage.open(local_path)
+        try:
+            local_path = hf_hub_download(repo_id=dataset_id, repo_type="dataset", filename=value, revision=rev)
+            return PILImage.open(local_path)
+        except Exception as e:
+            raise ImageLoadError("hub_download_error", f"HF download failed: {type(e).__name__}: {e}", {"filename": value, "revision": rev}) from e
 
     try:
         local_path = hf_hub_download(repo_id=dataset_id, repo_type="dataset", filename=value)
     except EntryNotFoundError:
         rev = _os.environ.get("MMAD_ASSET_REVISION") or "f1ad11c07452dff1e023a0df1093e40701d22cab"
-        local_path = hf_hub_download(repo_id=dataset_id, repo_type="dataset", filename=value, revision=rev)
-    return PILImage.open(local_path)
+        try:
+            local_path = hf_hub_download(repo_id=dataset_id, repo_type="dataset", filename=value, revision=rev)
+        except Exception as e:
+            raise ImageLoadError("hub_download_error", f"HF fallback download failed: {type(e).__name__}: {e}", {"filename": value, "revision": rev}) from e
+    except Exception as e:
+        raise ImageLoadError("hub_download_error", f"HF download failed: {type(e).__name__}: {e}", {"filename": value}) from e
+    try:
+        return PILImage.open(local_path)
+    except Exception as e:
+        raise ImageLoadError("decode_error", f"Failed to decode hub image: {type(e).__name__}: {e}", {"path": str(local_path)}) from e
+
+
+def _compute_correct(gt_label: Any, pred_label: Any) -> int:
+    gt = _normalize_yesno(gt_label)
+    pred = _normalize_yesno(pred_label)
+    if gt in {"yes", "no"} and pred in {"yes", "no"}:
+        return 1 if gt == pred else 0
+    return 0
 
 
 def _infer_model_device(model: Any) -> "torch.device":
@@ -899,6 +972,8 @@ def main() -> int:
     n_success = 0
     n_skipped = 0
     skip_reasons: Dict[str, int] = {}
+    skip_reason_examples: Dict[str, List[Dict[str, Any]]] = {}
+    image_env = _image_loader_env_snapshot()
 
     try:
         for idx in candidates:
@@ -929,11 +1004,12 @@ def main() -> int:
             
             # Now we are committed to this sample
             
-            qv = row.get("query_image")
-            if qv is None:
+            image_candidates = _extract_image_candidates(row)
+            if not image_candidates:
                 n_skipped += 1
-                skip_reasons["missing_image_key"] = skip_reasons.get("missing_image_key", 0) + 1
+                skip_reasons["no_image_field"] = skip_reasons.get("no_image_field", 0) + 1
                 continue
+            qv = image_candidates[0][1]
 
             pz_called = False
             cr_called = False
@@ -941,11 +1017,53 @@ def main() -> int:
             class_name = _extract_class_name(row)
             gt_label, gt_rule = _extract_gt_yesno(row, gt_key_override)
 
-            try:
-                img = _decode_hf_image(dataset_id, qv).convert("RGB")
-            except Exception as e:
+            img = None
+            image_field_used = ""
+            last_image_error: Optional[Exception] = None
+            for field_name, field_value in image_candidates:
+                try:
+                    img = _decode_hf_image(dataset_id, field_value).convert("RGB")
+                    image_field_used = field_name
+                    qv = field_value
+                    break
+                except Exception as e:
+                    last_image_error = e
+            if img is None:
                 n_skipped += 1
-                skip_reasons["image_load_error"] = skip_reasons.get("image_load_error", 0) + 1
+                reason = "image_load_error_other"
+                err_type = "UnknownError"
+                err_text = "image decode failed"
+                detail: Dict[str, Any] = {}
+                if isinstance(last_image_error, ImageLoadError):
+                    reason = last_image_error.reason
+                    err_type = type(last_image_error).__name__
+                    err_text = str(last_image_error)
+                    detail = dict(last_image_error.detail or {})
+                elif isinstance(last_image_error, Exception):
+                    reason = _classify_image_error(last_image_error)
+                    err_type = type(last_image_error).__name__
+                    err_text = str(last_image_error)
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                example = {
+                    "sample_id": sample_id,
+                    "split": split,
+                    "idx": int(idx),
+                    "error_type": err_type,
+                    "error": err_text,
+                    "candidate_fields": [name for name, _ in image_candidates],
+                    "offline": {
+                        "TRANSFORMERS_OFFLINE": image_env.get("TRANSFORMERS_OFFLINE", ""),
+                        "HF_DATASETS_OFFLINE": image_env.get("HF_DATASETS_OFFLINE", ""),
+                        "HF_HUB_OFFLINE": image_env.get("HF_HUB_OFFLINE", ""),
+                    },
+                    "hf_cache_root": image_env.get("HF_HOME", ""),
+                }
+                if detail:
+                    example["detail"] = detail
+                if reason not in skip_reason_examples:
+                    skip_reason_examples[reason] = []
+                if len(skip_reason_examples[reason]) < 20:
+                    skip_reason_examples[reason].append(example)
                 continue
 
             sample_dir = ensure_dir(trace_root / sample_id)
@@ -970,6 +1088,7 @@ def main() -> int:
                 },
                 "input": {
                     "query_image": qv if isinstance(qv, str) else "<in_memory_image>",
+                    "query_image_field": image_field_used,
                     "query_image_type": type(qv).__name__,
                     "image_mode": getattr(img, "mode", None),
                     "image_size": list(getattr(img, "size", (None, None))),
@@ -1033,6 +1152,7 @@ def main() -> int:
                         "class_name": class_name,
                         "gt_label": gt_label,
                         "pred_label": pred_label,
+                        "correct": _compute_correct(gt_label, pred_label),
                         "raw_output": raw0,
                         "model_id": vlm_model_id,
                         "seed": int(seed),
@@ -1212,6 +1332,7 @@ def main() -> int:
                     "class_name": class_name,
                     "gt_label": gt_label,
                     "pred_label": pred_label,
+                    "correct": _compute_correct(gt_label, pred_label),
                     "raw_output": raw_output,
                     "model_id": vlm_model_id,
                     "seed": int(seed),
@@ -1240,6 +1361,7 @@ def main() -> int:
                 "class_name",
                 "gt_label",
                 "pred_label",
+                "correct",
                 "raw_output",
                 "model_id",
                 "seed",
@@ -1271,6 +1393,8 @@ def main() -> int:
             "n_success": int(n_success),
             "n_skipped": int(n_skipped),
             "skip_reasons": skip_reasons,
+            "skip_reason_examples": skip_reason_examples,
+            "image_loader_env": image_env,
             "toolcall_rate": (float(n_samples_with_tool_call) / float(len(rows))) if rows else 0.0,
             "tool_calls_total": int(tool_calls_total),
             "uncertainty_rule": cr_rule,
@@ -1317,6 +1441,8 @@ def main() -> int:
         "n_success": int(n_success),
         "n_skipped": int(n_skipped),
         "skip_reasons": skip_reasons,
+        "skip_reason_examples": skip_reason_examples,
+        "image_loader_env": image_env,
     }
 
     # Log readable summary to stderr (Audit/Debug)
