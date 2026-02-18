@@ -46,8 +46,19 @@ class StageContext:
     max_samples: Optional[int]
     allow_flags: bool
     no_adapter: bool
+    allow_full_dataset: bool = False
     env_overrides: Dict[str, str] = field(default_factory=dict)
     scripts_dir: Path = field(default_factory=lambda: DIST_SCRIPTS)
+
+    def get_effective_max_samples(self) -> Optional[int]:
+        # Priority: CLI -> Config (Not implemented) -> Safe Default (2)
+        # If allow_full_dataset is True, and CLI is None, return None (Full Run)
+        if self.max_samples is not None:
+            return self.max_samples
+        if self.allow_full_dataset:
+            return None
+        # Safe Default
+        return 2
 
     def get_script(self, name: str) -> Path:
         p = self.scripts_dir / name
@@ -480,8 +491,14 @@ class AgentInfer06(Stage):
                 ev_06 = s_dir / "ev_06"
                 
                 cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(mr_cfg).with_run_name(f"mr_s{seed}").arg("--seed", seed).arg("--id_list", ctx.work_dir / "ids.txt").with_evidence_dir(ev_06)
-                if ctx.max_samples: cmd.arg("--max_samples", ctx.max_samples)
-                else: cmd.arg("--max_samples", "99999")
+                
+                eff_max = ctx.get_effective_max_samples()
+                if eff_max is not None:
+                     cmd.arg("--max_samples", eff_max)
+                else:
+                     # Full run (allowed)
+                     cmd.arg("--max_samples", "99999")
+                
                 if ctx.allow_flags: cmd.arg("--allow_code_execution")
                 
                 cmd_list = cmd.build()
@@ -543,7 +560,14 @@ class BuildTraj08(Stage):
             
             trace_dir = tmp_unzip / "traces" if (tmp_unzip / "traces").exists() else tmp_unzip
             
-            cmd = CmdBuilder(ctx.get_script("08_build_sft_trajectories.py")).with_config(mr_cfg).with_run_name(f"mr_s{seed}").with_trace_dir(trace_dir).with_out_jsonl(l3_jsonl).with_evidence_dir(ev_08).build()
+            builder = CmdBuilder(ctx.get_script("08_build_sft_trajectories.py")).with_config(mr_cfg).with_run_name(f"mr_s{seed}").with_trace_dir(trace_dir).with_out_jsonl(l3_jsonl).with_evidence_dir(ev_08)
+            eff_max = ctx.get_effective_max_samples()
+            if eff_max is not None:
+                 builder.arg("--max_samples", eff_max)
+            else:
+                 builder.arg("--allow_full_dataset")
+            
+            cmd = builder.build()
             if J1.record_if_violation(cmd, res, "08 cmd"): return
             cmd_res = CmdRunner.run(cmd, ctx.env_overrides, stream_output=True)
             if not _require_cmd_ok(res, cmd_res, f"S{seed}-08", "BuildTraj08"):
@@ -617,7 +641,12 @@ class SFTInfer(Stage):
         mr_cfg = ctx.work_dir / "mr_config.yaml"
         
         cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(mr_cfg).with_run_name("mr_sft").arg("--seed", "0").arg("--id_list", ctx.work_dir / "ids.txt").with_evidence_dir(ev_sft).arg("--adapter_path", seed0_adapter)
-        if ctx.max_samples: cmd.arg("--max_samples", ctx.max_samples)
+        
+        eff_max = ctx.get_effective_max_samples()
+        if eff_max is not None:
+             cmd.arg("--max_samples", eff_max)
+        else:
+             cmd.arg("--max_samples", "99999")
         
         cmd_list = cmd.build()
         if J1.record_if_violation(cmd_list, res, "SFT cmd"): return
@@ -738,7 +767,12 @@ class GRPOInfer(Stage):
         
         if grpo_adapter.exists():
             cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(mr_cfg).with_run_name("mr_grpo_infer").arg("--seed", "0").arg("--id_list", ctx.work_dir / "ids.txt").with_evidence_dir(ev_grpo).arg("--adapter_path", grpo_adapter)
-            if ctx.max_samples: cmd.arg("--max_samples", ctx.max_samples)
+            
+            eff_max = ctx.get_effective_max_samples()
+            if eff_max is not None:
+                 cmd.arg("--max_samples", eff_max)
+            else:
+                 cmd.arg("--max_samples", "99999")
             
             cmd_list = cmd.build()
             if J1.record_if_violation(cmd_list, res, "GRPO Infer cmd"): return
@@ -930,7 +964,15 @@ class SentinelPipeline(Stage):
             ev_08_sentinel = ctx.work_dir / "ev_08_sentinel"
             l3_sentinel = ctx.work_dir / "l3_sentinel.jsonl"
             
-            cmd = CmdBuilder(ctx.get_script("08_build_sft_trajectories.py")).with_config(mr_cfg).with_run_name(f"mr_s{first_seed}").with_trace_dir(trace_dir).with_out_jsonl(l3_sentinel).with_evidence_dir(ev_08_sentinel).build()
+            builder = CmdBuilder(ctx.get_script("08_build_sft_trajectories.py")).with_config(mr_cfg).with_run_name(f"mr_s{first_seed}").with_trace_dir(trace_dir).with_out_jsonl(l3_sentinel).with_evidence_dir(ev_08_sentinel)
+            
+            eff_max = ctx.get_effective_max_samples()
+            if eff_max is not None:
+                 builder.arg("--max_samples", eff_max)
+            else:
+                 builder.arg("--allow_full_dataset")
+            
+            cmd = builder.build()
             cmd_res = CmdRunner.run(cmd, ctx.env_overrides, stream_output=True)
             if not _require_cmd_ok(res, cmd_res, "SentinelBuildTraj08", "SentinelBuildTraj08"):
                  # CMD_FAILED already recorded by helper
@@ -1096,6 +1138,7 @@ def run_workload(args):
         max_samples=args.max_samples,
         allow_flags=args.allow_flags,
         no_adapter=args.no_adapter,
+        allow_full_dataset=args.allow_full_dataset,
         env_overrides=env_overrides
     )
     
@@ -1184,11 +1227,12 @@ def run_workload(args):
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="AgentIAD Reproduction Verification Orchestrator")
     parser.add_argument("--mode", type=str, default="default", help="Execution mode")
-    parser.add_argument("--max-samples", type=int, default=2, dest="max_samples", help="Max samples per stage")
+    parser.add_argument("--max-samples", type=int, default=None, dest="max_samples", help="Max samples per stage")
     parser.add_argument("--strict-contract", action="store_true", dest="strict_contract", help="Enforce strict contract")
     parser.add_argument("--output-dir", type=str, default=None, dest="output_dir", help="Output directory")
     parser.add_argument("--allow-flags", action="store_true", dest="allow_flags", help="Allow unsafe flags")
     parser.add_argument("--no-adapter", action="store_true", dest="no_adapter", help="Skip adapter checks")
+    parser.add_argument("--allow-full-dataset", action="store_true", dest="allow_full_dataset", help="Allow full dataset runs")
     parser.add_argument("--sentinel-ref", type=str, default="", dest="sentinel_ref", help="Sentinel reference directory")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Random seeds")
     return parser
