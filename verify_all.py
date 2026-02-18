@@ -145,8 +145,8 @@ class CmdRunner:
                 dur = time.time() - start_t
                 print(f"[Cmd] {cmd_name} took {dur:.2f}s (RC={res_proc.returncode})", file=sys.stderr)
                 if res_proc.returncode != 0:
-                     print(f"[Cmd] STDOUT: {res_proc.stdout.decode('utf-8', errors='replace')[:1000]}...", file=sys.stderr)
-                     print(f"[Cmd] STDERR: {res_proc.stderr.decode('utf-8', errors='replace')[:1000]}...", file=sys.stderr)
+                     print(f"[Cmd] STDOUT: {res_proc.stdout.decode('utf-8', errors='replace')[:1000]} [TRUNCATED]", file=sys.stderr)
+                     print(f"[Cmd] STDERR: {res_proc.stderr.decode('utf-8', errors='replace')[:1000]} [TRUNCATED]", file=sys.stderr)
                 return CmdResult(res_proc.returncode, res_proc.stdout, res_proc.stderr)
             except subprocess.TimeoutExpired:
                 print(f"[Cmd] {cmd[0]} TIMED OUT after {timeout}s", file=sys.stderr)

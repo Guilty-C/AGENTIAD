@@ -370,7 +370,8 @@ def _run_sft_build(args) -> int:
         print(f"FATAL: max_samples must be > 0. Got {eff_max_samples}.", file=sys.stderr)
         return 2
 
-    print(f"[L3] max_samples={args.max_samples} cfg.max_samples={cfg.get('max_samples')} eff_max_samples={eff_max_samples} audit_max_samples={args.audit_max_samples} acceptance_audit={args.acceptance_audit}", file=sys.stderr)
+    # Clean, pipe-separated log for easier parsing/audit
+    print(f"[L3] max_samples={args.max_samples} | cfg.max_samples={cfg.get('max_samples')} | eff_max_samples={eff_max_samples} | audit_max_samples={args.audit_max_samples} | acceptance_audit={args.acceptance_audit}", file=sys.stderr)
 
     trace_root = (paths.traces_dir / run_name).resolve()
     if trace_root.exists() and any(trace_root.iterdir()):
