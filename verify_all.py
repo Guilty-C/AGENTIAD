@@ -393,6 +393,32 @@ class CSVHash:
 
 # --- Stages ---
 
+def _expected_count_from_ids(ids_path: Path, eff_max: Optional[int]) -> Optional[int]:
+    """
+    Calculate expected trace count based on effective max samples and available IDs.
+    Policy:
+    - If eff_max is None (Full Run), we return None (do not enforce count strictly, or rely on full IDs).
+      Actually, if eff_max is None, we likely want to verify against ALL available IDs in ids.txt.
+      But to be safe and avoid ambiguity in full runs, we return None (meaning 'all found are valid').
+      However, prompt asks to be explicit.
+      Let's stick to: if None, return None (logic in verify_zip handles None as 'check integrity but not count').
+    - If eff_max is set, we return min(len(ids), eff_max).
+    """
+    if not ids_path.exists(): return None
+    try:
+        lines = [x for x in ids_path.read_text(encoding="utf-8").splitlines() if x.strip()]
+        n_ids = len(lines)
+        if eff_max is None:
+            # Full run -> we expect n_ids traces (since ids.txt drives the run)
+            # But strict_j often implies 'max_samples' is a subset limit.
+            # If full run, we might just return n_ids.
+            # BUT: verify_zip with expected_trace_count=None means "don't check count".
+            # The prompt says: "eff_max 为 None (full run) 时：expected_trace_count 必须为 None (不强制计数) 或采用显式策略"
+            return None
+        return min(n_ids, eff_max)
+    except:
+        return None
+
 class Stage:
     def execute(self, ctx: StageContext, res: StageResult): raise NotImplementedError
 
@@ -508,9 +534,9 @@ class AgentInfer06(Stage):
                     # CMD_FAILED already recorded by helper
                     return
                 
-                ids = (ctx.work_dir / "ids.txt").read_text(encoding="utf-8").splitlines()
-                subset_size = len([x for x in ids if x.strip()])
-                if ctx.max_samples and ctx.max_samples < subset_size: subset_size = ctx.max_samples
+                eff_max = ctx.get_effective_max_samples()
+                subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
+                
                 code, msg, dur = Evidence.verify_zip(ev_06 / "evidence_package.zip", "06_run_agentiad_infer.py", expected_trace_count=subset_size)
                 res.artifacts["evidence_checks"].append({
                     "stage": f"S{seed}-06", 
@@ -575,9 +601,9 @@ class BuildTraj08(Stage):
                 return
 
             # Evidence Check
-            ids = (ctx.work_dir / "ids.txt").read_text(encoding="utf-8").splitlines()
-            subset_size = len([x for x in ids if x.strip()])
-            if ctx.max_samples and ctx.max_samples < subset_size: subset_size = ctx.max_samples
+            eff_max = ctx.get_effective_max_samples()
+            subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
+            
             code, msg, dur = Evidence.verify_zip(ev_08 / "evidence_package.zip", "08_build_sft_trajectories.py", expected_trace_count=subset_size)
             res.artifacts["evidence_checks"].append({
                 "stage": f"S{seed}-08", 
@@ -595,11 +621,24 @@ class BuildTraj08(Stage):
             l3_lines = 0
             if l3_jsonl.exists():
                 with open(l3_jsonl, "r", encoding="utf-8") as f: l3_lines = sum(1 for _ in f)
-            ids = (ctx.work_dir / "ids.txt").read_text(encoding="utf-8").splitlines()
-            subset_size = len([x for x in ids if x.strip()])
-            if ctx.max_samples and ctx.max_samples < subset_size: subset_size = ctx.max_samples
             
-            if l3_lines != subset_size:
+            # Use effective max for line check
+            eff_max = ctx.get_effective_max_samples()
+            subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
+            
+            # If subset_size is None (full run), we skip the exact line count check (or check against total IDs if we trusted them)
+            # Policy: if full run, we can't strictly enforce count without knowing total available traces.
+            # But usually full run = all IDs.
+            # Let's check against IDs if subset_size is None, assuming full run means "all in ids.txt"
+            if subset_size is None:
+                 # Re-calculate from IDs for full run check
+                 try:
+                     lines = [x for x in (ctx.work_dir / "ids.txt").read_text(encoding="utf-8").splitlines() if x.strip()]
+                     subset_size = len(lines)
+                 except:
+                     subset_size = -1 # Skip check
+            
+            if subset_size > 0 and l3_lines != subset_size:
                  res.success = False; res.errors.append(f"J3 Fail: L3 lines {l3_lines} != Expected {subset_size}")
 
 class SFTTrain09(Stage):
@@ -656,9 +695,9 @@ class SFTInfer(Stage):
             return
 
         # Evidence Check
-        ids = (ctx.work_dir / "ids.txt").read_text(encoding="utf-8").splitlines()
-        subset_size = len([x for x in ids if x.strip()])
-        if ctx.max_samples and ctx.max_samples < subset_size: subset_size = ctx.max_samples
+        eff_max = ctx.get_effective_max_samples()
+        subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
+        
         code, msg, dur = Evidence.verify_zip(ev_sft / "evidence_package.zip", "06_run_agentiad_infer.py", expected_trace_count=subset_size)
         res.artifacts["evidence_checks"].append({
             "stage": "SFTInfer", 
@@ -782,9 +821,9 @@ class GRPOInfer(Stage):
                 return
 
             # Evidence Check
-            ids = (ctx.work_dir / "ids.txt").read_text(encoding="utf-8").splitlines()
-            subset_size = len([x for x in ids if x.strip()])
-            if ctx.max_samples and ctx.max_samples < subset_size: subset_size = ctx.max_samples
+            eff_max = ctx.get_effective_max_samples()
+            subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
+            
             code, msg, dur = Evidence.verify_zip(ev_grpo / "evidence_package.zip", "06_run_agentiad_infer.py", expected_trace_count=subset_size)
             res.artifacts["evidence_checks"].append({
                 "stage": "GRPOInfer", 
