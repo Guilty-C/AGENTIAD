@@ -1280,8 +1280,8 @@ def main() -> int:
         print(f"first_sample_id={first_sample_id}", file=sys.stderr)
         print(f"first_trace_fingerprint_hash={first_hash}", file=sys.stderr)
 
-    # Contract: Single line JSON to stdout
-    print(f"L2_RESULT_JSON={json.dumps(result_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stdout)
+    # Contract: Single line JSON to stderr (to keep stdout clean for harness)
+    print(f"L2_RESULT_JSON={json.dumps(result_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
 
     if args.evidence_dir:
         _package_evidence(Path(args.evidence_dir).resolve())
