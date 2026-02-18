@@ -166,7 +166,8 @@ class CmdRunner:
                 returncode = process.poll()
                 dur = time.time() - start_t
                 print(f"[Cmd] {cmd_name} finished in {dur:.2f}s (RC={returncode})", file=sys.stderr)
-                res = CmdResult(returncode, "".join(output_lines).encode('utf-8'))
+                full_out = "".join(output_lines).encode('utf-8')
+                res = CmdResult(returncode, full_out, full_out)
                 return res
             except Exception as e:
                 print(f"[Cmd] Exception running {cmd_name}: {e}", file=sys.stderr)
@@ -630,10 +631,13 @@ class AgentInfer06(Stage):
                 
                 # Task B: Parse L2_RESULT_JSON for effective_n
                 l2_effective_n = None
-                if cmd_res and cmd_res.stderr:
+                merged_output = b""
+                if cmd_res:
+                    merged_output = cmd_res.stderr if cmd_res.stderr else cmd_res.stdout
+                if merged_output:
                     try:
-                        # Scan stderr for "L2_RESULT_JSON="
-                        for line in cmd_res.stderr.decode("utf-8", errors="replace").splitlines():
+                        # Parse from merged output: stream mode redirects stderr->stdout.
+                        for line in merged_output.decode("utf-8", errors="replace").splitlines():
                             if line.strip().startswith("L2_RESULT_JSON="):
                                 json_str = line.strip()[len("L2_RESULT_JSON="):]
                                 l2_data = json.loads(json_str)
