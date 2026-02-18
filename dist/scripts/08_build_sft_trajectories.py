@@ -353,6 +353,12 @@ def _run_sft_build(args) -> int:
 
     out_jsonl_path = _resolve_path(project_root, args.out_jsonl)
 
+    # Determine effective max_samples (handle None -> infinite)
+    # Default is None (process all), unless restricted
+    eff_max_samples = int(args.max_samples) if args.max_samples is not None else 999999
+    
+    print(f"audit_max_samples_effective={args.audit_max_samples}")
+
     trace_root = (paths.traces_dir / run_name).resolve()
     if trace_root.exists() and any(trace_root.iterdir()):
         print(f"Traces found at {trace_root}, skipping L2 inference.")
@@ -361,7 +367,7 @@ def _run_sft_build(args) -> int:
         rc = _run_l2_infer(
             project_root=project_root,
             config_path=cfg_path,
-            max_samples=int(args.max_samples),
+            max_samples=eff_max_samples,
             seed=int(args.seed),
             run_name=run_name,
             out_split=split,
@@ -388,7 +394,9 @@ def _run_sft_build(args) -> int:
     items: List[Dict[str, Any]] = []
     require_tool = bool(args.require_tool)
     allow_skip = bool(args.allow_skip)
-    max_samples = int(args.max_samples)
+    
+    # Use effective limit for loop
+    limit_samples = eff_max_samples
 
     skipped_trace = 0
     skipped_final = 0
@@ -417,7 +425,7 @@ def _run_sft_build(args) -> int:
     n_total_candidates = int(len(candidates))
 
     for sample_id, sample_dir, trace in candidates:
-        if len(items) >= max_samples:
+        if len(items) >= limit_samples:
             break
 
         trace_path = sample_dir / "trace.json"
@@ -1263,7 +1271,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     # Modified to allow config to be optional for audit (checked manually)
     parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--max_samples", type=int, default=5)
+    parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out_jsonl", type=str, default="outputs/traces/trajectories_sft.jsonl")
     parser.add_argument("--trace_dir", type=str, default=None)
@@ -1277,7 +1285,7 @@ def main() -> int:
     # Audit args
     parser.add_argument("--acceptance_audit", action="store_true")
     parser.add_argument("--evidence_dir", type=str, default=None)
-    parser.add_argument("--audit_max_samples", type=int, default=5)
+    parser.add_argument("--audit_max_samples", type=int, default=None)
     
     args = parser.parse_args()
     
