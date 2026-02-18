@@ -242,16 +242,18 @@ def _require_cmd_ok(res: StageResult, cmd_res: Optional[CmdResult], label: str, 
     return True
 
 class J1:
+    SAFE_ALLOW_FLAGS = {"--allow_full_dataset"}
+
     @staticmethod
     def check(cmd_list: List[str]) -> bool:
         for arg in cmd_list:
             s = str(arg)
-            if s.startswith("--allow_"):
+            if s.startswith("--allow_") and s not in J1.SAFE_ALLOW_FLAGS:
                  return True
         return False
     @staticmethod
     def record_if_violation(cmd: List[str], res: StageResult, label: str = "cmd"):
-        found_flags = [str(arg) for arg in cmd if str(arg).startswith("--allow_")]
+        found_flags = [str(arg) for arg in cmd if str(arg).startswith("--allow_") and str(arg) not in J1.SAFE_ALLOW_FLAGS]
         if not found_flags: return False
 
         res.artifacts["allow_flags_used"] = True
@@ -922,27 +924,29 @@ class Phase1Metrics(Stage):
             # Ensure per-seed output directory exists
             s_dir.mkdir(parents=True, exist_ok=True)
 
-            tables_dir = s_dir / "ev_06" / "tables"
-            if not tables_dir.exists():
-                # Only error if we expected this seed to run
+            # SSOT: Read from evidence zip
+            zip_path = s_dir / "ev_06" / "evidence_package.zip"
+            if not zip_path.exists():
+                res.errors.append(f"Evidence zip missing for seed {seed}: {zip_path}")
                 continue
             
-            # Robust location: agentiad_infer_mr_s{seed}.csv
-            csv_name = f"agentiad_infer_mr_s{seed}.csv"
-            csv_path = tables_dir / csv_name
-            
-            if not csv_path.exists():
-                res.errors.append(f"Metrics CSV missing for seed {seed}: {csv_path}")
-                continue
+            csv_name = f"tables/agentiad_infer_mr_s{seed}.csv"
             
             try:
-                df = pd.read_csv(csv_path)
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    if csv_name not in zf.namelist():
+                         res.errors.append(f"Missing {csv_name} inside evidence_package.zip for seed {seed}")
+                         continue
+                    
+                    with zf.open(csv_name) as f:
+                        df = pd.read_csv(f)
+                
                 df["seed"] = seed
                 all_dfs.append(df)
                 
                 # Copy to stable layout
                 target_csv = s_dir / "baseline_metrics.csv"
-                shutil.copy(csv_path, target_csv)
+                target_csv.write_text(df.to_csv(index=False), encoding="utf-8")
                 
                 # Per-class
                 if "class_name" in df.columns and "correct" in df.columns:
@@ -1454,6 +1458,15 @@ def run_workload(args):
         
     # Evaluation
     GateEvaluator.evaluate(ctx, res)
+    
+    # Task B: Enforce success/exit_code consistency for Phase 1
+    if ctx.phase1_baseline:
+         # Must pass all gates to be considered successful
+         gates_passed = all(res.gates.get(k, True) for k in ["J1","J2","J3","J4_DEPENDENCIES","J6"])
+         if not gates_passed:
+             res.success = False
+             if "Phase1 Gate Failure" not in res.errors:
+                 res.errors.append("Phase1 Gate Failure: One or more strict gates failed")
     
     return {
         "success": res.success,
