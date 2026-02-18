@@ -1164,23 +1164,37 @@ class GateEvaluator:
             res.gates["J6"] = True
             res.artifacts["gates_na"]["J6"] = "no_data_available"
 
-        # J2: Evidence Integrity (Checked per stage, aggregated here)
-        # J2 = all(code in {"OK"} for ... evidence_checks where category is integrity)
-        # Actually verify_zip checks integrity (INDEX, Script, Fingerprint).
-        # We assume all checks in artifacts["evidence_checks"] must be OK.
+        # J2: Evidence Integrity / Auditability
+        # Only integrity-breaking codes should fail J2. Audit notes (e.g. EFFECTIVE_N_MISMATCH)
+        # must not force J2 failure.
+        fail_j2_codes = {
+            "MISSING_ZIP",
+            "MISSING_INDEX",
+            "MISSING_SCRIPT",
+            "EXCEPTION",
+            "CMD_FAILED",
+            "UNZIP_FAILED",
+            "MISSING_FINGERPRINT",
+            "RMTREE_FAILED",
+            "REF_DIR_MISSING",
+            "REF_ZIP_MISSING",
+            "SENTINEL_UNZIP_FAILED",
+            "REF_L3_MISSING",
+        }
         evidence_ok = True
         if res.artifacts["evidence_checks"]:
-             evidence_ok = all(check["code"] == "OK" for check in res.artifacts["evidence_checks"])
+            evidence_ok = not any(
+                check.get("code") in fail_j2_codes
+                for check in res.artifacts["evidence_checks"]
+            )
         else:
-             # If no checks ran but success is True (maybe skipped?), J2 might be N/A or False.
-             # If success is True and we ran stages, we should have checks.
-             # If Probe failed early, success is False.
-             if res.success and ctx.seeds: 
-                 # At least one seed run -> should have checks.
-                 evidence_ok = False
-        
-        # Also double check no "Evidence" errors as fallback if not caught in checks?
-        # Prompt says: "Do not rely on parsing res.errors strings".
+            # If no checks ran but success is True (maybe skipped?), J2 might be N/A or False.
+            # If success is True and we ran stages, we should have checks.
+            # If Probe failed early, success is False.
+            if res.success and ctx.seeds:
+                # At least one seed run -> should have checks.
+                evidence_ok = False
+
         res.gates["J2"] = evidence_ok
 
         # J3: Coverage (Checked via TRACE_COUNT_MISMATCH code in verify_zip)
