@@ -354,10 +354,23 @@ def _run_sft_build(args) -> int:
     out_jsonl_path = _resolve_path(project_root, args.out_jsonl)
 
     # Determine effective max_samples (handle None -> infinite)
-    # Default is None (process all), unless restricted
-    eff_max_samples = int(args.max_samples) if args.max_samples is not None else None
+    # Priority: 1. CLI args, 2. Config, 3. None (Full Run)
+    eff_max_samples = None
     
-    print(f"[L3] max_samples={args.max_samples} eff_max_samples={eff_max_samples} audit_max_samples={args.audit_max_samples} acceptance_audit={args.acceptance_audit}", file=sys.stderr)
+    if args.max_samples is not None:
+        eff_max_samples = int(args.max_samples)
+    elif cfg.get("max_samples") is not None:
+        try:
+            eff_max_samples = int(cfg["max_samples"])
+        except ValueError:
+            print(f"FATAL: Config max_samples '{cfg['max_samples']}' is not a valid integer.", file=sys.stderr)
+            return 2
+            
+    if eff_max_samples is not None and eff_max_samples <= 0:
+        print(f"FATAL: max_samples must be > 0. Got {eff_max_samples}.", file=sys.stderr)
+        return 2
+
+    print(f"[L3] max_samples={args.max_samples} cfg.max_samples={cfg.get('max_samples')} eff_max_samples={eff_max_samples} audit_max_samples={args.audit_max_samples} acceptance_audit={args.acceptance_audit}", file=sys.stderr)
 
     trace_root = (paths.traces_dir / run_name).resolve()
     if trace_root.exists() and any(trace_root.iterdir()):
@@ -365,10 +378,11 @@ def _run_sft_build(args) -> int:
         rc = 0
     else:
         # Safety Valve: Protect against accidental full-dataset runs locally (Hard Gate)
+        # Only triggers if we are truly doing a full run (eff_max_samples is None)
         if eff_max_samples is None and not args.allow_full_dataset:
             print(f"FATAL: Full dataset inference requested (max_samples=None) but traces are missing at {trace_root}.", file=sys.stderr)
             print(f"       Implicit full-dataset runs are prohibited for safety.", file=sys.stderr)
-            print(f"       Remediation: Explicitly pass --max_samples N (for partial run) or --allow_full_dataset (for full run).", file=sys.stderr)
+            print(f"       Remediation: Explicitly pass --max_samples N (for partial run), set max_samples in config, or use --allow_full_dataset (for full run).", file=sys.stderr)
             return 2
 
         # For L2 inference, if eff_max_samples is None, we need to pass a large number
