@@ -496,6 +496,7 @@ def main() -> int:
     parser.add_argument("--id_list", type=str, default=None, help="Path to a text file with allowed sample_ids (one per line)")
     parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter to load")
     parser.add_argument("--local_files_only", type=str, default=None, help="Force local files only (true/false/1/0)")
+    parser.add_argument("--allow_full_dataset", action="store_true", help="Allow full dataset traversal")
     args = parser.parse_args()
 
     from agentiad_repro.utils import ensure_dir, load_paths, sha256_text, utc_now_iso, write_json
@@ -516,7 +517,11 @@ def main() -> int:
 
     seed = int(args.seed) if args.seed is not None else int(cfg.get("seed", 0))
     split = str(args.split) if args.split is not None else str(cfg.get("split", "train"))
-    max_samples = int(args.max_samples) if args.max_samples is not None else int(cfg.get("max_samples", 50))
+    
+    if args.allow_full_dataset:
+        max_samples = 999999999  # Effectively infinite for this dataset
+    else:
+        max_samples = int(args.max_samples) if args.max_samples is not None else int(cfg.get("max_samples", 50))
 
     vlm_model_id = str(cfg.get("vlm_model_id", "")).strip()
     if not vlm_model_id:

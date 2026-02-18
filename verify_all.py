@@ -47,6 +47,8 @@ class StageContext:
     allow_flags: bool
     no_adapter: bool
     allow_full_dataset: bool = False
+    phase1_baseline: bool = False
+    dataset_split: str = "test"
     env_overrides: Dict[str, str] = field(default_factory=dict)
     scripts_dir: Path = field(default_factory=lambda: DIST_SCRIPTS)
     cached_cfg_max_samples: Optional[int] = None
@@ -465,6 +467,42 @@ class PreflightDeps(Stage):
 
 class ProbeIds(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
+        if ctx.phase1_baseline:
+            with Timer("Phase1 Dataset Binding"):
+                try:
+                    from datasets import load_dataset
+                    ds = load_dataset("jiang-cc/MMAD")
+                    split = ctx.dataset_split
+                    if split not in ds:
+                        # Fallback logic
+                        if "test" in ds: split = "test"
+                        else: split = list(ds.keys())[0]
+                    
+                    d0 = ds[split]
+                    valid_ids = []
+                    # Use index based access to avoid loading all at once if possible, though len(d0) implies iteration
+                    for i in range(len(d0)):
+                        row = d0[i]
+                        # Replicate _sample_id logic from script
+                        sid = row.get("sample_id") or row.get("id")
+                        if not sid:
+                             sid = f"{split}_{i}"
+                        valid_ids.append(str(sid).strip())
+                    
+                    if not valid_ids:
+                        res.success = False
+                        res.errors.append("No IDs found in dataset for Phase1")
+                        return
+
+                    (ctx.work_dir / "ids.txt").write_text("\n".join(valid_ids), encoding="utf-8")
+                    res.artifacts["ids_sha256"] = hashlib.sha256("\n".join(valid_ids).encode()).hexdigest()
+                    res.artifacts["phase1_full_mode"] = True
+                    return
+                except Exception as e:
+                    res.success = False
+                    res.errors.append(f"Phase1 Dataset Load Failed: {e}")
+                    return
+
         with Timer("Data Binding"):
             manifest_path = PROJECT_ROOT / "data/mmad/mmad_manifest.json"
             if not manifest_path.exists():
@@ -543,12 +581,18 @@ class AgentInfer06(Stage):
                 
                 cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(mr_cfg).with_run_name(f"mr_s{seed}").arg("--seed", seed).arg("--id_list", ctx.work_dir / "ids.txt").with_evidence_dir(ev_06)
                 
+                if ctx.phase1_baseline:
+                    cmd.arg("--enable_tools", "false")
+                
                 eff_max = ctx.get_effective_max_samples()
                 if eff_max is not None:
                      cmd.arg("--max_samples", eff_max)
                 else:
                      # Full run (allowed)
-                     cmd.arg("--max_samples", "99999")
+                     if ctx.allow_full_dataset:
+                         cmd.arg("--allow_full_dataset")
+                     else:
+                         cmd.arg("--max_samples", "99999")
                 
                 if ctx.allow_flags: cmd.arg("--allow_code_execution")
                 
@@ -575,7 +619,7 @@ class AgentInfer06(Stage):
 
 class BuildTraj08(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
-        if ctx.no_adapter: return
+        if ctx.no_adapter or ctx.phase1_baseline: return
         mr_cfg = ctx.work_dir / "mr_config.yaml"
         for seed in ctx.seeds:
             if not res.success: break
@@ -670,7 +714,7 @@ class BuildTraj08(Stage):
 
 class SFTTrain09(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
-        if ctx.no_adapter: return
+        if ctx.no_adapter or ctx.phase1_baseline: return
         for seed in ctx.seeds:
             if not res.success: break
             s_dir = ctx.work_dir / f"seed_{seed}"
@@ -699,7 +743,7 @@ class SFTTrain09(Stage):
 
 class SFTInfer(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
-        if ctx.no_adapter or not res.success: return
+        if ctx.no_adapter or not res.success or ctx.phase1_baseline: return
         # Using first seed's adapter for SFT inference
         first_seed = ctx.seeds[0] if ctx.seeds else 0
         seed0_adapter = ctx.work_dir / f"seed_{first_seed}/l4_out/adapter"
@@ -738,7 +782,7 @@ class SFTInfer(Stage):
 
 class GRPOBuild(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
-        if ctx.no_adapter or not res.success: return
+        if ctx.no_adapter or not res.success or ctx.phase1_baseline: return
         grpo_cfg = ctx.work_dir / "mr_grpo_config.yaml"
         grpo_cfg.write_text("base_model_id: 'distilgpt2'\nrollouts_per_prompt: 2\nmax_new_tokens: 16\nreward_weights:\n  w_json: 1.0\n  w_tool: 1.0\n  w_len: 0.0\nlr: 1e-5\nbatch_size: 1\ngrad_accum: 1\nrollout_samples: 100\nreward_audit_min_span: 0.0\nreward_audit_min_json_ok_rate: 0.0\nreward_audit_min_toolcall_rate: 0.0\n", encoding="utf-8")
         
@@ -780,7 +824,7 @@ class GRPOBuild(Stage):
 
 class GRPOTrain(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
-        if ctx.no_adapter or not res.success: return
+        if ctx.no_adapter or not res.success or ctx.phase1_baseline: return
         grpo_cfg = ctx.work_dir / "mr_grpo_config.yaml"
         rollouts_jsonl = ctx.work_dir / "rollouts.jsonl"
         l6_out = ctx.work_dir / "l6_out"
@@ -821,7 +865,7 @@ class GRPOTrain(Stage):
 
 class GRPOInfer(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
-        if ctx.no_adapter or not res.success: return
+        if ctx.no_adapter or not res.success or ctx.phase1_baseline: return
         l6_out = ctx.work_dir / "l6_out"
         ev_grpo = ctx.work_dir / "ev_grpo"
         mr_cfg = ctx.work_dir / "mr_config.yaml"
@@ -861,6 +905,70 @@ class GRPOInfer(Stage):
             })
             res.measurements["evidence_check_sec"] = res.measurements.get("evidence_check_sec", 0.0) + dur
             if code != "OK": res.success = False; res.errors.append(f"GRPOInfer Evidence: {msg}")
+
+class Phase1Metrics(Stage):
+    def execute(self, ctx: StageContext, res: StageResult):
+        if not ctx.phase1_baseline or not res.success: return
+        
+        import pandas as pd
+        import numpy as np
+        
+        all_dfs = []
+        for seed in ctx.seeds:
+            s_dir = ctx.work_dir / f"seed_{seed}"
+            tables_dir = s_dir / "ev_06" / "tables"
+            if not tables_dir.exists(): continue
+            
+            csv_files = list(tables_dir.glob("agent_pzcr_*.csv"))
+            if not csv_files: continue
+            csv_path = csv_files[0]
+            
+            try:
+                df = pd.read_csv(csv_path)
+                df["seed"] = seed
+                all_dfs.append(df)
+                
+                target_csv = ctx.work_dir / f"baseline_metrics_s{seed}.csv"
+                shutil.copy(csv_path, target_csv)
+                
+                if "class_name" in df.columns:
+                     # Calculate accuracy per class
+                     # acc = correct / count
+                     per_class = df.groupby("class_name").agg(
+                         acc=("correct", "mean"),
+                         count=("correct", "count")
+                     ).reset_index()
+                     per_class.to_csv(ctx.work_dir / f"baseline_per_class_s{seed}.csv", index=False)
+
+            except Exception as e:
+                res.errors.append(f"Metrics Aggregation Seed {seed} failed: {e}")
+
+        if not all_dfs:
+            res.errors.append("No metrics CSVs found for aggregation")
+            return
+
+        seed_accs = []
+        for df in all_dfs:
+             if "correct" in df.columns:
+                 acc = df["correct"].mean()
+                 seed_accs.append(acc)
+        
+        if seed_accs:
+            mean_acc = np.mean(seed_accs)
+            std_acc = np.std(seed_accs)
+            
+            agg_df = pd.DataFrame([{
+                "metric": "accuracy",
+                "mean": mean_acc,
+                "std": std_acc,
+                "seeds": len(seed_accs)
+            }])
+            agg_df.to_csv(ctx.work_dir / "metrics_mean_std.csv", index=False)
+            
+            res.artifacts["phase1_metrics"] = {
+                "accuracy_mean": float(mean_acc),
+                "accuracy_std": float(std_acc)
+            }
 
 class GateEvaluator:
     @staticmethod
@@ -907,11 +1015,19 @@ class GateEvaluator:
             # Gate J6: tool usage > 0 (soft check here, strict check in scorer)
             # Policy: If avg is 0, we do not fail J6 in workload mode, but mark it NA or Note.
             avg_rate = res.measurements["toolcall_rate_avg"]
-            if avg_rate > 0:
-                res.gates["J6"] = True
+            if ctx.phase1_baseline:
+                 # STRICT: Must be 0
+                 if avg_rate == 0:
+                      res.gates["J6"] = True
+                 else:
+                      res.gates["J6"] = False
+                      res.errors.append(f"J6 Fail: Phase1 Baseline must have 0 tool usage, got {avg_rate}")
             else:
-                res.gates["J6"] = True
-                res.artifacts["gates_na"]["J6"] = "workload_mode_not_enforced_use_strict_j"
+                if avg_rate > 0:
+                    res.gates["J6"] = True
+                else:
+                    res.gates["J6"] = True
+                    res.artifacts["gates_na"]["J6"] = "workload_mode_not_enforced_use_strict_j"
         else:
             # No tool rates available (e.g. no seeds or failed)
             res.gates["J6"] = True
@@ -1149,6 +1265,13 @@ def verify_evidence_zip_optimized(zip_path, script_name, expected_trace_count=No
 
 
 def run_workload(args):
+    # Phase 1 Baseline Logic
+    is_phase1 = args.mode == "phase1_baseline"
+    if is_phase1:
+        args.allow_full_dataset = True
+        if args.seeds == [42]: args.seeds = [0, 1, 2]
+        if args.output_dir is None: args.output_dir = "dist/outputs/phase1_baseline"
+    
     work_dir = Path(args.output_dir).resolve()
     
     # 0. Early Returns for strict_j FAIL-A / FAIL-B semantics (Stable J9)
@@ -1205,6 +1328,8 @@ def run_workload(args):
         allow_flags=args.allow_flags,
         no_adapter=args.no_adapter,
         allow_full_dataset=args.allow_full_dataset,
+        phase1_baseline=is_phase1,
+        dataset_split=args.dataset_split,
         env_overrides=env_overrides
     )
     
@@ -1266,7 +1391,8 @@ def run_workload(args):
         SFTInfer(),
         GRPOBuild(),
         GRPOTrain(),
-        GRPOInfer()
+        GRPOInfer(),
+        Phase1Metrics()
     ]
     
     # Run Pipeline
@@ -1299,6 +1425,7 @@ def build_arg_parser():
     parser.add_argument("--allow-flags", action="store_true", dest="allow_flags", help="Allow unsafe flags")
     parser.add_argument("--no-adapter", action="store_true", dest="no_adapter", help="Skip adapter checks")
     parser.add_argument("--allow-full-dataset", action="store_true", dest="allow_full_dataset", help="Allow full dataset runs")
+    parser.add_argument("--dataset-split", type=str, default="test", dest="dataset_split", help="Dataset split for phase1")
     parser.add_argument("--sentinel-ref", type=str, default="", dest="sentinel_ref", help="Sentinel reference directory")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Random seeds")
     return parser
