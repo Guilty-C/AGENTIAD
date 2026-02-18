@@ -1255,16 +1255,33 @@ def main() -> int:
             sys.stderr.write("\n")
             sys.stderr.flush()
 
-    print(f"run_name={run_name}")
-    print(f"config_hash={config_hash}")
-    print(f"prompt_hash={prompt_hash}")
-    print(str(out_csv))
-    print(str(out_summary))
-    print(str(trace_root))
-    print(f"csv_sha256={csv_sha}")
+    # Gather result summary
+    result_summary = {
+        "run_name": run_name,
+        "config_hash": config_hash,
+        "prompt_hash": prompt_hash,
+        "out_csv": str(out_csv),
+        "out_summary": str(out_summary),
+        "trace_root": str(trace_root),
+        "csv_sha256": csv_sha,
+        "first_sample_id": first_sample_id if rows else None,
+        "first_trace_fingerprint_hash": first_hash if rows else None,
+    }
+
+    # Log readable summary to stderr (Audit/Debug)
+    print(f"run_name={run_name}", file=sys.stderr)
+    print(f"config_hash={config_hash}", file=sys.stderr)
+    print(f"prompt_hash={prompt_hash}", file=sys.stderr)
+    print(str(out_csv), file=sys.stderr)
+    print(str(out_summary), file=sys.stderr)
+    print(str(trace_root), file=sys.stderr)
+    print(f"csv_sha256={csv_sha}", file=sys.stderr)
     if rows:
-        print(f"first_sample_id={first_sample_id}")
-        print(f"first_trace_fingerprint_hash={first_hash}")
+        print(f"first_sample_id={first_sample_id}", file=sys.stderr)
+        print(f"first_trace_fingerprint_hash={first_hash}", file=sys.stderr)
+
+    # Contract: Single line JSON to stdout
+    print(f"L2_RESULT_JSON={json.dumps(result_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stdout)
 
     if args.evidence_dir:
         _package_evidence(Path(args.evidence_dir).resolve())

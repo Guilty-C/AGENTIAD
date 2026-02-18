@@ -364,6 +364,15 @@ def _run_sft_build(args) -> int:
         print(f"Traces found at {trace_root}, skipping L2 inference.", file=sys.stderr)
         rc = 0
     else:
+        # Safety Valve: Protect against accidental full-dataset runs locally
+        if eff_max_samples is None and not args.allow_full_dataset:
+            print(f"FATAL: Full dataset inference requested (max_samples=None) but traces are missing at {trace_root}.", file=sys.stderr)
+            print(f"       This is a potentially expensive operation. Please:", file=sys.stderr)
+            print(f"       1. Run with explicit limit: --max_samples N", file=sys.stderr)
+            print(f"       2. OR confirm full run: --allow_full_dataset", file=sys.stderr)
+            print(f"       3. OR run on remote infrastructure.", file=sys.stderr)
+            return 2
+
         # For L2 inference, if eff_max_samples is None, we need to pass a large number
         # because the L2 script expects an int. But only for normal mode.
         # In acceptance_audit mode, max_samples will be set to audit_max_samples (int).
@@ -1298,6 +1307,7 @@ def main() -> int:
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--require_tool", action="store_true")
     parser.add_argument("--allow_skip", action="store_true")
+    parser.add_argument("--allow_full_dataset", action="store_true", help="Allow running L2 on full dataset when max_samples is None")
     
     # Audit args
     parser.add_argument("--acceptance_audit", action="store_true")
