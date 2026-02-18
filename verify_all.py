@@ -49,15 +49,45 @@ class StageContext:
     allow_full_dataset: bool = False
     env_overrides: Dict[str, str] = field(default_factory=dict)
     scripts_dir: Path = field(default_factory=lambda: DIST_SCRIPTS)
+    cached_cfg_max_samples: Optional[int] = None
+
+    def __post_init__(self):
+        # Config-aware initialization
+        # Try to read max_samples from mr_config.yaml in work_dir
+        mr_cfg = self.work_dir / "mr_config.yaml"
+        if mr_cfg.exists():
+            try:
+                import yaml
+                # Safe load
+                with open(mr_cfg, "r", encoding="utf-8") as f:
+                    cfg_data = yaml.safe_load(f)
+                if isinstance(cfg_data, dict) and "max_samples" in cfg_data:
+                    val = cfg_data["max_samples"]
+                    if val is not None:
+                        try:
+                            self.cached_cfg_max_samples = int(val)
+                        except:
+                            pass
+            except:
+                pass
 
     def get_effective_max_samples(self) -> Optional[int]:
-        # Priority: CLI -> Config (Not implemented) -> Safe Default (2)
-        # If allow_full_dataset is True, and CLI is None, return None (Full Run)
+        # Priority: CLI -> Config -> Full Run (None) -> Safe Default (2)
+        # Matches L3 logic: CLI > config > None
+        
+        # 1. CLI Override
         if self.max_samples is not None:
             return self.max_samples
+            
+        # 2. Config Override
+        if self.cached_cfg_max_samples is not None:
+            return self.cached_cfg_max_samples
+            
+        # 3. Full Run
         if self.allow_full_dataset:
             return None
-        # Safe Default
+            
+        # 4. Safe Default
         return 2
 
     def get_script(self, name: str) -> Path:
@@ -397,11 +427,10 @@ def _expected_count_from_ids(ids_path: Path, eff_max: Optional[int]) -> Optional
     """
     Calculate expected trace count based on effective max samples and available IDs.
     Policy:
-    - If eff_max is None (Full Run), we return None (do not enforce count strictly, or rely on full IDs).
-      Actually, if eff_max is None, we likely want to verify against ALL available IDs in ids.txt.
-      But to be safe and avoid ambiguity in full runs, we return None (meaning 'all found are valid').
-      However, prompt asks to be explicit.
-      Let's stick to: if None, return None (logic in verify_zip handles None as 'check integrity but not count').
+    - If eff_max is None (Full Run), we enforce STRICT count against all IDs found in ids.txt.
+      Rationale: If the user explicitly requested a full run (via --allow-full-dataset),
+      we must verify that every single ID in the input list produced a trace.
+      This hardens J3 for full runs.
     - If eff_max is set, we return min(len(ids), eff_max).
     """
     if not ids_path.exists(): return None
@@ -409,12 +438,8 @@ def _expected_count_from_ids(ids_path: Path, eff_max: Optional[int]) -> Optional
         lines = [x for x in ids_path.read_text(encoding="utf-8").splitlines() if x.strip()]
         n_ids = len(lines)
         if eff_max is None:
-            # Full run -> we expect n_ids traces (since ids.txt drives the run)
-            # But strict_j often implies 'max_samples' is a subset limit.
-            # If full run, we might just return n_ids.
-            # BUT: verify_zip with expected_trace_count=None means "don't check count".
-            # The prompt says: "eff_max 为 None (full run) 时：expected_trace_count 必须为 None (不强制计数) 或采用显式策略"
-            return None
+            # Full run -> Strict expectation: all IDs must have traces
+            return n_ids
         return min(n_ids, eff_max)
     except:
         return None
@@ -630,6 +655,8 @@ class BuildTraj08(Stage):
             # Policy: if full run, we can't strictly enforce count without knowing total available traces.
             # But usually full run = all IDs.
             # Let's check against IDs if subset_size is None, assuming full run means "all in ids.txt"
+            # NOTE: With updated _expected_count_from_ids, subset_size should NOT be None even for full run.
+            # It returns n_ids if eff_max is None. So this fallback block is likely redundant but kept for safety.
             if subset_size is None:
                  # Re-calculate from IDs for full run check
                  try:
