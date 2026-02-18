@@ -367,7 +367,8 @@ def _run_sft_build(args) -> int:
         # For L2 inference, if eff_max_samples is None, we need to pass a large number
         # because the L2 script expects an int. But only for normal mode.
         # In acceptance_audit mode, max_samples will be set to audit_max_samples (int).
-        l2_max_samples = eff_max_samples if eff_max_samples is not None else 10**9
+        # We use 1_000_000 as a safe upper bound.
+        l2_max_samples = eff_max_samples if eff_max_samples is not None else 1_000_000
         
         rc = _run_l2_infer(
             project_root=project_root,
@@ -401,7 +402,8 @@ def _run_sft_build(args) -> int:
     allow_skip = bool(args.allow_skip)
     
     # Use effective limit for loop
-    limit_samples = eff_max_samples if eff_max_samples is not None else float('inf')
+    # If eff_max_samples is None, we don't break based on count
+    limit_samples = eff_max_samples
 
     skipped_trace = 0
     skipped_final = 0
@@ -430,7 +432,7 @@ def _run_sft_build(args) -> int:
     n_total_candidates = int(len(candidates))
 
     for sample_id, sample_dir, trace in candidates:
-        if len(items) >= limit_samples:
+        if limit_samples is not None and len(items) >= limit_samples:
             break
 
         trace_path = sample_dir / "trace.json"
@@ -962,11 +964,20 @@ def _run_acceptance_audit(args) -> int:
             args.run_name = run_name
             args.out_jsonl = str(actual_evidence_dir / "trajectories_sft.jsonl")
             args.max_samples = args.audit_max_samples
-            args.dry_run = True 
-            results["measurements"]["audit_forced_dry_run"] = True
+            
+            # G1 needs real traces if they don't exist.
+            # If we force dry_run=True, L2 might not produce traces (depending on implementation).
+            # We assume L2 infer respects dry_run by NOT generating new heavy artifacts,
+            # BUT for audit we need traces to count. 
+            # If L2 dry_run skips generation, G1 will fail.
+            # So we do NOT force dry_run here, trusting max_samples=5 is cheap enough.
+            # args.dry_run = True 
+            results["measurements"]["audit_forced_dry_run"] = False
             
             trace_dir = paths.traces_dir / run_name
-            if trace_dir.exists():
+            trace_dir_existed_before = trace_dir.exists()
+            
+            if trace_dir_existed_before:
                  # Fail to avoid destructive behavior
                  results["failed_gates"].append("G0")
                  results["remediations"].append(f"Trace dir {trace_dir} already exists. Please remove it manually to proceed with audit.")
@@ -1208,11 +1219,11 @@ def _run_acceptance_audit(args) -> int:
                  return _finalize_and_print(results)
                  
             # G5: Score & G0 Cleanup (Logic flow: G0 cleanup -> G5 final check)
-            if 'trace_dir_existed_before' in locals() and not trace_dir_existed_before and 'trace_dir' in locals() and trace_dir.exists():
+            if not trace_dir_existed_before and trace_dir.exists():
                 shutil.rmtree(trace_dir, ignore_errors=True)
                 
             g0_pass = True
-            if 'trace_dir_existed_before' in locals() and not trace_dir_existed_before and 'trace_dir' in locals() and trace_dir.exists():
+            if not trace_dir_existed_before and trace_dir.exists():
                 g0_pass = False
                 
             # Check Residue
