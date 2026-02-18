@@ -285,6 +285,40 @@ def _normalize_assistant_content(content: str) -> str:
     return f"{PaperContract.TAG_ANSWER_START}\n{canonical_json}\n{PaperContract.TAG_ANSWER_END}"
 
 
+def _copy_and_collect_traces(trace_root: Path, ev_dir: Path, items: List[Dict[str, Any]]) -> List[Tuple[Path, str]]:
+    collected: List[Tuple[Path, str]] = []
+    run_name = trace_root.name
+    
+    # Target: ev_dir/traces/<run_name>
+    target_base = ev_dir / "traces" / run_name
+    target_base.mkdir(parents=True, exist_ok=True)
+    
+    # We iterate items to ensure we only include traces for the trajectories we generated
+    # This aligns the count with N_written
+    for item in items:
+        sample_id = str(item.get("sample_id") or "")
+        if not sample_id:
+            continue
+            
+        src = trace_root / sample_id
+        if src.exists() and src.is_dir():
+            dst = target_base / sample_id
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            
+            # Recursively collect all files in the copied directory for zipping
+            for root, dirs, files in os.walk(dst):
+                for f in files:
+                    fp = Path(root) / f
+                    # arcname should be relative to ev_dir to maintain structure in zip
+                    # e.g. traces/run_name/sample_id/trace.json
+                    rel = fp.relative_to(ev_dir)
+                    collected.append((fp, str(rel).replace(os.sep, "/")))
+                    
+    return collected
+
+
 def _run_sft_build(args) -> int:
     project_root = REPO_ROOT
     
@@ -615,6 +649,10 @@ def _run_sft_build(args) -> int:
         extra = []
         if out_jsonl_path.exists():
             extra.append((out_jsonl_path, out_jsonl_path.name))
+            
+        # Copy and collect traces to match verify_all expectations
+        trace_extras = _copy_and_collect_traces(trace_root, ev_dir, items)
+        extra.extend(trace_extras)
             
         _emit_minimal_evidence(res, ev_dir, Path(__file__), extra_files=extra, zip_name="evidence_package.zip")
         print(f"Evidence generated at {ev_dir}")
