@@ -242,23 +242,46 @@ def _require_cmd_ok(res: StageResult, cmd_res: Optional[CmdResult], label: str, 
     return True
 
 class J1:
-    SAFE_ALLOW_FLAGS = {"--allow_full_dataset"}
+    @staticmethod
+    def _norm_flag(s: str) -> str:
+        s = str(s).strip()
+        s = s.replace("-", "_")
+        return s
+
+    SAFE_ALLOW_FLAGS = {_norm_flag("--allow_full_dataset"), _norm_flag("--allow-full-dataset")}
 
     @staticmethod
     def check(cmd_list: List[str]) -> bool:
         for arg in cmd_list:
             s = str(arg)
-            if s.startswith("--allow_") and s not in J1.SAFE_ALLOW_FLAGS:
+            norm_s = J1._norm_flag(s)
+            # Check prefix on normalized string to handle --allow-foo and --allow_foo
+            if norm_s.startswith("--allow_") and norm_s not in J1.SAFE_ALLOW_FLAGS:
                  return True
         return False
+
     @staticmethod
     def record_if_violation(cmd: List[str], res: StageResult, label: str = "cmd"):
-        found_flags = [str(arg) for arg in cmd if str(arg).startswith("--allow_") and str(arg) not in J1.SAFE_ALLOW_FLAGS]
-        if not found_flags: return False
+        # Find flags that are violations
+        # We report the ORIGINAL flag for clarity, but check against normalized whitelist
+        violations = []
+        for arg in cmd:
+            s = str(arg)
+            norm_s = J1._norm_flag(s)
+            if norm_s.startswith("--allow_"):
+                if norm_s not in J1.SAFE_ALLOW_FLAGS:
+                    violations.append(s)
+        
+        if not violations: return False
 
         res.artifacts["allow_flags_used"] = True
         res.artifacts["allow_flags_violation"] = True
-        res.errors.append(f"J1 Violation: allow flag detected in {label}: {found_flags}")
+        
+        # Enhanced debug info (Task C)
+        all_allow_flags = [str(a) for a in cmd if J1._norm_flag(str(a)).startswith("--allow_")]
+        normalized_violations = [J1._norm_flag(v) for v in violations]
+        
+        res.errors.append(f"J1 Violation: allow flag detected in {label}: {violations} (Normalized Violations: {normalized_violations}, Whitelist: {list(J1.SAFE_ALLOW_FLAGS)})")
         return True
 
 class Evidence:
@@ -1329,10 +1352,10 @@ def run_workload(args):
     # 0. Early Returns for strict_j FAIL-A / FAIL-B semantics (Stable J9)
     if args.allow_flags:
         # FAIL-A: J1 Violation check must happen immediately
-        # NOTE: If we want to allow running with flags (non-strict mode), we should probably
-        # not return early here. But strict J9 contract requires immediate fail.
-        # To support "permissive run", we would need a different mode or flag.
-        # Current logic enforces FAIL-A strictness.
+        # Current logic enforces FAIL-A strictness for strict J9.
+        # However, for Phase 1, we might want to check if allow_flags is explicitly enabling UNSAFE things.
+        # But Phase 1 baseline should never need --allow-flags.
+        # So we keep the strict return, but add clarity.
         return {
             "success": False,
             "gates": {"J1": False},
@@ -1463,10 +1486,15 @@ def run_workload(args):
     if ctx.phase1_baseline:
          # Must pass all gates to be considered successful
          gates_passed = all(res.gates.get(k, True) for k in ["J1","J2","J3","J4_DEPENDENCIES","J6"])
-         if not gates_passed:
+         
+         # Also check for allow_flags_violation or any errors
+         allow_violation = res.artifacts.get("allow_flags_violation", False)
+         has_errors = len(res.errors) > 0
+         
+         if not gates_passed or allow_violation or has_errors:
              res.success = False
              if "Phase1 Gate Failure" not in res.errors:
-                 res.errors.append("Phase1 Gate Failure: One or more strict gates failed")
+                 res.errors.append("Phase1 Gate Failure: Strict compliance failed (gates/flags/errors)")
     
     return {
         "success": res.success,
