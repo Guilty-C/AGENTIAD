@@ -786,6 +786,18 @@ def main() -> int:
             )
         candidates = list(range(n_total))
 
+    # Structural Safety: Cap max_samples to n_available
+    n_available = n_total
+    effective_max_samples = max_samples
+    if max_samples > n_available:
+        effective_max_samples = n_available
+    
+    # Log effective limits to stderr
+    print(f"[L2] max_samples={max_samples} effective_max_samples={effective_max_samples} n_available={n_available} split={split}", file=sys.stderr)
+    
+    # Use effective limit
+    max_samples = effective_max_samples
+
     normal_idx_by_class: Dict[str, List[int]] = {}
     for i in range(n_total):
         row = d0[int(i)]

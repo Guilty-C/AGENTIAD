@@ -361,13 +361,14 @@ def _run_sft_build(args) -> int:
 
     trace_root = (paths.traces_dir / run_name).resolve()
     if trace_root.exists() and any(trace_root.iterdir()):
-        print(f"Traces found at {trace_root}, skipping L2 inference.")
+        print(f"Traces found at {trace_root}, skipping L2 inference.", file=sys.stderr)
         rc = 0
     else:
         # For L2 inference, if eff_max_samples is None, we need to pass a large number
         # because the L2 script expects an int. But only for normal mode.
         # In acceptance_audit mode, max_samples will be set to audit_max_samples (int).
-        # We use 1_000_000 as a safe upper bound.
+        # We use 1_000_000 as a safe upper bound. The L2 script now structurally caps this 
+        # against n_available to ensure safety.
         l2_max_samples = eff_max_samples if eff_max_samples is not None else 1_000_000
         
         rc = _run_l2_infer(
@@ -612,17 +613,17 @@ def _run_sft_build(args) -> int:
 
     _write_jsonl(out_jsonl_path, items)
 
-    print(f"run_name={run_name}")
-    print(f"trace_dir={_safe_rel(project_root, trace_root)}")
-    print(f"out_jsonl={_safe_rel(project_root, out_jsonl_path)}")
-    print(f"N_total_candidates={n_total_candidates}")
-    print(f"N_written={len(items)}")
-    print(f"skipped_trace={int(skipped_trace)}")
-    print(f"skipped_final={int(skipped_final)}")
+    print(f"run_name={run_name}", file=sys.stderr)
+    print(f"trace_dir={_safe_rel(project_root, trace_root)}", file=sys.stderr)
+    print(f"out_jsonl={_safe_rel(project_root, out_jsonl_path)}", file=sys.stderr)
+    print(f"N_total_candidates={n_total_candidates}", file=sys.stderr)
+    print(f"N_written={len(items)}", file=sys.stderr)
+    print(f"skipped_trace={int(skipped_trace)}", file=sys.stderr)
+    print(f"skipped_final={int(skipped_final)}", file=sys.stderr)
     if items:
-        print(f"first_sample_id={items[0].get('sample_id')}")
-        print(f"first_trace_fingerprint_hash={items[0].get('trace_fingerprint_hash')}")
-        print(f"first_trajectory_fingerprint_hash={items[0].get('trajectory_fingerprint_hash')}")
+        print(f"first_sample_id={items[0].get('sample_id')}", file=sys.stderr)
+        print(f"first_trace_fingerprint_hash={items[0].get('trace_fingerprint_hash')}", file=sys.stderr)
+        print(f"first_trajectory_fingerprint_hash={items[0].get('trajectory_fingerprint_hash')}", file=sys.stderr)
         msgs0 = items[0].get("messages") if isinstance(items[0], dict) else None
         has_tool_pair = False
         if isinstance(msgs0, list):
@@ -634,7 +635,7 @@ def _run_sft_build(args) -> int:
                 if m0.get("role") == "assistant" and "tool_call" in m0 and m1.get("role") == "tool":
                     has_tool_pair = True
                     break
-        print(f"first_has_tool={bool(has_tool_pair)}")
+        print(f"first_has_tool={bool(has_tool_pair)}", file=sys.stderr)
 
     if require_tool and len(items) == 0:
         return 1
@@ -672,7 +673,7 @@ def _run_sft_build(args) -> int:
         extra.extend(trace_extras)
             
         _emit_minimal_evidence(res, ev_dir, Path(__file__), extra_files=extra, zip_name="evidence_package.zip")
-        print(f"Evidence generated at {ev_dir}")
+        print(f"Evidence generated at {ev_dir}", file=sys.stderr)
 
     return 0
 
