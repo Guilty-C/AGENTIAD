@@ -362,7 +362,7 @@ def _run_sft_build(args) -> int:
         print(f"Traces found at {trace_root}, skipping L2 inference.", file=sys.stderr)
         rc = 0
     else:
-        # Safety Valve: Protect against accidental full-dataset runs locally (Soft Fallback)
+        # Safety Valve: Protect against accidental full-dataset runs locally (Hard Gate)
         if eff_max_samples is None and not args.allow_full_dataset:
             print(f"FATAL: Full dataset inference requested (max_samples=None) but traces are missing at {trace_root}.", file=sys.stderr)
             print(f"       Implicit full-dataset runs are prohibited for safety.", file=sys.stderr)
@@ -495,6 +495,11 @@ def _run_sft_build(args) -> int:
             tool_call = t.get("tool_call")
             tool_result = t.get("tool_result")
 
+            # SSOT: Derive tool name strictly from tool_call content if available
+            tc_name = None
+            if isinstance(tool_call, dict):
+                tc_name = tool_call.get("name")
+
             if name == "global":
                 # Ensure global prompt is the Contract System Prompt
                 messages.append(
@@ -507,7 +512,7 @@ def _run_sft_build(args) -> int:
                 messages.append({"role": "assistant", "name": "global", "content": raw})
                 continue
 
-            if name == "pz":
+            if tc_name == "crop_image_normalized":
                 # Enforce Contract: Tool Name & Args
                 bbox = None
                 if isinstance(tool_call, dict) and "arguments" in tool_call:
@@ -537,7 +542,7 @@ def _run_sft_build(args) -> int:
                 messages.append({"role": "assistant", "name": "pz", "content": raw})
                 continue
 
-            if name == "cr":
+            if tc_name == "query_image":
                 # Enforce Contract: Tool Name & Args
                 contract_tool_call = {
                     "name": "query_image",

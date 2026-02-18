@@ -1269,6 +1269,7 @@ def main() -> int:
     }
 
     # Log readable summary to stderr (Audit/Debug)
+    # Ensure all logs go to stderr to keep stdout clean for harness
     print(f"run_name={run_name}", file=sys.stderr)
     print(f"config_hash={config_hash}", file=sys.stderr)
     print(f"prompt_hash={prompt_hash}", file=sys.stderr)
