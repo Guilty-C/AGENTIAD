@@ -314,6 +314,7 @@ class Evidence:
                         if len(trace_files) != expected_trace_count:
                             return "TRACE_COUNT_MISMATCH", f"J3 Fail: Trace count {len(trace_files)} != Expected {expected_trace_count}", t.duration
                     
+                    has_tool_call = False
                     has_fingerprint = False
                     for tf in trace_files:
                         try:
@@ -321,16 +322,30 @@ class Evidence:
                                 data = json.load(f)
                                 turns = data.get("turns", [])
                                 for t_turn in turns:
+                                    tc = t_turn.get("tool_call")
+                                    if isinstance(tc, dict) and str(tc.get("name") or "").strip():
+                                        has_tool_call = True
+                                    tcs = t_turn.get("tool_calls")
+                                    if isinstance(tcs, list):
+                                        for c in tcs:
+                                            if isinstance(c, dict) and str(c.get("name") or "").strip():
+                                                has_tool_call = True
+                                                break
+
                                     candidates = []
-                                    if "tool_result" in t_turn: candidates.append(t_turn["tool_result"])
-                                    if "tool_results" in t_turn: candidates.extend(t_turn["tool_results"])
+                                    if "tool_result" in t_turn:
+                                        candidates.append(t_turn["tool_result"])
+                                    if "tool_results" in t_turn:
+                                        candidates.extend(t_turn["tool_results"])
                                     for tr in candidates:
-                                        if isinstance(tr, dict):
-                                            if any(k in tr for k in ["result_sha", "size", "path_hash"]): has_fingerprint = True
-                        except: pass
-                        if has_fingerprint: break
-                    if not has_fingerprint and trace_files:
-                         return "MISSING_FINGERPRINT", f"Missing tool fingerprints (J2). Checked {len(trace_files)} traces.", t.duration
+                                        if isinstance(tr, dict) and any(k in tr for k in ["result_sha", "size", "path_hash"]):
+                                            has_fingerprint = True
+                        except:
+                            pass
+                        if has_tool_call and has_fingerprint:
+                            break
+                    if has_tool_call and not has_fingerprint:
+                        return "MISSING_FINGERPRINT", f"Missing tool fingerprints (J2). Checked {len(trace_files)} traces.", t.duration
             except Exception as e: return "EXCEPTION", f"Zip Check Exception: {e}", t.duration
         return "OK", "OK", t.duration
 
