@@ -64,6 +64,7 @@ def _decode_hf_image(dataset_id: str, value: Any) -> "PIL.Image.Image":
             p = _Path(value["path"])
             if p.exists():
                 return PILImage.open(p)
+            value = value["path"]
 
     if not isinstance(value, str):
         raise TypeError(f"Unsupported image type: {type(value)}")
@@ -71,6 +72,13 @@ def _decode_hf_image(dataset_id: str, value: Any) -> "PIL.Image.Image":
     p = _Path(value)
     if p.exists():
         return PILImage.open(p)
+
+    mmad_root = os.environ.get("MMAD_ROOT", "").strip()
+    rel = value.replace("\\", "/")
+    if mmad_root and rel.startswith(("DS-MVTec/", "MVTec-AD/")):
+        local_abs = _Path(mmad_root) / _Path(*rel.split("/"))
+        if local_abs.exists():
+            return PILImage.open(local_abs)
 
     try:
         from huggingface_hub import hf_hub_download

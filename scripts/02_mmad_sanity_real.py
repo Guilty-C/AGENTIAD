@@ -76,7 +76,15 @@ def _decode_image_from_dataset_path(dataset_id: str, value: Any):
     except Exception as e:
         raise RuntimeError("Pillow is required to decode images.") from e
 
+    mmad_root = os.environ.get("MMAD_ROOT", "").strip()
+
     if isinstance(value, str):
+        rel = value.replace("\\", "/")
+        if mmad_root and rel.startswith(("DS-MVTec/", "MVTec-AD/")):
+            local_abs = Path(mmad_root) / Path(*rel.split("/"))
+            if local_abs.exists():
+                return PILImage.open(local_abs)
+
         p = Path(value)
         if p.exists():
             return PILImage.open(p)
