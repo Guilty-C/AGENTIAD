@@ -56,6 +56,10 @@ def _load_paper_contract_cls():
 
 PaperContract = _load_paper_contract_cls()
 
+MMAD_ROOT_RESOLVED: Optional[Path] = None
+MMAD_ASSET_MODE: str = "unknown"
+_LOCAL_DIR_ENTRY_CACHE: Dict[str, Dict[str, Path]] = {}
+
 
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -221,6 +225,91 @@ def _detect_mmad_asset_mode(mmad_root: Optional[Path], image_env: Dict[str, Any]
     if offline:
         return "hub_disabled_no_assets"
     return "hf_cache"
+
+
+def _extract_dataset_filename(value: Any) -> Optional[str]:
+    raw = None
+    if isinstance(value, dict):
+        p = value.get("path")
+        if isinstance(p, str) and p.strip():
+            raw = p
+    elif isinstance(value, str):
+        raw = value
+    if raw is None:
+        return None
+    s = str(raw).strip().replace("\\", "/")
+    if not s:
+        return None
+    if "://" in s:
+        return None
+    if Path(s).is_absolute():
+        return None
+    return s.lstrip("./").lstrip("/")
+
+
+def _get_dir_entry_map_ci(parent: Path) -> Dict[str, Path]:
+    key = str(parent.resolve())
+    cached = _LOCAL_DIR_ENTRY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    mapping: Dict[str, Path] = {}
+    try:
+        for child in parent.iterdir():
+            mapping[child.name.lower()] = child
+    except Exception:
+        pass
+    _LOCAL_DIR_ENTRY_CACHE[key] = mapping
+    return mapping
+
+
+def _resolve_case_insensitive_path(base: Path, rel_path: str) -> Optional[Path]:
+    cur = base
+    parts = [p for p in rel_path.replace("\\", "/").split("/") if p]
+    for part in parts:
+        direct = cur / part
+        if direct.exists():
+            cur = direct
+            continue
+        mapping = _get_dir_entry_map_ci(cur)
+        nxt = mapping.get(part.lower())
+        if nxt is None:
+            return None
+        cur = nxt
+    return cur if cur.exists() else None
+
+
+def _resolve_local_mmad_asset(filename: str) -> Optional[Path]:
+    if MMAD_ROOT_RESOLVED is None:
+        return None
+    rel = filename.replace("\\", "/").lstrip("/")
+    direct = MMAD_ROOT_RESOLVED / rel
+    if direct.exists():
+        return direct
+    return _resolve_case_insensitive_path(MMAD_ROOT_RESOLVED, rel)
+
+
+def _local_root_prefix_probe(d0: Any, sample_n: int = 1000) -> Tuple[List[str], Dict[str, str]]:
+    n = 0
+    needed: Dict[str, str] = {}
+    total = len(d0) if hasattr(d0, "__len__") else sample_n
+    lim = min(int(total), int(max(1, sample_n)))
+    for i in range(lim):
+        row = d0[i]
+        if not isinstance(row, dict):
+            continue
+        for _, v in _extract_image_candidates(row):
+            fn = _extract_dataset_filename(v)
+            if not fn or "/" not in fn:
+                continue
+            prefix = fn.split("/", 1)[0].strip()
+            if not prefix:
+                continue
+            if prefix not in needed:
+                needed[prefix] = fn
+        n += 1
+        if n >= lim:
+            break
+    return sorted(needed.keys()), needed
 
 
 def _extract_image_candidates(row: Mapping[str, Any]) -> List[Tuple[str, Any]]:
@@ -394,6 +483,19 @@ def _decode_hf_image(dataset_id: str, value: Any) -> "PIL.Image.Image":
                     return PILImage.open(p)
                 except Exception as e:
                     raise ImageLoadError("decode_error", f"Failed to decode local path image: {type(e).__name__}: {e}", {"path": str(p)}) from e
+            if MMAD_ASSET_MODE == "local_root":
+                fn = _extract_dataset_filename(value)
+                local_p = _resolve_local_mmad_asset(fn or str(p))
+                if local_p is not None:
+                    try:
+                        return PILImage.open(local_p)
+                    except Exception as e:
+                        raise ImageLoadError("decode_error", f"Failed to decode local MMAD asset: {type(e).__name__}: {e}", {"path": str(local_p), "filename": fn or str(p)}) from e
+                raise ImageLoadError(
+                    "local_asset_missing",
+                    f"Local MMAD asset missing: {fn or p}",
+                    {"filename": fn or str(p), "mmad_root": str(MMAD_ROOT_RESOLVED) if MMAD_ROOT_RESOLVED else "NOT_SET"},
+                )
             raise ImageLoadError("missing_file", f"Local image path missing: {p}", {"path": str(p)})
     if not isinstance(value, str):
         raise ImageLoadError("unsupported_image_value", f"Unsupported image type: {type(value)}")
@@ -404,6 +506,20 @@ def _decode_hf_image(dataset_id: str, value: Any) -> "PIL.Image.Image":
             return PILImage.open(p)
         except Exception as e:
             raise ImageLoadError("decode_error", f"Failed to decode local image: {type(e).__name__}: {e}", {"path": str(p)}) from e
+
+    filename = _extract_dataset_filename(value)
+    if MMAD_ASSET_MODE == "local_root":
+        local_p = _resolve_local_mmad_asset(filename or value)
+        if local_p is not None:
+            try:
+                return PILImage.open(local_p)
+            except Exception as e:
+                raise ImageLoadError("decode_error", f"Failed to decode local MMAD asset: {type(e).__name__}: {e}", {"path": str(local_p), "filename": filename or value}) from e
+        raise ImageLoadError(
+            "local_asset_missing",
+            f"Local MMAD asset missing: {filename or value}",
+            {"filename": filename or value, "mmad_root": str(MMAD_ROOT_RESOLVED) if MMAD_ROOT_RESOLVED else "NOT_SET"},
+        )
 
     try:
         from huggingface_hub import hf_hub_download
@@ -730,12 +846,17 @@ def main() -> int:
         object.__setattr__(paths, "logs_dir", ensure_dir(ev_dir / "logs"))
         object.__setattr__(paths, "traces_dir", ensure_dir(ev_dir / "traces"))
     dataset_id = str(cfg.get("dataset_id", "jiang-cc/MMAD"))
+    missing_dataset_prefixes: List[str] = []
+    missing_example_files: List[str] = []
     image_env_start = _image_loader_env_snapshot()
     mmad_root, mmad_root_source = resolve_mmad_root(project_root, paths)
     mmad_root_str = str(mmad_root) if mmad_root is not None else "NOT_SET"
+    global MMAD_ROOT_RESOLVED, MMAD_ASSET_MODE
+    MMAD_ROOT_RESOLVED = mmad_root
     if mmad_root is not None:
         os.environ["MMAD_ROOT"] = str(mmad_root)
     mmad_asset_mode = _detect_mmad_asset_mode(mmad_root, image_env_start)
+    MMAD_ASSET_MODE = mmad_asset_mode
     print(f"MMAD_ROOT_RESOLVED={mmad_root_str}")
     print(f"MMAD_ASSET_MODE={mmad_asset_mode}")
     print(f"[L2] MMAD_ROOT_SOURCE={mmad_root_source}", file=sys.stderr)
@@ -916,6 +1037,38 @@ def main() -> int:
         if split not in ds:
             split = "test" if "test" in ds else list(ds.keys())[0]
         d0: Any = ds[split]
+
+        if mmad_asset_mode == "local_root" and mmad_root is not None:
+            required_prefixes, prefix_examples = _local_root_prefix_probe(d0, sample_n=1000)
+            missing_prefixes = [pfx for pfx in required_prefixes if not (mmad_root / pfx).exists()]
+            missing_dataset_prefixes = list(missing_prefixes)
+            missing_example_files = [prefix_examples[pfx] for pfx in missing_prefixes if pfx in prefix_examples]
+            if missing_prefixes:
+                remediation = "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
+                print(
+                    "MMAD_ROOT missing required sub-datasets: "
+                    f"{missing_prefixes}; expected paths like: {missing_example_files}",
+                )
+                print(f"REMEDIATION={remediation}")
+                print(
+                    "L2_RESULT_JSON="
+                    + json.dumps(
+                        {
+                            "run_name": run_name,
+                            "dataset_split": split,
+                            "mmad_root_resolved": mmad_root_str,
+                            "mmad_asset_mode": mmad_asset_mode,
+                            "missing_dataset_prefixes": missing_prefixes,
+                            "missing_example_files": missing_example_files,
+                            "error": "local_root_missing_required_prefixes",
+                            "remediation": remediation,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                return 2
 
         n_total = int(d0.num_rows)
         candidates = list(range(n_total))
@@ -1478,6 +1631,8 @@ def main() -> int:
             "allow_full_dataset": bool(args.allow_full_dataset),
             "max_samples_effective": max_samples_effective,
             "dataset_split": split,
+            "missing_dataset_prefixes": missing_dataset_prefixes,
+            "missing_example_files": missing_example_files,
             "toolcall_rate": (float(n_samples_with_tool_call) / float(len(rows))) if rows else 0.0,
             "tool_calls_total": int(tool_calls_total),
             "uncertainty_rule": cr_rule,
@@ -1531,6 +1686,8 @@ def main() -> int:
         "allow_full_dataset": bool(args.allow_full_dataset),
         "max_samples_effective": max_samples_effective,
         "dataset_split": split,
+        "missing_dataset_prefixes": missing_dataset_prefixes,
+        "missing_example_files": missing_example_files,
     }
 
     # Log readable summary to stderr (Audit/Debug)

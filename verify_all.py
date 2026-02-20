@@ -778,12 +778,36 @@ class AgentInfer06(Stage):
                                          res.artifacts[f"seed_{seed}_l2_skipped"] = l2_data["n_skipped"]
                                     if "skip_reasons" in l2_data:
                                          res.artifacts[f"seed_{seed}_l2_skip_reasons"] = l2_data["skip_reasons"]
+                                    if "skip_reason_examples" in l2_data:
+                                         res.artifacts[f"seed_{seed}_l2_skip_reason_examples"] = l2_data["skip_reason_examples"]
                                     if "allow_full_dataset" in l2_data:
                                          res.artifacts[f"seed_{seed}_l2_allow_full_dataset"] = l2_data["allow_full_dataset"]
                                     if "max_samples_effective" in l2_data:
                                          res.artifacts[f"seed_{seed}_l2_max_samples_effective"] = l2_data["max_samples_effective"]
                                     if "dataset_split" in l2_data:
                                          res.artifacts[f"seed_{seed}_l2_dataset_split"] = l2_data["dataset_split"]
+
+                                    image_env = l2_data.get("image_loader_env", {}) if isinstance(l2_data, dict) else {}
+                                    offline_all = (
+                                        str(image_env.get("HF_DATASETS_OFFLINE", "")) == "1"
+                                        and str(image_env.get("HF_HUB_OFFLINE", "")) == "1"
+                                        and str(image_env.get("TRANSFORMERS_OFFLINE", "")) == "1"
+                                    )
+                                    skip_examples = l2_data.get("skip_reason_examples", {}) if isinstance(l2_data, dict) else {}
+                                    if (
+                                        str(res.artifacts.get("mmad_asset_mode", "")) == "local_root"
+                                        and offline_all
+                                        and isinstance(skip_examples, dict)
+                                        and "hub_download_error" in skip_examples
+                                    ):
+                                        res.success = False
+                                        res.errors.append(
+                                            f"S{seed}-06 local_root offline violation: hub_download_error present in skip_reason_examples. "
+                                            "Remediation: export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/."
+                                        )
+                                        remediation = "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
+                                        if remediation not in res.remediations:
+                                            res.remediations.append(remediation)
                                     
                                     # Audit check: mismatch between requested and effective
                                     if "n_requested_ids" in l2_data:
