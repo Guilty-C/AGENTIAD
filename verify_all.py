@@ -48,6 +48,7 @@ class StageContext:
     no_adapter: bool
     allow_full_dataset: bool = False
     phase1_baseline: bool = False
+    strict_j_mode: bool = False
     dataset_split: str = "test"
     env_overrides: Dict[str, str] = field(default_factory=dict)
     scripts_dir: Path = field(default_factory=lambda: DIST_SCRIPTS)
@@ -667,7 +668,7 @@ class ProbeIds(Stage):
                 probe_cfg = ctx.work_dir / "probe_config.yaml"
                 probe_cfg.write_text("model_id: distilgpt2\nrun_name: probe\n", encoding="utf-8")
                 
-                cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(probe_cfg).with_run_name("probe").arg("--seed", "42").arg("--max_samples", "32").arg("--evidence_dir", probe_dir).build()
+                cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(probe_cfg).with_run_name("probe").arg("--seed", "42").arg("--max_samples", "32").arg("--evidence_dir", probe_dir).arg("--split", ctx.dataset_split).build()
                 if J1.record_if_violation(cmd, res, "probe cmd"): return
                 probe_res = CmdRunner.run(cmd, ctx.env_overrides, stream_output=True)
                 if probe_res:
@@ -763,6 +764,7 @@ class AgentInfer06(Stage):
                 
                 # Task B: Parse L2_RESULT_JSON for effective_n
                 l2_effective_n = None
+                seed_audit_mismatch_recorded = False
                 if merged_output:
                     try:
                         # Parse from merged output: stream mode redirects stderr->stdout.
@@ -770,6 +772,22 @@ class AgentInfer06(Stage):
                             if line.strip().startswith("L2_RESULT_JSON="):
                                 json_str = line.strip()[len("L2_RESULT_JSON="):]
                                 l2_data = json.loads(json_str)
+                                l2_dataset_split = str(l2_data.get("dataset_split", "") or "")
+                                res.artifacts[f"seed_{seed}_l2_dataset_split"] = l2_dataset_split
+                                if ctx.strict_j_mode and l2_dataset_split and l2_dataset_split != ctx.dataset_split:
+                                    seed_audit_mismatch_recorded = True
+                                    res.artifacts["evidence_checks"].append({
+                                        "stage": f"S{seed}-06",
+                                        "stable_stage": "AgentInfer06",
+                                        "label": f"S{seed}-06",
+                                        "code": "DATASET_SPLIT_MISMATCH",
+                                        "msg": f"Strict J fail: dataset_split mismatch (expected={ctx.dataset_split}, actual={l2_dataset_split})"
+                                    })
+                                    res.success = False
+                                    res.gates["J3"] = False
+                                    res.errors.append(
+                                        f"S{seed}-06 dataset_split mismatch under strict_j: expected {ctx.dataset_split}, got {l2_dataset_split}"
+                                    )
                                 if "effective_n" in l2_data:
                                     l2_effective_n = int(l2_data["effective_n"])
                                     res.artifacts[f"seed_{seed}_l2_effective_n"] = l2_effective_n
@@ -784,8 +802,6 @@ class AgentInfer06(Stage):
                                          res.artifacts[f"seed_{seed}_l2_allow_full_dataset"] = l2_data["allow_full_dataset"]
                                     if "max_samples_effective" in l2_data:
                                          res.artifacts[f"seed_{seed}_l2_max_samples_effective"] = l2_data["max_samples_effective"]
-                                    if "dataset_split" in l2_data:
-                                         res.artifacts[f"seed_{seed}_l2_dataset_split"] = l2_data["dataset_split"]
 
                                     image_env = l2_data.get("image_loader_env", {}) if isinstance(l2_data, dict) else {}
                                     offline_all = (
@@ -808,25 +824,49 @@ class AgentInfer06(Stage):
                                         remediation = "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
                                         if remediation not in res.remediations:
                                             res.remediations.append(remediation)
-                                    
+
                                     # Audit check: mismatch between requested and effective
                                     if "n_requested_ids" in l2_data:
                                         n_req = int(l2_data["n_requested_ids"])
-                                        if n_req != l2_effective_n:
-                                            n_skipped = int(l2_data.get("n_skipped", 0))
-                                            skip_reasons = l2_data.get("skip_reasons", {})
+                                        n_skipped = int(l2_data.get("n_skipped", 0))
+                                        skip_reasons = l2_data.get("skip_reasons", {})
+                                        max_eff_raw = l2_data.get("max_samples_effective")
+
+                                        max_eff_int: Optional[int] = None
+                                        if isinstance(max_eff_raw, int):
+                                            max_eff_int = max_eff_raw
+                                        elif isinstance(max_eff_raw, str):
+                                            s_eff = max_eff_raw.strip()
+                                            if s_eff and s_eff.upper() != "NONE":
+                                                try:
+                                                    max_eff_int = int(s_eff)
+                                                except Exception:
+                                                    max_eff_int = None
+
+                                        expected_n = n_req if max_eff_int is None else min(n_req, max_eff_int)
+                                        has_skip_signal = n_skipped > 0 or (isinstance(skip_reasons, dict) and len(skip_reasons) > 0)
+                                        should_flag_mismatch = (
+                                            l2_effective_n != expected_n and (has_skip_signal or l2_effective_n < expected_n)
+                                        )
+
+                                        if should_flag_mismatch:
+                                            seed_audit_mismatch_recorded = True
                                             res.artifacts["evidence_checks"].append({
                                                 "stage": f"S{seed}-06",
                                                 "stable_stage": "AgentInfer06",
                                                 "label": f"S{seed}-06",
                                                 "code": "EFFECTIVE_N_MISMATCH",
-                                                "msg": f"Requested {n_req} != Effective {l2_effective_n} (Skipped {n_skipped}; Reasons={skip_reasons})"
+                                                "msg": (
+                                                    f"Expected {expected_n} != Effective {l2_effective_n} "
+                                                    f"(n_requested_ids={n_req}, max_samples_effective={max_eff_raw}, "
+                                                    f"Skipped {n_skipped}; Reasons={skip_reasons})"
+                                                )
                                             })
                                             if ctx.phase1_baseline:
                                                 res.success = False
                                                 res.gates["J3"] = False
                                                 res.errors.append(
-                                                    f"Phase1 dataset completeness failure: effective_n ({l2_effective_n}) != n_requested_ids ({n_req}); n_skipped={n_skipped}, skip_reasons={skip_reasons}. Remediation: export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/."
+                                                    f"Phase1 dataset completeness failure: effective_n ({l2_effective_n}) != expected ({expected_n}); n_skipped={n_skipped}, skip_reasons={skip_reasons}. Remediation: export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/."
                                                 )
                                                 remediation = (
                                                     "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
@@ -853,13 +893,14 @@ class AgentInfer06(Stage):
                     code, msg, dur = Evidence.verify_zip(ev06_zip, "06_run_agentiad_infer.py", expected_trace_count=subset_size)
                     if ev06_note:
                         msg = f"{msg} ({ev06_note})"
-                res.artifacts["evidence_checks"].append({
-                    "stage": f"S{seed}-06", 
-                    "stable_stage": "AgentInfer06",
-                    "label": f"S{seed}-06",
-                    "code": code, 
-                    "msg": msg
-                })
+                if not (seed_audit_mismatch_recorded and code == "OK"):
+                    res.artifacts["evidence_checks"].append({
+                        "stage": f"S{seed}-06", 
+                        "stable_stage": "AgentInfer06",
+                        "label": f"S{seed}-06",
+                        "code": code, 
+                        "msg": msg
+                    })
                 res.measurements["evidence_check_sec"] = res.measurements.get("evidence_check_sec", 0.0) + dur
                 if code != "OK": res.success = False; res.errors.append(f"S{seed}-06 Evidence: {msg}")
 
@@ -1763,6 +1804,7 @@ def run_workload(args):
         no_adapter=args.no_adapter,
         allow_full_dataset=args.allow_full_dataset,
         phase1_baseline=is_phase1,
+        strict_j_mode=(args.mode == "strict_j"),
         dataset_split=args.dataset_split,
         env_overrides=env_overrides
     )
