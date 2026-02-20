@@ -824,8 +824,44 @@ class SFTTrain09(Stage):
                 # CMD_FAILED already recorded by helper
                 return
             
+            expected = ev_09 / "evidence_package.zip"
+            if not expected.exists():
+                candidates = sorted(ev_09.glob("*.zip"), key=lambda p: p.name.lower())
+                if len(candidates) == 1:
+                    legacy_zip = candidates[0]
+                    try:
+                        legacy_zip.replace(expected)
+                    except Exception:
+                        try:
+                            shutil.copy2(legacy_zip, expected)
+                        except Exception as e:
+                            code, msg, dur = (
+                                "MISSING_ZIP",
+                                f"Missing zip: failed to normalize legacy zip {legacy_zip.name} -> evidence_package.zip ({e})",
+                                0.0,
+                            )
+                    if expected.exists():
+                        print(
+                            f"[S{seed}-09] Normalized legacy zip {legacy_zip.name} -> evidence_package.zip",
+                            file=sys.stderr,
+                        )
+                elif len(candidates) == 0:
+                    code, msg, dur = (
+                        "MISSING_ZIP",
+                        "Missing zip: expected ev_09/evidence_package.zip and found 0 zip candidates in ev_09",
+                        0.0,
+                    )
+                else:
+                    candidate_names = ", ".join(p.name for p in candidates)
+                    code, msg, dur = (
+                        "MISSING_ZIP",
+                        f"Multiple zip candidates in ev_09: {candidate_names}",
+                        0.0,
+                    )
+
             # Evidence Check (Training, no traces usually)
-            code, msg, dur = Evidence.verify_zip(ev_09 / "evidence_package.zip", "09_train_lora_sft_toy.py", expected_trace_count=None)
+            if expected.exists():
+                code, msg, dur = Evidence.verify_zip(expected, "09_train_lora_sft_toy.py", expected_trace_count=None)
             res.artifacts["evidence_checks"].append({
                 "stage": f"S{seed}-09", 
                 "stable_stage": "SFTTrain09",
