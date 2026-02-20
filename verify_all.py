@@ -630,6 +630,8 @@ class ProbeIds(Stage):
                     (ctx.work_dir / "ids.txt").write_text("\n".join(valid_ids), encoding="utf-8")
                     res.artifacts["ids_sha256"] = hashlib.sha256("\n".join(valid_ids).encode()).hexdigest()
                     res.artifacts["phase1_full_mode"] = True
+                    res.artifacts["audit_ids_total"] = len(valid_ids)
+                    res.artifacts["audit_ids_source"] = "generated_dataset"
                     return
                 except Exception as e:
                     res.success = False
@@ -657,6 +659,7 @@ class ProbeIds(Stage):
             valid_ids = []
             if (ctx.work_dir / "ids.txt").exists() and (ctx.work_dir / "ids.txt").stat().st_size > 0:
                  valid_ids = [x.strip() for x in (ctx.work_dir / "ids.txt").read_text(encoding="utf-8").splitlines() if x.strip()]
+            ids_source = "ids.txt" if valid_ids else ""
             
             if not valid_ids:
                 probe_dir = ctx.work_dir / "probe"
@@ -686,6 +689,7 @@ class ProbeIds(Stage):
                                         if "sample_id" in d: valid_ids.append(d["sample_id"])
                                     except: pass
                     valid_ids = sorted(list(set(valid_ids)))[:32]
+                    ids_source = "probe"
                 else:
                     # _require_cmd_ok already set res.success=False and errors
                     return
@@ -704,6 +708,8 @@ class ProbeIds(Stage):
                  return
             (ctx.work_dir / "ids.txt").write_text("\n".join(valid_ids), encoding="utf-8")
             res.artifacts["ids_sha256"] = hashlib.sha256("\n".join(valid_ids).encode()).hexdigest()
+            res.artifacts["audit_ids_total"] = len(valid_ids)
+            res.artifacts["audit_ids_source"] = ids_source or "generated/ids.txt"
 
 class AgentInfer06(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
@@ -720,18 +726,18 @@ class AgentInfer06(Stage):
                 ev_06 = s_dir / "ev_06"
                 
                 cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(mr_cfg).with_run_name(f"mr_s{seed}").arg("--seed", seed).arg("--id_list", ctx.work_dir / "ids.txt").with_evidence_dir(ev_06)
+                cmd.arg("--split", ctx.dataset_split)
                 
                 if ctx.phase1_baseline:
                     cmd.arg("--enable_tools", "false")
                 
-                eff_max = ctx.get_effective_max_samples()
-                if eff_max is not None:
-                     cmd.arg("--max_samples", eff_max)
+                if ctx.allow_full_dataset:
+                    cmd.arg("--allow_full_dataset")
                 else:
-                     # Full run (allowed)
-                     if ctx.allow_full_dataset:
-                         cmd.arg("--allow_full_dataset")
-                     else:
+                    eff_max = ctx.get_effective_max_samples()
+                    if eff_max is not None:
+                         cmd.arg("--max_samples", eff_max)
+                    else:
                          cmd.arg("--max_samples", "99999")
                 
                 if ctx.allow_flags: cmd.arg("--allow_code_execution")
@@ -772,6 +778,12 @@ class AgentInfer06(Stage):
                                          res.artifacts[f"seed_{seed}_l2_skipped"] = l2_data["n_skipped"]
                                     if "skip_reasons" in l2_data:
                                          res.artifacts[f"seed_{seed}_l2_skip_reasons"] = l2_data["skip_reasons"]
+                                    if "allow_full_dataset" in l2_data:
+                                         res.artifacts[f"seed_{seed}_l2_allow_full_dataset"] = l2_data["allow_full_dataset"]
+                                    if "max_samples_effective" in l2_data:
+                                         res.artifacts[f"seed_{seed}_l2_max_samples_effective"] = l2_data["max_samples_effective"]
+                                    if "dataset_split" in l2_data:
+                                         res.artifacts[f"seed_{seed}_l2_dataset_split"] = l2_data["dataset_split"]
                                     
                                     # Audit check: mismatch between requested and effective
                                     if "n_requested_ids" in l2_data:
@@ -1732,6 +1744,11 @@ def run_workload(args):
     )
     
     res = StageResult()
+    res.artifacts["audit_allow_full_dataset"] = bool(ctx.allow_full_dataset)
+    res.artifacts["audit_dataset_split"] = str(ctx.dataset_split)
+    res.artifacts["audit_effective_max_samples"] = "NONE" if ctx.allow_full_dataset else int(ctx.get_effective_max_samples())
+    res.artifacts["audit_ids_total"] = 0
+    res.artifacts["audit_ids_source"] = "NOT_SET"
 
     # SENTINEL MODE
     if args.sentinel_ref:
@@ -1852,6 +1869,9 @@ def build_arg_parser():
     return parser
 
 def main():
+    # Remote Route-A reference command:
+    # export MMAD_ROOT="/data2/lrrelevant/datasets/MMAD_ROOT"
+    # CUDA_VISIBLE_DEVICES=0 python verify_all.py --mode strict_j --allow-full-dataset --dataset-split train --seeds 0 1 2
     parser = build_arg_parser()
     args = parser.parse_args()
 

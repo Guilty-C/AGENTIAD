@@ -952,6 +952,7 @@ def main() -> int:
     
     # Use effective limit
     max_samples = effective_max_samples
+    max_samples_effective = "NONE" if args.allow_full_dataset else int(max_samples)
 
     normal_idx_by_class: Dict[str, List[int]] = {}
     for i in range(n_total):
@@ -1474,6 +1475,9 @@ def main() -> int:
             "image_loader_env": image_env,
             "mmad_root_resolved": mmad_root_str,
             "mmad_asset_mode": mmad_asset_mode,
+            "allow_full_dataset": bool(args.allow_full_dataset),
+            "max_samples_effective": max_samples_effective,
+            "dataset_split": split,
             "toolcall_rate": (float(n_samples_with_tool_call) / float(len(rows))) if rows else 0.0,
             "tool_calls_total": int(tool_calls_total),
             "uncertainty_rule": cr_rule,
@@ -1524,6 +1528,9 @@ def main() -> int:
         "image_loader_env": image_env,
         "mmad_root_resolved": mmad_root_str,
         "mmad_asset_mode": mmad_asset_mode,
+        "allow_full_dataset": bool(args.allow_full_dataset),
+        "max_samples_effective": max_samples_effective,
+        "dataset_split": split,
     }
 
     # Log readable summary to stderr (Audit/Debug)
