@@ -382,6 +382,18 @@ class Evidence:
                 return with_tool / len(traces)
         except: return 0.0
 
+
+def resolve_evidence_zip(ev_dir: Path):
+    expected = ev_dir / "evidence_package.zip"
+    if expected.exists():
+        return expected, "", ["evidence_package.zip"]
+
+    candidates = sorted([p for p in ev_dir.glob("*.zip") if p.is_file()], key=lambda p: p.name.lower())
+    found = [p.name for p in candidates]
+    if len(candidates) == 1:
+        return candidates[0], f"fallback to {candidates[0].name}", found
+    return None, "", found
+
 class CSVHash:
     @staticmethod
     def compute(zip_path: Path, csv_name: str) -> Optional[str]:
@@ -577,8 +589,8 @@ class ProbeIds(Stage):
                 probe_res = CmdRunner.run(cmd, ctx.env_overrides, stream_output=True)
                 
                 if _require_cmd_ok(res, probe_res, "Probe", "ProbeIds"):
-                    zip_path = probe_dir / "evidence_package.zip"
-                    if zip_path.exists():
+                    zip_path, _, _ = resolve_evidence_zip(probe_dir)
+                    if zip_path is not None and zip_path.exists():
                         with zipfile.ZipFile(zip_path, "r") as zf:
                             for n in zf.namelist():
                                 if n.endswith("trace.json"):
@@ -701,7 +713,15 @@ class AgentInfer06(Stage):
                 if ctx.phase1_baseline and l2_effective_n is not None:
                      subset_size = l2_effective_n
 
-                code, msg, dur = Evidence.verify_zip(ev_06 / "evidence_package.zip", "06_run_agentiad_infer.py", expected_trace_count=subset_size)
+                ev06_zip, ev06_note, ev06_found = resolve_evidence_zip(ev_06)
+                if ev06_zip is None:
+                    code = "MISSING_ZIP"
+                    msg = f"Missing zip: expected evidence_package.zip in {ev_06}; found {ev06_found}"
+                    dur = 0.0
+                else:
+                    code, msg, dur = Evidence.verify_zip(ev06_zip, "06_run_agentiad_infer.py", expected_trace_count=subset_size)
+                    if ev06_note:
+                        msg = f"{msg} ({ev06_note})"
                 res.artifacts["evidence_checks"].append({
                     "stage": f"S{seed}-06", 
                     "stable_stage": "AgentInfer06",
@@ -724,10 +744,10 @@ class BuildTraj08(Stage):
             l3_jsonl = s_dir / "l3.jsonl"
             
             # Prereq Check
-            zip_path = ev_06 / "evidence_package.zip"
-            if not zip_path.exists():
+            zip_path, zip_note, zip_found = resolve_evidence_zip(ev_06)
+            if zip_path is None:
                 res.success = False
-                res.errors.append(f"S{seed}-08 prereq missing: ev_06 evidence_package.zip")
+                res.errors.append(f"S{seed}-08 prereq missing: expected evidence_package.zip in ev_06; found {zip_found}")
                 return
 
             tmp_unzip = s_dir / "tmp_unzip_06"
@@ -768,7 +788,15 @@ class BuildTraj08(Stage):
             eff_max = ctx.get_effective_max_samples()
             subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
             
-            code, msg, dur = Evidence.verify_zip(ev_08 / "evidence_package.zip", "08_build_sft_trajectories.py", expected_trace_count=subset_size)
+            ev08_zip, ev08_note, ev08_found = resolve_evidence_zip(ev_08)
+            if ev08_zip is None:
+                code = "MISSING_ZIP"
+                msg = f"Missing zip: expected evidence_package.zip in {ev_08}; found {ev08_found}"
+                dur = 0.0
+            else:
+                code, msg, dur = Evidence.verify_zip(ev08_zip, "08_build_sft_trajectories.py", expected_trace_count=subset_size)
+                if ev08_note:
+                    msg = f"{msg} ({ev08_note})"
             res.artifacts["evidence_checks"].append({
                 "stage": f"S{seed}-08", 
                 "stable_stage": "BuildTraj08",
@@ -824,44 +852,16 @@ class SFTTrain09(Stage):
                 # CMD_FAILED already recorded by helper
                 return
             
-            expected = ev_09 / "evidence_package.zip"
-            if not expected.exists():
-                candidates = sorted(ev_09.glob("*.zip"), key=lambda p: p.name.lower())
-                if len(candidates) == 1:
-                    legacy_zip = candidates[0]
-                    try:
-                        legacy_zip.replace(expected)
-                    except Exception:
-                        try:
-                            shutil.copy2(legacy_zip, expected)
-                        except Exception as e:
-                            code, msg, dur = (
-                                "MISSING_ZIP",
-                                f"Missing zip: failed to normalize legacy zip {legacy_zip.name} -> evidence_package.zip ({e})",
-                                0.0,
-                            )
-                    if expected.exists():
-                        print(
-                            f"[S{seed}-09] Normalized legacy zip {legacy_zip.name} -> evidence_package.zip",
-                            file=sys.stderr,
-                        )
-                elif len(candidates) == 0:
-                    code, msg, dur = (
-                        "MISSING_ZIP",
-                        "Missing zip: expected ev_09/evidence_package.zip and found 0 zip candidates in ev_09",
-                        0.0,
-                    )
-                else:
-                    candidate_names = ", ".join(p.name for p in candidates)
-                    code, msg, dur = (
-                        "MISSING_ZIP",
-                        f"Multiple zip candidates in ev_09: {candidate_names}",
-                        0.0,
-                    )
-
-            # Evidence Check (Training, no traces usually)
-            if expected.exists():
-                code, msg, dur = Evidence.verify_zip(expected, "09_train_lora_sft_toy.py", expected_trace_count=None)
+            ev09_zip, ev09_note, ev09_found = resolve_evidence_zip(ev_09)
+            if ev09_zip is None:
+                code = "MISSING_ZIP"
+                msg = f"Missing zip: expected evidence_package.zip in {ev_09}; found {ev09_found}"
+                dur = 0.0
+            else:
+                # Evidence Check (Training, no traces usually)
+                code, msg, dur = Evidence.verify_zip(ev09_zip, "09_train_lora_sft_toy.py", expected_trace_count=None)
+                if ev09_note:
+                    msg = f"{msg} ({ev09_note})"
             res.artifacts["evidence_checks"].append({
                 "stage": f"S{seed}-09", 
                 "stable_stage": "SFTTrain09",
@@ -900,7 +900,15 @@ class SFTInfer(Stage):
         eff_max = ctx.get_effective_max_samples()
         subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
         
-        code, msg, dur = Evidence.verify_zip(ev_sft / "evidence_package.zip", "06_run_agentiad_infer.py", expected_trace_count=subset_size)
+        evsft_zip, evsft_note, evsft_found = resolve_evidence_zip(ev_sft)
+        if evsft_zip is None:
+            code = "MISSING_ZIP"
+            msg = f"Missing zip: expected evidence_package.zip in {ev_sft}; found {evsft_found}"
+            dur = 0.0
+        else:
+            code, msg, dur = Evidence.verify_zip(evsft_zip, "06_run_agentiad_infer.py", expected_trace_count=subset_size)
+            if evsft_note:
+                msg = f"{msg} ({evsft_note})"
         res.artifacts["evidence_checks"].append({
             "stage": "SFTInfer", 
             "stable_stage": "SFTInfer",
@@ -942,7 +950,15 @@ class GRPOBuild(Stage):
 
         # Evidence Check
         # rollouts produces traces but count might vary or be large
-        code, msg, dur = Evidence.verify_zip(ev_10_build / "evidence_package.zip", "10_build_grpo_rollouts_toy.py", expected_trace_count=None)
+        ev10b_zip, ev10b_note, ev10b_found = resolve_evidence_zip(ev_10_build)
+        if ev10b_zip is None:
+            code = "MISSING_ZIP"
+            msg = f"Missing zip: expected evidence_package.zip in {ev_10_build}; found {ev10b_found}"
+            dur = 0.0
+        else:
+            code, msg, dur = Evidence.verify_zip(ev10b_zip, "10_build_grpo_rollouts_toy.py", expected_trace_count=None)
+            if ev10b_note:
+                msg = f"{msg} ({ev10b_note})"
         res.artifacts["evidence_checks"].append({
             "stage": "GRPOBuild", 
             "stable_stage": "GRPOBuild",
@@ -983,7 +999,15 @@ class GRPOTrain(Stage):
             if "lora_param_abs_delta" in snap: res.artifacts["lora_delta"] = snap["lora_param_abs_delta"]
 
         # Evidence Check
-        code, msg, dur = Evidence.verify_zip(ev_10_train / "evidence_package.zip", "10_train_grpo_toy.py", expected_trace_count=None)
+        ev10t_zip, ev10t_note, ev10t_found = resolve_evidence_zip(ev_10_train)
+        if ev10t_zip is None:
+            code = "MISSING_ZIP"
+            msg = f"Missing zip: expected evidence_package.zip in {ev_10_train}; found {ev10t_found}"
+            dur = 0.0
+        else:
+            code, msg, dur = Evidence.verify_zip(ev10t_zip, "10_train_grpo_toy.py", expected_trace_count=None)
+            if ev10t_note:
+                msg = f"{msg} ({ev10t_note})"
         res.artifacts["evidence_checks"].append({
             "stage": "GRPOTrain", 
             "stable_stage": "GRPOTrain",
@@ -1026,7 +1050,15 @@ class GRPOInfer(Stage):
             eff_max = ctx.get_effective_max_samples()
             subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
             
-            code, msg, dur = Evidence.verify_zip(ev_grpo / "evidence_package.zip", "06_run_agentiad_infer.py", expected_trace_count=subset_size)
+            evgrpo_zip, evgrpo_note, evgrpo_found = resolve_evidence_zip(ev_grpo)
+            if evgrpo_zip is None:
+                code = "MISSING_ZIP"
+                msg = f"Missing zip: expected evidence_package.zip in {ev_grpo}; found {evgrpo_found}"
+                dur = 0.0
+            else:
+                code, msg, dur = Evidence.verify_zip(evgrpo_zip, "06_run_agentiad_infer.py", expected_trace_count=subset_size)
+                if evgrpo_note:
+                    msg = f"{msg} ({evgrpo_note})"
             res.artifacts["evidence_checks"].append({
                 "stage": "GRPOInfer", 
                 "stable_stage": "GRPOInfer",
@@ -1077,9 +1109,11 @@ class Phase1Metrics(Stage):
             s_dir.mkdir(parents=True, exist_ok=True)
 
             # SSOT: Read from evidence zip
-            zip_path = s_dir / "ev_06" / "evidence_package.zip"
-            if not zip_path.exists():
-                res.errors.append(f"Evidence zip missing for seed {seed}: {zip_path}")
+            zip_path, _, found = resolve_evidence_zip(s_dir / "ev_06")
+            if zip_path is None or not zip_path.exists():
+                res.errors.append(
+                    f"Evidence zip missing for seed {seed}: expected evidence_package.zip in {s_dir / 'ev_06'}; found {found}"
+                )
                 continue
             
             csv_name = f"tables/agentiad_infer_mr_s{seed}.csv"
@@ -1193,16 +1227,16 @@ class GateEvaluator:
         first_seed = ctx.seeds[0] if ctx.seeds else 0
         
         # Baseline/Agent: Usually same in this repro, derived from 06 run of first seed
-        agent_csv = ctx.work_dir / f"seed_{first_seed}/ev_06/evidence_package.zip"
-        agent_hash = CSVHash.compute(agent_csv, f"tables/agentiad_infer_mr_s{first_seed}.csv")
+        agent_csv, _, _ = resolve_evidence_zip(ctx.work_dir / f"seed_{first_seed}/ev_06")
+        agent_hash = CSVHash.compute(agent_csv, f"tables/agentiad_infer_mr_s{first_seed}.csv") if agent_csv else None
         
         # SFT: Derived from SFT Infer run
-        sft_csv = ctx.work_dir / "ev_sft/evidence_package.zip"
-        sft_hash = CSVHash.compute(sft_csv, "tables/agentiad_infer_mr_sft.csv")
+        sft_csv, _, _ = resolve_evidence_zip(ctx.work_dir / "ev_sft")
+        sft_hash = CSVHash.compute(sft_csv, "tables/agentiad_infer_mr_sft.csv") if sft_csv else None
         
         # GRPO: Derived from GRPO Infer run
-        grpo_csv = ctx.work_dir / "ev_grpo/evidence_package.zip"
-        grpo_hash = CSVHash.compute(grpo_csv, "tables/agentiad_infer_mr_grpo_infer.csv")
+        grpo_csv, _, _ = resolve_evidence_zip(ctx.work_dir / "ev_grpo")
+        grpo_hash = CSVHash.compute(grpo_csv, "tables/agentiad_infer_mr_grpo_infer.csv") if grpo_csv else None
         
         res.artifacts["table_hashes"] = {
             "agent": agent_hash,
@@ -1215,8 +1249,8 @@ class GateEvaluator:
         # Tool Rates (J6) - Iterate all seeds
         tool_rates = []
         for s in ctx.seeds:
-            ev_pkg = ctx.work_dir / f"seed_{s}/ev_06/evidence_package.zip"
-            if ev_pkg.exists():
+            ev_pkg, _, _ = resolve_evidence_zip(ctx.work_dir / f"seed_{s}/ev_06")
+            if ev_pkg is not None and ev_pkg.exists():
                 tool_rates.append(Evidence.get_toolcall_rate(ev_pkg))
         
         if tool_rates:
