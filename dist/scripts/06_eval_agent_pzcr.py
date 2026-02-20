@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import sys
@@ -42,6 +43,66 @@ def _merge_cfg(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
             continue
         out[k] = v
     return out
+
+
+def _image_loader_env_snapshot() -> Dict[str, Any]:
+    return {
+        "TRANSFORMERS_OFFLINE": os.environ.get("TRANSFORMERS_OFFLINE", ""),
+        "HF_DATASETS_OFFLINE": os.environ.get("HF_DATASETS_OFFLINE", ""),
+        "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", ""),
+    }
+
+
+def _load_paths_yaml_candidates(project_root: Path) -> Dict[str, Any]:
+    candidates = [
+        project_root / "configs" / "paths.yaml",
+        project_root / "dist" / "configs" / "paths.yaml",
+    ]
+    for p in candidates:
+        try:
+            if p.exists():
+                data = _load_yaml(p)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            continue
+    return {}
+
+
+def resolve_mmad_root(project_root: Path, paths: Any) -> Tuple[Optional[Path], str]:
+    env_raw = str(os.environ.get("MMAD_ROOT", "") or "").strip()
+    if env_raw:
+        return Path(env_raw).expanduser().resolve(), "env"
+    cfg = _load_paths_yaml_candidates(project_root)
+    paths_cfg = cfg.get("paths", {}) if isinstance(cfg, dict) else {}
+    if isinstance(paths_cfg, dict):
+        cfg_raw = str(paths_cfg.get("mmad_root", "") or "").strip()
+        if cfg_raw:
+            p = Path(cfg_raw)
+            if not p.is_absolute():
+                p = (project_root / p).resolve()
+            else:
+                p = p.resolve()
+            return p, "paths_yaml"
+    mmad_dir = getattr(paths, "mmad_dir", None)
+    if isinstance(mmad_dir, Path):
+        return mmad_dir.resolve(), "paths.mmad_dir"
+    data_dir = getattr(paths, "data_dir", None)
+    if isinstance(data_dir, Path):
+        return (data_dir / "mmad").resolve(), "paths.data_dir/mmad"
+    return None, "not_set"
+
+
+def _detect_mmad_asset_mode(mmad_root: Optional[Path], image_env: Dict[str, Any]) -> str:
+    has_local_assets = False
+    if mmad_root is not None:
+        has_local_assets = (mmad_root / "DS-MVTec").exists() and (mmad_root / "MVTec-AD").exists()
+    if has_local_assets:
+        return "local_root"
+    offline = any(str(image_env.get(k, "")).strip() == "1" for k in ["HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE"])
+    if offline:
+        return "hub_disabled_no_assets"
+    return "hf_cache"
 
 
 def _decode_hf_image(dataset_id: str, value: Any, *, silent: bool = False) -> "PIL.Image.Image":
@@ -336,6 +397,24 @@ def main() -> int:
         return 2
 
     paths = load_paths(project_root)
+    image_env_start = _image_loader_env_snapshot()
+    mmad_root, mmad_root_source = resolve_mmad_root(project_root, paths)
+    mmad_root_str = str(mmad_root) if mmad_root is not None else "NOT_SET"
+    if mmad_root is not None:
+        os.environ["MMAD_ROOT"] = str(mmad_root)
+    mmad_asset_mode = _detect_mmad_asset_mode(mmad_root, image_env_start)
+    print(f"MMAD_ROOT_RESOLVED={mmad_root_str}")
+    print(f"MMAD_ASSET_MODE={mmad_asset_mode}")
+    print(f"[L2_CLIP] MMAD_ROOT_SOURCE={mmad_root_source}", file=sys.stderr)
+    if mmad_asset_mode == "hub_disabled_no_assets":
+        remediation = "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
+        print(
+            "Missing offline MMAD assets. "
+            f"MMAD_ROOT_RESOLVED={mmad_root_str}. "
+            f"Remediation: {remediation}",
+            file=sys.stderr,
+        )
+        return 2
     dataset_id = "jiang-cc/MMAD"
     ds = load_dataset(dataset_id)
     if split not in ds:

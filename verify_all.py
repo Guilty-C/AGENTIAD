@@ -394,6 +394,23 @@ def resolve_evidence_zip(ev_dir: Path):
         return candidates[0], f"fallback to {candidates[0].name}", found
     return None, "", found
 
+
+def parse_l2_asset_audit(merged_output: bytes) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not merged_output:
+        return out
+    try:
+        lines = merged_output.decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        return out
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("MMAD_ROOT_RESOLVED="):
+            out["mmad_root_resolved"] = line.split("=", 1)[1].strip() or "NOT_SET"
+        elif line.startswith("MMAD_ASSET_MODE="):
+            out["mmad_asset_mode"] = line.split("=", 1)[1].strip() or "unknown"
+    return out
+
 class CSVHash:
     @staticmethod
     def compute(zip_path: Path, csv_name: str) -> Optional[str]:
@@ -650,6 +667,13 @@ class ProbeIds(Stage):
                 cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(probe_cfg).with_run_name("probe").arg("--seed", "42").arg("--max_samples", "32").arg("--evidence_dir", probe_dir).build()
                 if J1.record_if_violation(cmd, res, "probe cmd"): return
                 probe_res = CmdRunner.run(cmd, ctx.env_overrides, stream_output=True)
+                if probe_res:
+                    merged_probe = probe_res.stderr if probe_res.stderr else probe_res.stdout
+                    l2_asset_probe = parse_l2_asset_audit(merged_probe or b"")
+                    if "mmad_root_resolved" in l2_asset_probe:
+                        res.artifacts["mmad_root_resolved"] = l2_asset_probe["mmad_root_resolved"]
+                    if "mmad_asset_mode" in l2_asset_probe:
+                        res.artifacts["mmad_asset_mode"] = l2_asset_probe["mmad_asset_mode"]
                 
                 if _require_cmd_ok(res, probe_res, "Probe", "ProbeIds"):
                     zip_path, _, _ = resolve_evidence_zip(probe_dir)
@@ -715,15 +739,24 @@ class AgentInfer06(Stage):
                 cmd_list = cmd.build()
                 if J1.record_if_violation(cmd_list, res, f"06 cmd seed {seed}"): return
                 cmd_res = CmdRunner.run(cmd_list, ctx.env_overrides, stream_output=True)
+                merged_output = b""
+                if cmd_res:
+                    merged_output = cmd_res.stderr if cmd_res.stderr else cmd_res.stdout
+                l2_asset_info = parse_l2_asset_audit(merged_output or b"")
+                if "mmad_root_resolved" in l2_asset_info:
+                    res.artifacts["mmad_root_resolved"] = l2_asset_info["mmad_root_resolved"]
+                if "mmad_asset_mode" in l2_asset_info:
+                    res.artifacts["mmad_asset_mode"] = l2_asset_info["mmad_asset_mode"]
+                if l2_asset_info.get("mmad_asset_mode") == "hub_disabled_no_assets":
+                    remediation = "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
+                    if remediation not in res.remediations:
+                        res.remediations.append(remediation)
                 if not _require_cmd_ok(res, cmd_res, f"S{seed}-06", "AgentInfer06"):
                     # CMD_FAILED already recorded by helper
                     return
                 
                 # Task B: Parse L2_RESULT_JSON for effective_n
                 l2_effective_n = None
-                merged_output = b""
-                if cmd_res:
-                    merged_output = cmd_res.stderr if cmd_res.stderr else cmd_res.stdout
                 if merged_output:
                     try:
                         # Parse from merged output: stream mode redirects stderr->stdout.
@@ -757,11 +790,10 @@ class AgentInfer06(Stage):
                                                 res.success = False
                                                 res.gates["J3"] = False
                                                 res.errors.append(
-                                                    f"Phase1 dataset completeness failure: effective_n ({l2_effective_n}) != n_requested_ids ({n_req}); n_skipped={n_skipped}, skip_reasons={skip_reasons}. This is a data availability issue, not a model failure."
+                                                    f"Phase1 dataset completeness failure: effective_n ({l2_effective_n}) != n_requested_ids ({n_req}); n_skipped={n_skipped}, skip_reasons={skip_reasons}. Remediation: export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/."
                                                 )
                                                 remediation = (
-                                                    "ensure MMAD assets are fully present locally / HF cache contains required files; "
-                                                    "avoid HF_*_OFFLINE=1 unless cache complete; re-run dataset sync"
+                                                    "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
                                                 )
                                                 if remediation not in res.remediations:
                                                     res.remediations.append(remediation)
@@ -1795,6 +1827,8 @@ def run_workload(args):
         "measurements": res.measurements,
         "remediations": res.remediations
     }
+    payload["artifacts"].setdefault("mmad_root_resolved", "NOT_SET")
+    payload["artifacts"].setdefault("mmad_asset_mode", "unknown")
     if ctx.phase1_baseline:
         payload["acceptance_a"] = build_phase1_acceptance_payload(ctx.work_dir, ctx.seeds, payload)
         payload["artifacts"]["phase1_baseline_spec"] = {

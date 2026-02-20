@@ -1,10 +1,10 @@
-paths:
+﻿paths:
   outputs_dir: outputs
   logs_dir: outputs/logs
   tables_dir: outputs/tables
   traces_dir: outputs/traces
   data_dir: data
   mmad_dir: data/mmad
+  mmad_root: ""
   trajectories_dir: data/trajectories
   cache_dir: data/cache
-

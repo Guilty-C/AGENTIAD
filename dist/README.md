@@ -296,3 +296,27 @@ ZIP_HAS_PYCACHE_DIR False
 ```
 
 为提升 zip 的确定性，脚本会按归档路径排序写入文件；同一 dist 内容在相同脚本版本与环境下 zip hash 更稳定（跨机器仍可能因压缩实现差异略有不同）。
+
+## Offline MMAD Asset Configuration (Recommended)
+
+For offline Route A runs, configure local MMAD assets explicitly.
+
+Option 1: set environment variable before running scripts:
+
+```powershell
+$env:MMAD_ROOT = "D:\\datasets\\mmad"
+```
+
+Option 2: set `paths.mmad_root` in `dist/configs/paths.yaml` (or `configs/paths.yaml`):
+
+```yaml
+paths:
+  mmad_root: "D:/datasets/mmad"
+```
+
+`MMAD_ROOT` (resolved value) should contain both directories:
+- `DS-MVTec/`
+- `MVTec-AD/`
+
+If assets are missing and hub/offline access is disabled, remediation is:
+`export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/`

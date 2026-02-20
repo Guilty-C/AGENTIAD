@@ -166,6 +166,63 @@ def _image_loader_env_snapshot() -> Dict[str, Any]:
     }
 
 
+def _load_paths_yaml_candidates(project_root: Path) -> Dict[str, Any]:
+    candidates = [
+        project_root / "configs" / "paths.yaml",
+        project_root / "dist" / "configs" / "paths.yaml",
+    ]
+    for p in candidates:
+        try:
+            if p.exists():
+                data = _load_yaml(p)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            continue
+    return {}
+
+
+def resolve_mmad_root(project_root: Path, paths: Any) -> Tuple[Optional[Path], str]:
+    env_raw = str(os.environ.get("MMAD_ROOT", "") or "").strip()
+    if env_raw:
+        p = Path(env_raw).expanduser().resolve()
+        return p, "env"
+
+    cfg = _load_paths_yaml_candidates(project_root)
+    paths_cfg = cfg.get("paths", {}) if isinstance(cfg, dict) else {}
+    if isinstance(paths_cfg, dict):
+        cfg_raw = str(paths_cfg.get("mmad_root", "") or "").strip()
+        if cfg_raw:
+            p = Path(cfg_raw)
+            if not p.is_absolute():
+                p = (project_root / p).resolve()
+            else:
+                p = p.resolve()
+            return p, "paths_yaml"
+
+    mmad_dir = getattr(paths, "mmad_dir", None)
+    if isinstance(mmad_dir, Path):
+        return mmad_dir.resolve(), "paths.mmad_dir"
+
+    data_dir = getattr(paths, "data_dir", None)
+    if isinstance(data_dir, Path):
+        return (data_dir / "mmad").resolve(), "paths.data_dir/mmad"
+
+    return None, "not_set"
+
+
+def _detect_mmad_asset_mode(mmad_root: Optional[Path], image_env: Dict[str, Any]) -> str:
+    has_local_assets = False
+    if mmad_root is not None:
+        has_local_assets = (mmad_root / "DS-MVTec").exists() and (mmad_root / "MVTec-AD").exists()
+    if has_local_assets:
+        return "local_root"
+    offline = any(str(image_env.get(k, "")).strip() == "1" for k in ["HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE"])
+    if offline:
+        return "hub_disabled_no_assets"
+    return "hf_cache"
+
+
 def _extract_image_candidates(row: Mapping[str, Any]) -> List[Tuple[str, Any]]:
     out: List[Tuple[str, Any]] = []
     for key in ["query_image", "image", "img", "image_path", "path", "file_path", "image_file", "image_bytes", "bytes"]:
@@ -673,6 +730,26 @@ def main() -> int:
         object.__setattr__(paths, "logs_dir", ensure_dir(ev_dir / "logs"))
         object.__setattr__(paths, "traces_dir", ensure_dir(ev_dir / "traces"))
     dataset_id = str(cfg.get("dataset_id", "jiang-cc/MMAD"))
+    image_env_start = _image_loader_env_snapshot()
+    mmad_root, mmad_root_source = resolve_mmad_root(project_root, paths)
+    mmad_root_str = str(mmad_root) if mmad_root is not None else "NOT_SET"
+    if mmad_root is not None:
+        os.environ["MMAD_ROOT"] = str(mmad_root)
+    mmad_asset_mode = _detect_mmad_asset_mode(mmad_root, image_env_start)
+    print(f"MMAD_ROOT_RESOLVED={mmad_root_str}")
+    print(f"MMAD_ASSET_MODE={mmad_asset_mode}")
+    print(f"[L2] MMAD_ROOT_SOURCE={mmad_root_source}", file=sys.stderr)
+    if mmad_asset_mode == "hub_disabled_no_assets":
+        remediation = (
+            "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
+        )
+        print(
+            "Missing offline MMAD assets. "
+            f"MMAD_ROOT_RESOLVED={mmad_root_str}. "
+            f"Remediation: {remediation}",
+            file=sys.stderr,
+        )
+        return 2
 
     processor = None
     model = None
@@ -1395,6 +1472,8 @@ def main() -> int:
             "skip_reasons": skip_reasons,
             "skip_reason_examples": skip_reason_examples,
             "image_loader_env": image_env,
+            "mmad_root_resolved": mmad_root_str,
+            "mmad_asset_mode": mmad_asset_mode,
             "toolcall_rate": (float(n_samples_with_tool_call) / float(len(rows))) if rows else 0.0,
             "tool_calls_total": int(tool_calls_total),
             "uncertainty_rule": cr_rule,
@@ -1443,6 +1522,8 @@ def main() -> int:
         "skip_reasons": skip_reasons,
         "skip_reason_examples": skip_reason_examples,
         "image_loader_env": image_env,
+        "mmad_root_resolved": mmad_root_str,
+        "mmad_asset_mode": mmad_asset_mode,
     }
 
     # Log readable summary to stderr (Audit/Debug)
