@@ -1053,7 +1053,7 @@ class SFTInfer(Stage):
         ev_sft = ctx.work_dir / "ev_sft"
         mr_cfg = ctx.work_dir / "mr_config.yaml"
         
-        cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(mr_cfg).with_run_name("mr_sft").arg("--seed", "0").arg("--id_list", ctx.work_dir / "ids.txt").with_evidence_dir(ev_sft).arg("--adapter_path", seed0_adapter)
+        cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(mr_cfg).with_run_name("mr_sft").arg("--seed", "0").arg("--id_list", ctx.work_dir / "ids.txt").with_evidence_dir(ev_sft).arg("--split", ctx.dataset_split).arg("--adapter_path", seed0_adapter)
         
         eff_max = ctx.get_effective_max_samples()
         if eff_max is not None:
@@ -1203,7 +1203,7 @@ class GRPOInfer(Stage):
                  grpo_adapter = l6_out
         
         if grpo_adapter.exists():
-            cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(mr_cfg).with_run_name("mr_grpo_infer").arg("--seed", "0").arg("--id_list", ctx.work_dir / "ids.txt").with_evidence_dir(ev_grpo).arg("--adapter_path", grpo_adapter)
+            cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(mr_cfg).with_run_name("mr_grpo_infer").arg("--seed", "0").arg("--id_list", ctx.work_dir / "ids.txt").with_evidence_dir(ev_grpo).arg("--split", ctx.dataset_split).arg("--adapter_path", grpo_adapter)
             
             eff_max = ctx.get_effective_max_samples()
             if eff_max is not None:
@@ -1430,6 +1430,10 @@ class Phase1Metrics(Stage):
 class GateEvaluator:
     @staticmethod
     def evaluate(ctx: StageContext, res: StageResult):
+        def _set_gate(name: str, value: bool):
+            # Fail-sticky: once a gate is set False by any stage, evaluator must not override it to True.
+            res.gates[name] = bool(res.gates.get(name, True) and value)
+
         # Table Hashes (Task A Requirement: distinguish baseline/sft/grpo)
         first_seed = ctx.seeds[0] if ctx.seeds else 0
         
@@ -1475,19 +1479,19 @@ class GateEvaluator:
             if ctx.phase1_baseline:
                  # STRICT: Must be 0
                  if avg_rate == 0:
-                      res.gates["J6"] = True
+                      _set_gate("J6", True)
                  else:
-                      res.gates["J6"] = False
+                      _set_gate("J6", False)
                       res.errors.append(f"J6 Fail: Phase1 Baseline must have 0 tool usage, got {avg_rate}")
             else:
                 if avg_rate > 0:
-                    res.gates["J6"] = True
+                    _set_gate("J6", True)
                 else:
-                    res.gates["J6"] = True
+                    _set_gate("J6", True)
                     res.artifacts["gates_na"]["J6"] = "workload_mode_not_enforced_use_strict_j"
         else:
             # No tool rates available (e.g. no seeds or failed)
-            res.gates["J6"] = True
+            _set_gate("J6", True)
             res.artifacts["gates_na"]["J6"] = "no_data_available"
 
         # J2: Evidence Integrity / Auditability
@@ -1521,7 +1525,7 @@ class GateEvaluator:
                 # At least one seed run -> should have checks.
                 evidence_ok = False
 
-        res.gates["J2"] = evidence_ok
+        _set_gate("J2", evidence_ok)
 
         # J3: Coverage (Checked via TRACE_COUNT_MISMATCH code in verify_zip)
         coverage_ok = True
@@ -1531,16 +1535,21 @@ class GateEvaluator:
                  coverage_ok = coverage_ok and all(
                      check.get("code") != "EFFECTIVE_N_MISMATCH" for check in res.artifacts["evidence_checks"]
                  )
-        res.gates["J3"] = coverage_ok
+             if ctx.strict_j_mode:
+                 coverage_ok = coverage_ok and all(
+                     check.get("code") not in {"DATASET_SPLIT_MISMATCH", "EFFECTIVE_N_MISMATCH"}
+                     for check in res.artifacts["evidence_checks"]
+                 )
+        _set_gate("J3", coverage_ok)
 
         # J1: Flags (Checked per stage)
         # J1 Gate Pass = NO VIOLATION.
         # artifacts["allow_flags_used"] is for audit, not for gate failure if whitelisted.
-        res.gates["J1"] = not res.artifacts.get("allow_flags_violation", False)
+        _set_gate("J1", not res.artifacts.get("allow_flags_violation", False))
         
         # J9: Determinism (N/A for single run mode, unless Sentinel)
         # Explicitly marking N/A for workload mode -> True with artifacts note
-        res.gates["J9"] = True
+        _set_gate("J9", True)
         res.artifacts["gates_na"]["J9"] = "N/A in normal workload mode"
         
         return res
