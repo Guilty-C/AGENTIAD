@@ -1038,10 +1038,13 @@ def main() -> int:
             available = list(ds.keys())
             if args.split is not None:
                 offline_env = _image_loader_env_snapshot()
-                remediation = (
-                    "Requested split is missing from local dataset cache. Sync/cache the dataset to include this split "
-                    f"(e.g. run once with network: python -c \"from datasets import load_dataset; print(load_dataset('{dataset_id}').keys())\")."
-                )
+                if dataset_id == "jiang-cc/MMAD" and available == ["train"]:
+                    remediation = "This HuggingFace dataset exposes a single split: 'train'. Use --split train (or omit --split). 'test' is not available."
+                else:
+                    remediation = (
+                        "Requested split is missing from local dataset cache. Sync/cache the dataset to include this split "
+                        f"(e.g. run once with network: python -c \"from datasets import load_dataset; print(load_dataset('{dataset_id}').keys())\")."
+                    )
                 print(
                     f"Requested split '{split}' not available. available_splits={available}; "
                     f"dataset_id={dataset_id}; image_loader_env={offline_env}",

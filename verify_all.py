@@ -693,6 +693,14 @@ class ProbeIds(Stage):
                         res.artifacts["mmad_root_resolved"] = l2_asset_probe["mmad_root_resolved"]
                     if "mmad_asset_mode" in l2_asset_probe:
                         res.artifacts["mmad_asset_mode"] = l2_asset_probe["mmad_asset_mode"]
+                    probe_l2 = parse_l2_json_from_cmd(probe_res)
+                    if isinstance(probe_l2, dict):
+                        if "error" in probe_l2:
+                            res.artifacts["probe_l2_error"] = probe_l2.get("error")
+                        if "dataset_splits_available" in probe_l2:
+                            res.artifacts["probe_dataset_splits_available"] = probe_l2.get("dataset_splits_available")
+                        if "remediation" in probe_l2:
+                            res.artifacts["probe_remediation"] = probe_l2.get("remediation")
                 
                 if _require_cmd_ok(res, probe_res, "Probe", "ProbeIds"):
                     zip_path, _, _ = resolve_evidence_zip(probe_dir)
@@ -708,6 +716,7 @@ class ProbeIds(Stage):
                     ids_source = "probe"
                 else:
                     # _require_cmd_ok already set res.success=False and errors
+                    res.gates["J3"] = False
                     return
 
             if not valid_ids:
