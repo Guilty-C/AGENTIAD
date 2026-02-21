@@ -1923,6 +1923,7 @@ def run_workload(args):
         if args.output_dir is None: args.output_dir = "dist/outputs/phase1_baseline"
     if is_phase2_full:
         args.allow_full_dataset = True
+        args.max_samples = None
         if args.seeds is None or args.seeds == [42]:
             args.seeds = [0]
         if args.output_dir is None:
@@ -2054,6 +2055,8 @@ def run_workload(args):
     res.artifacts["audit_ids_total"] = 0
     res.artifacts["audit_ids_source"] = "NOT_SET"
     res.artifacts["ids_source_note"] = "NOT_SET"
+    if is_phase2_full:
+        res.artifacts["ids_source_note"] = "phase2_full_infer forces full coverage"
 
     # SENTINEL MODE
     if args.sentinel_ref:
