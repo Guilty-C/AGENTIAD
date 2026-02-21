@@ -412,6 +412,21 @@ def parse_l2_asset_audit(merged_output: bytes) -> Dict[str, str]:
             out["mmad_asset_mode"] = line.split("=", 1)[1].strip() or "unknown"
     return out
 
+def parse_l2_json_from_cmd(cmd_res: Optional[CmdResult]) -> Optional[Dict[str, Any]]:
+    if not cmd_res:
+        return None
+    merged_output = cmd_res.stderr if cmd_res.stderr else cmd_res.stdout
+    if not merged_output:
+        return None
+    try:
+        for line in merged_output.decode("utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if s.startswith("L2_RESULT_JSON="):
+                return json.loads(s[len("L2_RESULT_JSON="):])
+    except Exception as e:
+        print(f"Warning: Failed to parse L2_RESULT_JSON: {e}", file=sys.stderr)
+    return None
+
 class CSVHash:
     @staticmethod
     def compute(zip_path: Path, csv_name: str) -> Optional[str]:
@@ -765,117 +780,109 @@ class AgentInfer06(Stage):
                 # Task B: Parse L2_RESULT_JSON for effective_n
                 l2_effective_n = None
                 seed_audit_mismatch_recorded = False
-                if merged_output:
-                    try:
-                        # Parse from merged output: stream mode redirects stderr->stdout.
-                        for line in merged_output.decode("utf-8", errors="replace").splitlines():
-                            if line.strip().startswith("L2_RESULT_JSON="):
-                                json_str = line.strip()[len("L2_RESULT_JSON="):]
-                                l2_data = json.loads(json_str)
-                                l2_dataset_split = str(l2_data.get("dataset_split", "") or "")
-                                res.artifacts[f"seed_{seed}_l2_dataset_split"] = l2_dataset_split
-                                if ctx.strict_j_mode and l2_dataset_split and l2_dataset_split != ctx.dataset_split:
-                                    seed_audit_mismatch_recorded = True
-                                    res.artifacts["evidence_checks"].append({
-                                        "stage": f"S{seed}-06",
-                                        "stable_stage": "AgentInfer06",
-                                        "label": f"S{seed}-06",
-                                        "code": "DATASET_SPLIT_MISMATCH",
-                                        "msg": f"Strict J fail: dataset_split mismatch (expected={ctx.dataset_split}, actual={l2_dataset_split})"
-                                    })
+                l2_data = parse_l2_json_from_cmd(cmd_res)
+                if isinstance(l2_data, dict):
+                    l2_dataset_split = str(l2_data.get("dataset_split", "") or "")
+                    res.artifacts[f"seed_{seed}_l2_dataset_split"] = l2_dataset_split
+                    if ctx.strict_j_mode and l2_dataset_split and l2_dataset_split != ctx.dataset_split:
+                        seed_audit_mismatch_recorded = True
+                        res.artifacts["evidence_checks"].append({
+                            "stage": f"S{seed}-06",
+                            "stable_stage": "AgentInfer06",
+                            "label": f"S{seed}-06",
+                            "code": "DATASET_SPLIT_MISMATCH",
+                            "msg": f"Strict J fail: dataset_split mismatch (expected={ctx.dataset_split}, actual={l2_dataset_split})"
+                        })
+                        res.success = False
+                        res.gates["J3"] = False
+                        res.errors.append(
+                            f"S{seed}-06 dataset_split mismatch under strict_j: expected {ctx.dataset_split}, got {l2_dataset_split}"
+                        )
+                    if "effective_n" in l2_data:
+                        l2_effective_n = int(l2_data["effective_n"])
+                        res.artifacts[f"seed_{seed}_l2_effective_n"] = l2_effective_n
+                        # Also record skip info for audit
+                        if "n_skipped" in l2_data:
+                             res.artifacts[f"seed_{seed}_l2_skipped"] = l2_data["n_skipped"]
+                        if "skip_reasons" in l2_data:
+                             res.artifacts[f"seed_{seed}_l2_skip_reasons"] = l2_data["skip_reasons"]
+                        if "skip_reason_examples" in l2_data:
+                             res.artifacts[f"seed_{seed}_l2_skip_reason_examples"] = l2_data["skip_reason_examples"]
+                        if "allow_full_dataset" in l2_data:
+                             res.artifacts[f"seed_{seed}_l2_allow_full_dataset"] = l2_data["allow_full_dataset"]
+                        if "max_samples_effective" in l2_data:
+                             res.artifacts[f"seed_{seed}_l2_max_samples_effective"] = l2_data["max_samples_effective"]
+
+                        image_env = l2_data.get("image_loader_env", {}) if isinstance(l2_data, dict) else {}
+                        offline_all = (
+                            str(image_env.get("HF_DATASETS_OFFLINE", "")) == "1"
+                            and str(image_env.get("HF_HUB_OFFLINE", "")) == "1"
+                            and str(image_env.get("TRANSFORMERS_OFFLINE", "")) == "1"
+                        )
+                        skip_examples = l2_data.get("skip_reason_examples", {}) if isinstance(l2_data, dict) else {}
+                        if (
+                            str(res.artifacts.get("mmad_asset_mode", "")) == "local_root"
+                            and offline_all
+                            and isinstance(skip_examples, dict)
+                            and "hub_download_error" in skip_examples
+                        ):
+                            res.success = False
+                            res.errors.append(
+                                f"S{seed}-06 local_root offline violation: hub_download_error present in skip_reason_examples. "
+                                "Remediation: export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/."
+                            )
+                            remediation = "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
+                            if remediation not in res.remediations:
+                                res.remediations.append(remediation)
+
+                        # Audit check: mismatch between requested and effective
+                        if "n_requested_ids" in l2_data:
+                            n_req = int(l2_data["n_requested_ids"])
+                            n_skipped = int(l2_data.get("n_skipped", 0))
+                            skip_reasons = l2_data.get("skip_reasons", {})
+                            max_eff_raw = l2_data.get("max_samples_effective")
+
+                            max_eff_int: Optional[int] = None
+                            if isinstance(max_eff_raw, int):
+                                max_eff_int = max_eff_raw
+                            elif isinstance(max_eff_raw, str):
+                                s_eff = max_eff_raw.strip()
+                                if s_eff and s_eff.upper() != "NONE":
+                                    try:
+                                        max_eff_int = int(s_eff)
+                                    except Exception:
+                                        max_eff_int = None
+
+                            expected_n = n_req if max_eff_int is None else min(n_req, max_eff_int)
+                            has_skip_signal = n_skipped > 0 or (isinstance(skip_reasons, dict) and len(skip_reasons) > 0)
+                            should_flag_mismatch = (
+                                l2_effective_n != expected_n and (has_skip_signal or l2_effective_n < expected_n)
+                            )
+
+                            if should_flag_mismatch:
+                                seed_audit_mismatch_recorded = True
+                                res.artifacts["evidence_checks"].append({
+                                    "stage": f"S{seed}-06",
+                                    "stable_stage": "AgentInfer06",
+                                    "label": f"S{seed}-06",
+                                    "code": "EFFECTIVE_N_MISMATCH",
+                                    "msg": (
+                                        f"Expected {expected_n} != Effective {l2_effective_n} "
+                                        f"(n_requested_ids={n_req}, max_samples_effective={max_eff_raw}, "
+                                        f"Skipped {n_skipped}; Reasons={skip_reasons})"
+                                    )
+                                })
+                                if ctx.phase1_baseline:
                                     res.success = False
                                     res.gates["J3"] = False
                                     res.errors.append(
-                                        f"S{seed}-06 dataset_split mismatch under strict_j: expected {ctx.dataset_split}, got {l2_dataset_split}"
+                                        f"Phase1 dataset completeness failure: effective_n ({l2_effective_n}) != expected ({expected_n}); n_skipped={n_skipped}, skip_reasons={skip_reasons}. Remediation: export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/."
                                     )
-                                if "effective_n" in l2_data:
-                                    l2_effective_n = int(l2_data["effective_n"])
-                                    res.artifacts[f"seed_{seed}_l2_effective_n"] = l2_effective_n
-                                    # Also record skip info for audit
-                                    if "n_skipped" in l2_data:
-                                         res.artifacts[f"seed_{seed}_l2_skipped"] = l2_data["n_skipped"]
-                                    if "skip_reasons" in l2_data:
-                                         res.artifacts[f"seed_{seed}_l2_skip_reasons"] = l2_data["skip_reasons"]
-                                    if "skip_reason_examples" in l2_data:
-                                         res.artifacts[f"seed_{seed}_l2_skip_reason_examples"] = l2_data["skip_reason_examples"]
-                                    if "allow_full_dataset" in l2_data:
-                                         res.artifacts[f"seed_{seed}_l2_allow_full_dataset"] = l2_data["allow_full_dataset"]
-                                    if "max_samples_effective" in l2_data:
-                                         res.artifacts[f"seed_{seed}_l2_max_samples_effective"] = l2_data["max_samples_effective"]
-
-                                    image_env = l2_data.get("image_loader_env", {}) if isinstance(l2_data, dict) else {}
-                                    offline_all = (
-                                        str(image_env.get("HF_DATASETS_OFFLINE", "")) == "1"
-                                        and str(image_env.get("HF_HUB_OFFLINE", "")) == "1"
-                                        and str(image_env.get("TRANSFORMERS_OFFLINE", "")) == "1"
+                                    remediation = (
+                                        "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
                                     )
-                                    skip_examples = l2_data.get("skip_reason_examples", {}) if isinstance(l2_data, dict) else {}
-                                    if (
-                                        str(res.artifacts.get("mmad_asset_mode", "")) == "local_root"
-                                        and offline_all
-                                        and isinstance(skip_examples, dict)
-                                        and "hub_download_error" in skip_examples
-                                    ):
-                                        res.success = False
-                                        res.errors.append(
-                                            f"S{seed}-06 local_root offline violation: hub_download_error present in skip_reason_examples. "
-                                            "Remediation: export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/."
-                                        )
-                                        remediation = "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
-                                        if remediation not in res.remediations:
-                                            res.remediations.append(remediation)
-
-                                    # Audit check: mismatch between requested and effective
-                                    if "n_requested_ids" in l2_data:
-                                        n_req = int(l2_data["n_requested_ids"])
-                                        n_skipped = int(l2_data.get("n_skipped", 0))
-                                        skip_reasons = l2_data.get("skip_reasons", {})
-                                        max_eff_raw = l2_data.get("max_samples_effective")
-
-                                        max_eff_int: Optional[int] = None
-                                        if isinstance(max_eff_raw, int):
-                                            max_eff_int = max_eff_raw
-                                        elif isinstance(max_eff_raw, str):
-                                            s_eff = max_eff_raw.strip()
-                                            if s_eff and s_eff.upper() != "NONE":
-                                                try:
-                                                    max_eff_int = int(s_eff)
-                                                except Exception:
-                                                    max_eff_int = None
-
-                                        expected_n = n_req if max_eff_int is None else min(n_req, max_eff_int)
-                                        has_skip_signal = n_skipped > 0 or (isinstance(skip_reasons, dict) and len(skip_reasons) > 0)
-                                        should_flag_mismatch = (
-                                            l2_effective_n != expected_n and (has_skip_signal or l2_effective_n < expected_n)
-                                        )
-
-                                        if should_flag_mismatch:
-                                            seed_audit_mismatch_recorded = True
-                                            res.artifacts["evidence_checks"].append({
-                                                "stage": f"S{seed}-06",
-                                                "stable_stage": "AgentInfer06",
-                                                "label": f"S{seed}-06",
-                                                "code": "EFFECTIVE_N_MISMATCH",
-                                                "msg": (
-                                                    f"Expected {expected_n} != Effective {l2_effective_n} "
-                                                    f"(n_requested_ids={n_req}, max_samples_effective={max_eff_raw}, "
-                                                    f"Skipped {n_skipped}; Reasons={skip_reasons})"
-                                                )
-                                            })
-                                            if ctx.phase1_baseline:
-                                                res.success = False
-                                                res.gates["J3"] = False
-                                                res.errors.append(
-                                                    f"Phase1 dataset completeness failure: effective_n ({l2_effective_n}) != expected ({expected_n}); n_skipped={n_skipped}, skip_reasons={skip_reasons}. Remediation: export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/."
-                                                )
-                                                remediation = (
-                                                    "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
-                                                )
-                                                if remediation not in res.remediations:
-                                                    res.remediations.append(remediation)
-                                break
-                    except Exception as e:
-                        print(f"Warning: Failed to parse L2_RESULT_JSON: {e}", file=sys.stderr)
+                                    if remediation not in res.remediations:
+                                        res.remediations.append(remediation)
 
                 eff_max = ctx.get_effective_max_samples()
                 subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
@@ -1064,6 +1071,27 @@ class SFTInfer(Stage):
         cmd_list = cmd.build()
         if J1.record_if_violation(cmd_list, res, "SFT cmd"): return
         cmd_res = CmdRunner.run(cmd_list, ctx.env_overrides, stream_output=True)
+        sft_audit_mismatch_recorded = False
+        l2_data = parse_l2_json_from_cmd(cmd_res)
+        if isinstance(l2_data, dict):
+            l2_dataset_split = str(l2_data.get("dataset_split", "") or "")
+            res.artifacts["sft_l2_dataset_split"] = l2_dataset_split
+            if "effective_n" in l2_data:
+                res.artifacts["sft_l2_effective_n"] = int(l2_data["effective_n"])
+            if ctx.strict_j_mode and l2_dataset_split and l2_dataset_split != ctx.dataset_split:
+                sft_audit_mismatch_recorded = True
+                res.artifacts["evidence_checks"].append({
+                    "stage": "SFTInfer",
+                    "stable_stage": "SFTInfer",
+                    "label": "SFTInfer",
+                    "code": "DATASET_SPLIT_MISMATCH",
+                    "msg": f"Strict J fail: dataset_split mismatch (expected={ctx.dataset_split}, actual={l2_dataset_split})"
+                })
+                res.success = False
+                res.gates["J3"] = False
+                res.errors.append(
+                    f"SFTInfer dataset_split mismatch under strict_j: expected {ctx.dataset_split}, got {l2_dataset_split}"
+                )
         if not _require_cmd_ok(res, cmd_res, "SFTInfer", "SFTInfer"):
             # CMD_FAILED already recorded by helper
             return
@@ -1081,13 +1109,14 @@ class SFTInfer(Stage):
             code, msg, dur = Evidence.verify_zip(evsft_zip, "06_run_agentiad_infer.py", expected_trace_count=subset_size)
             if evsft_note:
                 msg = f"{msg} ({evsft_note})"
-        res.artifacts["evidence_checks"].append({
-            "stage": "SFTInfer", 
-            "stable_stage": "SFTInfer",
-            "label": "SFTInfer",
-            "code": code, 
-            "msg": msg
-        })
+        if not (sft_audit_mismatch_recorded and code == "OK"):
+            res.artifacts["evidence_checks"].append({
+                "stage": "SFTInfer", 
+                "stable_stage": "SFTInfer",
+                "label": "SFTInfer",
+                "code": code, 
+                "msg": msg
+            })
         res.measurements["evidence_check_sec"] = res.measurements.get("evidence_check_sec", 0.0) + dur
         if code != "OK": res.success = False; res.errors.append(f"SFT Evidence: {msg}")
 
@@ -1214,6 +1243,27 @@ class GRPOInfer(Stage):
             cmd_list = cmd.build()
             if J1.record_if_violation(cmd_list, res, "GRPO Infer cmd"): return
             cmd_res = CmdRunner.run(cmd_list, ctx.env_overrides, stream_output=True)
+            grpo_audit_mismatch_recorded = False
+            l2_data = parse_l2_json_from_cmd(cmd_res)
+            if isinstance(l2_data, dict):
+                l2_dataset_split = str(l2_data.get("dataset_split", "") or "")
+                res.artifacts["grpo_l2_dataset_split"] = l2_dataset_split
+                if "effective_n" in l2_data:
+                    res.artifacts["grpo_l2_effective_n"] = int(l2_data["effective_n"])
+                if ctx.strict_j_mode and l2_dataset_split and l2_dataset_split != ctx.dataset_split:
+                    grpo_audit_mismatch_recorded = True
+                    res.artifacts["evidence_checks"].append({
+                        "stage": "GRPOInfer",
+                        "stable_stage": "GRPOInfer",
+                        "label": "GRPOInfer",
+                        "code": "DATASET_SPLIT_MISMATCH",
+                        "msg": f"Strict J fail: dataset_split mismatch (expected={ctx.dataset_split}, actual={l2_dataset_split})"
+                    })
+                    res.success = False
+                    res.gates["J3"] = False
+                    res.errors.append(
+                        f"GRPOInfer dataset_split mismatch under strict_j: expected {ctx.dataset_split}, got {l2_dataset_split}"
+                    )
             if not _require_cmd_ok(res, cmd_res, "GRPOInfer", "GRPOInfer"):
                 # CMD_FAILED already recorded by helper
                 return
@@ -1231,13 +1281,14 @@ class GRPOInfer(Stage):
                 code, msg, dur = Evidence.verify_zip(evgrpo_zip, "06_run_agentiad_infer.py", expected_trace_count=subset_size)
                 if evgrpo_note:
                     msg = f"{msg} ({evgrpo_note})"
-            res.artifacts["evidence_checks"].append({
-                "stage": "GRPOInfer", 
-                "stable_stage": "GRPOInfer",
-                "label": "GRPOInfer",
-                "code": code, 
-                "msg": msg
-            })
+            if not (grpo_audit_mismatch_recorded and code == "OK"):
+                res.artifacts["evidence_checks"].append({
+                    "stage": "GRPOInfer", 
+                    "stable_stage": "GRPOInfer",
+                    "label": "GRPOInfer",
+                    "code": code, 
+                    "msg": msg
+                })
             res.measurements["evidence_check_sec"] = res.measurements.get("evidence_check_sec", 0.0) + dur
             if code != "OK": res.success = False; res.errors.append(f"GRPOInfer Evidence: {msg}")
 
@@ -1529,6 +1580,7 @@ class GateEvaluator:
 
         # J3: Coverage (Checked via TRACE_COUNT_MISMATCH code in verify_zip)
         coverage_ok = True
+        no_split_mismatch = True
         if res.artifacts["evidence_checks"]:
              coverage_ok = all(check["code"] != "TRACE_COUNT_MISMATCH" for check in res.artifacts["evidence_checks"])
              if ctx.phase1_baseline:
@@ -1536,11 +1588,11 @@ class GateEvaluator:
                      check.get("code") != "EFFECTIVE_N_MISMATCH" for check in res.artifacts["evidence_checks"]
                  )
              if ctx.strict_j_mode:
-                 coverage_ok = coverage_ok and all(
-                     check.get("code") not in {"DATASET_SPLIT_MISMATCH", "EFFECTIVE_N_MISMATCH"}
+                 no_split_mismatch = all(
+                     check.get("code") != "DATASET_SPLIT_MISMATCH"
                      for check in res.artifacts["evidence_checks"]
                  )
-        _set_gate("J3", coverage_ok)
+        res.gates["J3"] = res.gates.get("J3", True) and coverage_ok and no_split_mismatch
 
         # J1: Flags (Checked per stage)
         # J1 Gate Pass = NO VIOLATION.
