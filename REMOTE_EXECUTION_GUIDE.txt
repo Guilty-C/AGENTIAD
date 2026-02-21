@@ -93,3 +93,10 @@ Follow this workflow to run code remotely without altering the server environmen
    - `jiang-cc/MMAD` exposes only one split: `train`.
    - In `strict_j` mode, requesting an unavailable split is a hard failure (`06_run_agentiad_infer.py` exits with RC=2).
    - For MMAD runs, use `--dataset-split train` (or omit split where defaults already target train).
+
+## Phase1 Baseline & Acceptance-Only
+   - `phase1_baseline`: full inference-only run (no SFT/GRPO training); for MMAD use `--dataset-split train`.
+   - `phase1_acceptance_only`: does not rerun `06`; it recomputes `ACCEPTANCE_JSON` from an existing `--output-dir`.
+   - `dataset_binding_hash` in acceptance is resolved as `manifest_hash` first, then `ids_sha256`.
+   - Heavy remote baseline command: `CUDA_VISIBLE_DEVICES=0 python3 verify_all.py --mode phase1_baseline --dataset-split train --output-dir dist/outputs/phase1_baseline`
+   - Lightweight acceptance recheck command: `python3 verify_all.py --mode phase1_acceptance_only --output-dir dist/outputs/phase1_baseline`
