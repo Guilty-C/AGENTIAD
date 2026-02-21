@@ -516,9 +516,14 @@ def build_phase1_acceptance_payload(work_dir: Path, seeds: List[int], payload: D
     evidence_paths: List[str] = []
     n_total = 0
 
-    manifest_hash = (payload.get("artifacts") or {}).get("manifest_hash")
-    if not manifest_hash:
-        errors.append("manifest_hash unavailable")
+    artifacts = payload.get("artifacts") or {}
+    dataset_binding_hash = artifacts.get("manifest_hash") or artifacts.get("ids_sha256")
+    dataset_binding_hash_source = (
+        "manifest_hash" if artifacts.get("manifest_hash")
+        else ("ids_sha256" if artifacts.get("ids_sha256") else "")
+    )
+    if not dataset_binding_hash:
+        errors.append("dataset_binding_hash unavailable (manifest_hash/ids_sha256 both missing)")
 
     for seed in seeds:
         s_dir = work_dir / f"seed_{seed}"
@@ -565,6 +570,8 @@ def build_phase1_acceptance_payload(work_dir: Path, seeds: List[int], payload: D
         "success": success,
         "errors": errors,
         "seeds": seeds,
+        "dataset_binding_hash": dataset_binding_hash,
+        "dataset_binding_hash_source": dataset_binding_hash_source,
         "per_seed_metrics_path": per_seed_metrics_path,
         "summary_path": str(summary_path),
         "n_total": n_total,
@@ -1812,12 +1819,50 @@ def verify_evidence_zip_optimized(zip_path, script_name, expected_trace_count=No
 def run_workload(args):
     # Phase 1 Baseline Logic
     is_phase1 = args.mode == "phase1_baseline"
+    is_phase1_acceptance_only = args.mode == "phase1_acceptance_only"
     if is_phase1:
         args.allow_full_dataset = True
         args.seeds = [0, 1, 2]
         if args.output_dir is None: args.output_dir = "dist/outputs/phase1_baseline"
+    if is_phase1_acceptance_only:
+        args.seeds = [0, 1, 2]
+        if args.output_dir is None: args.output_dir = "dist/outputs/phase1_baseline"
     
     work_dir = Path(args.output_dir).resolve()
+
+    if is_phase1_acceptance_only:
+        payload = {
+            "success": True,
+            "gates": {},
+            "artifacts": {
+                "allow_flags_used": False,
+                "allow_flags_violation": False,
+                "evidence_checks": [],
+                "gates_na": {},
+            },
+            "errors": [],
+            "measurements": {"evidence_check_sec": 0.0},
+            "remediations": [],
+        }
+        ids_path = work_dir / "ids.txt"
+        if ids_path.exists() and ids_path.stat().st_size > 0:
+            ids_lines = [x.strip() for x in ids_path.read_text(encoding="utf-8").splitlines() if x.strip()]
+            if ids_lines:
+                payload["artifacts"]["ids_sha256"] = hashlib.sha256("\n".join(ids_lines).encode()).hexdigest()
+                payload["artifacts"]["audit_ids_total"] = len(ids_lines)
+                payload["artifacts"]["audit_ids_source"] = "ids.txt"
+            else:
+                payload["errors"].append("ids.txt is empty under output_dir; ids_sha256 unavailable")
+        else:
+            payload["errors"].append("ids.txt missing under output_dir; ids_sha256 unavailable")
+        acceptance = build_phase1_acceptance_payload(work_dir, args.seeds, payload)
+        payload["acceptance_a"] = acceptance
+        if not acceptance.get("success", False):
+            payload["success"] = False
+            for err in acceptance.get("errors", []):
+                if err not in payload["errors"]:
+                    payload["errors"].append(err)
+        return payload
     
     # 0. Early Returns for strict_j FAIL-A / FAIL-B semantics (Stable J9)
     if args.allow_flags:
@@ -1984,6 +2029,11 @@ def run_workload(args):
     payload["artifacts"].setdefault("mmad_asset_mode", "unknown")
     if ctx.phase1_baseline:
         payload["acceptance_a"] = build_phase1_acceptance_payload(ctx.work_dir, ctx.seeds, payload)
+        if not payload["acceptance_a"].get("success", False):
+            payload["success"] = False
+            for err in payload["acceptance_a"].get("errors", []):
+                if err not in payload["errors"]:
+                    payload["errors"].append(err)
         payload["artifacts"]["phase1_baseline_spec"] = {
             "seed_policy_fixed": [0, 1, 2],
             "scope": "full_mmad_baseline_no_sft_no_grpo_training",
@@ -2011,7 +2061,9 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    if args.output_dir is None:
+    if args.output_dir is None and args.mode in {"phase1_baseline", "phase1_acceptance_only"}:
+        args.output_dir = "dist/outputs/phase1_baseline"
+    elif args.output_dir is None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         args.output_dir = f"outputs/workload_{timestamp}"
 
@@ -2035,11 +2087,13 @@ def main():
         }
     
     print("WORKLOAD_RESULT=" + json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    if args.mode == "phase1_baseline":
+    if args.mode in {"phase1_baseline", "phase1_acceptance_only"}:
         acceptance = payload.get("acceptance_a", {
             "success": False,
             "errors": ["acceptance payload missing"],
             "seeds": [0, 1, 2],
+            "dataset_binding_hash": "",
+            "dataset_binding_hash_source": "",
             "per_seed_metrics_path": [],
             "summary_path": "",
             "n_total": 0,
