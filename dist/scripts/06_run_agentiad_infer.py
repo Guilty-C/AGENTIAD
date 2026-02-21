@@ -1035,7 +1035,37 @@ def main() -> int:
         else:
             ds = load_dataset(dataset_id)
         if split not in ds:
-            split = "test" if "test" in ds else list(ds.keys())[0]
+            available = list(ds.keys())
+            if args.split is not None:
+                offline_env = _image_loader_env_snapshot()
+                remediation = (
+                    "Requested split is missing from local dataset cache. Sync/cache the dataset to include this split "
+                    f"(e.g. run once with network: python -c \"from datasets import load_dataset; print(load_dataset('{dataset_id}').keys())\")."
+                )
+                print(
+                    f"Requested split '{split}' not available. available_splits={available}; "
+                    f"dataset_id={dataset_id}; image_loader_env={offline_env}",
+                    file=sys.stderr,
+                )
+                print(f"REMEDIATION={remediation}", file=sys.stderr)
+                print(
+                    "L2_RESULT_JSON="
+                    + json.dumps(
+                        {
+                            "run_name": run_name,
+                            "dataset_split_requested": split,
+                            "dataset_splits_available": available,
+                            "image_loader_env": offline_env,
+                            "error": "requested_split_not_available",
+                            "remediation": remediation,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                return 2
+            split = "test" if "test" in ds else available[0]
         d0: Any = ds[split]
 
         if mmad_asset_mode == "local_root" and mmad_root is not None:
