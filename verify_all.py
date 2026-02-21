@@ -48,6 +48,7 @@ class StageContext:
     no_adapter: bool
     allow_full_dataset: bool = False
     phase1_baseline: bool = False
+    phase2_full_infer: bool = False
     strict_j_mode: bool = False
     dataset_split: str = "test"
     env_overrides: Dict[str, str] = field(default_factory=dict)
@@ -579,6 +580,45 @@ def build_phase1_acceptance_payload(work_dir: Path, seeds: List[int], payload: D
         "audit_note": "Phase1 baseline excludes SFT/GRPO training stages; acceptance uses baseline inference outputs only.",
     }
 
+def build_phase2_full_infer_acceptance_payload(work_dir: Path, seeds: List[int], payload: Dict[str, Any]) -> Dict[str, Any]:
+    errors: List[str] = []
+    evidence_paths: List[str] = []
+    gates = payload.get("gates", {}) or {}
+    measurements = payload.get("measurements", {}) or {}
+
+    for seed in seeds:
+        s_dir = work_dir / f"seed_{seed}"
+        ev_zip, _, found = resolve_evidence_zip(s_dir / "ev_06")
+        if ev_zip is None or not ev_zip.exists():
+            evidence_paths.append("")
+            errors.append(
+                f"seed {seed}: missing evidence zip (expected evidence_package.zip in {s_dir / 'ev_06'}; found {found})"
+            )
+        else:
+            evidence_paths.append(str(ev_zip))
+
+    if not bool(gates.get("J2", False)):
+        errors.append("J2 must pass in phase2_full_infer")
+    if not bool(gates.get("J3", False)):
+        errors.append("J3 must pass in phase2_full_infer")
+    tool_avg = float(measurements.get("toolcall_rate_avg", 0.0) or 0.0)
+    if tool_avg <= 0:
+        errors.append(f"J6/toolcall_rate_avg must be > 0 in phase2_full_infer, got {tool_avg}")
+
+    success = (
+        len(errors) == 0
+        and bool(payload.get("success", False))
+    )
+
+    return {
+        "success": success,
+        "errors": errors,
+        "seeds": seeds,
+        "evidence_paths": evidence_paths,
+        "toolcall_rate_avg": tool_avg,
+        "audit_note": "Phase2 full infer acceptance requires infer-only evidence completeness and non-zero tool usage.",
+    }
+
 # --- Stages ---
 
 def _expected_count_from_ids(ids_path: Path, eff_max: Optional[int]) -> Optional[int]:
@@ -642,7 +682,7 @@ class PreflightDeps(Stage):
 
 class ProbeIds(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
-        if ctx.phase1_baseline:
+        if ctx.phase1_baseline or ctx.phase2_full_infer:
             with Timer("Phase1 Dataset Binding"):
                 try:
                     valid_ids, used_split = _generate_ids_from_dataset(ctx.dataset_split)
@@ -657,11 +697,13 @@ class ProbeIds(Stage):
                     res.artifacts["phase1_full_mode"] = True
                     res.artifacts["audit_ids_total"] = len(valid_ids)
                     res.artifacts["audit_ids_source"] = "generated_dataset"
-                    res.artifacts["ids_source_note"] = f"phase1_baseline uses generated full dataset ids (split={used_split})"
+                    mode_name = "phase2_full_infer" if ctx.phase2_full_infer else "phase1_baseline"
+                    res.artifacts["ids_source_note"] = f"{mode_name} uses generated full dataset ids (split={used_split})"
                     return
                 except Exception as e:
                     res.success = False
-                    res.errors.append(f"Phase1 Dataset Load Failed: {e}")
+                    mode_name = "Phase2" if ctx.phase2_full_infer else "Phase1"
+                    res.errors.append(f"{mode_name} Dataset Load Failed: {e}")
                     return
 
         with Timer("Data Binding"):
@@ -1591,6 +1633,12 @@ class GateEvaluator:
                  else:
                       _set_gate("J6", False)
                       res.errors.append(f"J6 Fail: Phase1 Baseline must have 0 tool usage, got {avg_rate}")
+            elif ctx.phase2_full_infer:
+                if avg_rate > 0:
+                    _set_gate("J6", True)
+                else:
+                    _set_gate("J6", False)
+                    res.errors.append(f"J6 Fail: phase2_full_infer requires toolcall_rate_avg > 0, got {avg_rate}")
             else:
                 if avg_rate > 0:
                     _set_gate("J6", True)
@@ -1599,8 +1647,12 @@ class GateEvaluator:
                     res.artifacts["gates_na"]["J6"] = "workload_mode_not_enforced_use_strict_j"
         else:
             # No tool rates available (e.g. no seeds or failed)
-            _set_gate("J6", True)
-            res.artifacts["gates_na"]["J6"] = "no_data_available"
+            if ctx.phase2_full_infer:
+                _set_gate("J6", False)
+                res.errors.append("J6 Fail: phase2_full_infer has no tool rate data")
+            else:
+                _set_gate("J6", True)
+                res.artifacts["gates_na"]["J6"] = "no_data_available"
 
         # J2: Evidence Integrity / Auditability
         # Only integrity-breaking codes should fail J2. Audit notes (e.g. EFFECTIVE_N_MISMATCH)
@@ -1861,6 +1913,7 @@ def run_workload(args):
     # Phase 1 Baseline Logic
     is_phase1 = args.mode == "phase1_baseline"
     is_phase1_acceptance_only = args.mode == "phase1_acceptance_only"
+    is_phase2_full = args.mode == "phase2_full_infer"
     if is_phase1:
         args.allow_full_dataset = True
         args.seeds = [0, 1, 2]
@@ -1868,6 +1921,34 @@ def run_workload(args):
     if is_phase1_acceptance_only:
         args.seeds = [0, 1, 2]
         if args.output_dir is None: args.output_dir = "dist/outputs/phase1_baseline"
+    if is_phase2_full:
+        args.allow_full_dataset = True
+        if args.seeds is None or args.seeds == [42]:
+            args.seeds = [0]
+        if args.output_dir is None:
+            args.output_dir = "dist/outputs/phase2_full_infer"
+        if str(args.dataset_split).strip().lower() != "train":
+            return {
+                "success": False,
+                "gates": {"J2": False, "J3": False},
+                "artifacts": {
+                    "allow_flags_used": False,
+                    "allow_flags_violation": False,
+                    "evidence_checks": [{
+                        "stage": "DataBinding",
+                        "stable_stage": "DataBinding",
+                        "label": "DataBinding",
+                        "code": "DATASET_SPLIT_INVALID",
+                        "msg": "phase2_full_infer requires MMAD single split: train",
+                    }],
+                    "gates_na": {},
+                    "audit_dataset_split": str(args.dataset_split),
+                    "ids_source_note": "phase2_full_infer rejected non-train dataset_split",
+                },
+                "errors": [f"phase2_full_infer invalid --dataset-split={args.dataset_split}; MMAD supports single split 'train'"],
+                "measurements": {"evidence_check_sec": 0.0},
+                "remediations": ["Use --dataset-split train for MMAD single-split dataset."],
+            }
     
     work_dir = Path(args.output_dir).resolve()
 
@@ -1960,6 +2041,7 @@ def run_workload(args):
         no_adapter=args.no_adapter,
         allow_full_dataset=args.allow_full_dataset,
         phase1_baseline=is_phase1,
+        phase2_full_infer=is_phase2_full,
         strict_j_mode=(args.mode == "strict_j"),
         dataset_split=args.dataset_split,
         env_overrides=env_overrides
@@ -2020,18 +2102,25 @@ def run_workload(args):
     res.artifacts["execution_path"] = str(current_exec)
 
     # Pipeline Definition
-    pipeline = [
-        PreflightDeps(),
-        ProbeIds(),
-        AgentInfer06(),
-        BuildTraj08(),
-        SFTTrain09(),
-        SFTInfer(),
-        GRPOBuild(),
-        GRPOTrain(),
-        GRPOInfer(),
-        Phase1Metrics()
-    ]
+    if is_phase2_full:
+        pipeline = [
+            PreflightDeps(),
+            ProbeIds(),
+            AgentInfer06(),
+        ]
+    else:
+        pipeline = [
+            PreflightDeps(),
+            ProbeIds(),
+            AgentInfer06(),
+            BuildTraj08(),
+            SFTTrain09(),
+            SFTInfer(),
+            GRPOBuild(),
+            GRPOTrain(),
+            GRPOInfer(),
+            Phase1Metrics()
+        ]
     
     # Run Pipeline
     for stage in pipeline:
@@ -2080,6 +2169,17 @@ def run_workload(args):
             "seed_policy_fixed": [0, 1, 2],
             "scope": "full_mmad_baseline_no_sft_no_grpo_training",
         }
+    if ctx.phase2_full_infer:
+        payload["acceptance_b"] = build_phase2_full_infer_acceptance_payload(ctx.work_dir, ctx.seeds, payload)
+        if not payload["acceptance_b"].get("success", False):
+            payload["success"] = False
+            for err in payload["acceptance_b"].get("errors", []):
+                if err not in payload["errors"]:
+                    payload["errors"].append(err)
+        payload["artifacts"]["phase2_full_infer_spec"] = {
+            "scope": "infer_only_no_sft_no_grpo_training",
+            "stages": ["PreflightDeps", "ProbeIds", "AgentInfer06"],
+        }
     return payload
 
 def build_arg_parser():
@@ -2105,6 +2205,8 @@ def main():
 
     if args.output_dir is None and args.mode in {"phase1_baseline", "phase1_acceptance_only"}:
         args.output_dir = "dist/outputs/phase1_baseline"
+    elif args.output_dir is None and args.mode == "phase2_full_infer":
+        args.output_dir = "dist/outputs/phase2_full_infer"
     elif args.output_dir is None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         args.output_dir = f"outputs/workload_{timestamp}"
@@ -2129,7 +2231,7 @@ def main():
         }
     
     print("WORKLOAD_RESULT=" + json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    if args.mode in {"phase1_baseline", "phase1_acceptance_only"}:
+    if args.mode in {"phase1_baseline", "phase1_acceptance_only", "phase2_full_infer"}:
         acceptance = payload.get("acceptance_a", {
             "success": False,
             "errors": ["acceptance payload missing"],
@@ -2141,6 +2243,14 @@ def main():
             "n_total": 0,
             "evidence_paths": [],
         })
+        if args.mode == "phase2_full_infer":
+            acceptance = payload.get("acceptance_b", {
+                "success": False,
+                "errors": ["acceptance payload missing"],
+                "seeds": payload.get("seeds", []),
+                "evidence_paths": [],
+                "toolcall_rate_avg": 0.0,
+            })
         print("ACCEPTANCE_JSON=" + json.dumps(acceptance, ensure_ascii=False, sort_keys=True))
     
     sys.exit(0 if payload.get("success", False) else 1)
