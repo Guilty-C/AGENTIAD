@@ -88,3 +88,8 @@ Follow this workflow to run code remotely without altering the server environmen
    - NO pip install --user (use virtualenv if needed, but prefer system python if dependencies match).
    - NO artifacts left in home directory (except the transient zip and ~/data/mmad cache).
    - ALWAYS run in /tmp to ensure isolation.
+
+## Dataset Split Constraints
+   - `jiang-cc/MMAD` exposes only one split: `train`.
+   - In `strict_j` mode, requesting an unavailable split is a hard failure (`06_run_agentiad_infer.py` exits with RC=2).
+   - For MMAD runs, use `--dataset-split train` (or omit split where defaults already target train).
