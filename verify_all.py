@@ -602,6 +602,25 @@ def _expected_count_from_ids(ids_path: Path, eff_max: Optional[int]) -> Optional
     except:
         return None
 
+def _generate_ids_from_dataset(requested_split: str) -> tuple[List[str], str]:
+    from datasets import load_dataset
+    ds = load_dataset("jiang-cc/MMAD")
+    split = requested_split
+    if split not in ds:
+        if "test" in ds:
+            split = "test"
+        else:
+            split = list(ds.keys())[0]
+    d0 = ds[split]
+    valid_ids: List[str] = []
+    for i in range(len(d0)):
+        row = d0[i]
+        sid = row.get("sample_id") or row.get("id")
+        if not sid:
+            sid = f"{split}_{i}"
+        valid_ids.append(str(sid).strip())
+    return valid_ids, split
+
 class Stage:
     def execute(self, ctx: StageContext, res: StageResult): raise NotImplementedError
 
@@ -626,24 +645,7 @@ class ProbeIds(Stage):
         if ctx.phase1_baseline:
             with Timer("Phase1 Dataset Binding"):
                 try:
-                    from datasets import load_dataset
-                    ds = load_dataset("jiang-cc/MMAD")
-                    split = ctx.dataset_split
-                    if split not in ds:
-                        # Fallback logic
-                        if "test" in ds: split = "test"
-                        else: split = list(ds.keys())[0]
-                    
-                    d0 = ds[split]
-                    valid_ids = []
-                    # Use index based access to avoid loading all at once if possible, though len(d0) implies iteration
-                    for i in range(len(d0)):
-                        row = d0[i]
-                        # Replicate _sample_id logic from script
-                        sid = row.get("sample_id") or row.get("id")
-                        if not sid:
-                             sid = f"{split}_{i}"
-                        valid_ids.append(str(sid).strip())
+                    valid_ids, used_split = _generate_ids_from_dataset(ctx.dataset_split)
                     
                     if not valid_ids:
                         res.success = False
@@ -655,6 +657,7 @@ class ProbeIds(Stage):
                     res.artifacts["phase1_full_mode"] = True
                     res.artifacts["audit_ids_total"] = len(valid_ids)
                     res.artifacts["audit_ids_source"] = "generated_dataset"
+                    res.artifacts["ids_source_note"] = f"phase1_baseline uses generated full dataset ids (split={used_split})"
                     return
                 except Exception as e:
                     res.success = False
@@ -683,48 +686,85 @@ class ProbeIds(Stage):
             if (ctx.work_dir / "ids.txt").exists() and (ctx.work_dir / "ids.txt").stat().st_size > 0:
                  valid_ids = [x.strip() for x in (ctx.work_dir / "ids.txt").read_text(encoding="utf-8").splitlines() if x.strip()]
             ids_source = "ids.txt" if valid_ids else ""
+            ids_source_note = "reused existing ids.txt from output_dir" if valid_ids else ""
+            eff_max = ctx.get_effective_max_samples()
+            if ctx.strict_j_mode and ctx.allow_full_dataset:
+                # strict_j full run must use full dataset ids source, not a potentially truncated ids.txt.
+                valid_ids = []
+                ids_source = ""
+                ids_source_note = "strict_j + allow_full_dataset: force generated full dataset ids source"
+            elif ctx.strict_j_mode and eff_max is not None and eff_max > 32 and len(valid_ids) < eff_max:
+                valid_ids = []
+                ids_source = ""
+                ids_source_note = f"strict_j + max_samples={eff_max}>32: existing ids.txt insufficient, switching ids source"
             
             if not valid_ids:
-                probe_dir = ctx.work_dir / "probe"
-                probe_dir.mkdir(parents=True, exist_ok=True)
-                probe_cfg = ctx.work_dir / "probe_config.yaml"
-                probe_cfg.write_text("model_id: distilgpt2\nrun_name: probe\n", encoding="utf-8")
-                
-                cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(probe_cfg).with_run_name("probe").arg("--seed", "42").arg("--max_samples", "32").arg("--evidence_dir", probe_dir).arg("--split", ctx.dataset_split).build()
-                if J1.record_if_violation(cmd, res, "probe cmd"): return
-                probe_res = CmdRunner.run(cmd, ctx.env_overrides, stream_output=True)
-                if probe_res:
-                    merged_probe = probe_res.stderr if probe_res.stderr else probe_res.stdout
-                    l2_asset_probe = parse_l2_asset_audit(merged_probe or b"")
-                    if "mmad_root_resolved" in l2_asset_probe:
-                        res.artifacts["mmad_root_resolved"] = l2_asset_probe["mmad_root_resolved"]
-                    if "mmad_asset_mode" in l2_asset_probe:
-                        res.artifacts["mmad_asset_mode"] = l2_asset_probe["mmad_asset_mode"]
-                    probe_l2 = parse_l2_json_from_cmd(probe_res)
-                    if isinstance(probe_l2, dict):
-                        if "error" in probe_l2:
-                            res.artifacts["probe_l2_error"] = probe_l2.get("error")
-                        if "dataset_splits_available" in probe_l2:
-                            res.artifacts["probe_dataset_splits_available"] = probe_l2.get("dataset_splits_available")
-                        if "remediation" in probe_l2:
-                            res.artifacts["probe_remediation"] = probe_l2.get("remediation")
-                
-                if _require_cmd_ok(res, probe_res, "Probe", "ProbeIds"):
-                    zip_path, _, _ = resolve_evidence_zip(probe_dir)
-                    if zip_path is not None and zip_path.exists():
-                        with zipfile.ZipFile(zip_path, "r") as zf:
-                            for n in zf.namelist():
-                                if n.endswith("trace.json"):
-                                    try:
-                                        d = json.load(zf.open(n))
-                                        if "sample_id" in d: valid_ids.append(d["sample_id"])
-                                    except: pass
-                    valid_ids = sorted(list(set(valid_ids)))[:32]
-                    ids_source = "probe"
+                if ctx.strict_j_mode and ctx.allow_full_dataset:
+                    try:
+                        valid_ids, used_split = _generate_ids_from_dataset(ctx.dataset_split)
+                        ids_source = "generated_dataset"
+                        ids_source_note = f"strict_j + allow_full_dataset: generated full ids from dataset (split={used_split})"
+                    except Exception as e:
+                        res.success = False
+                        res.errors.append(f"Strict J full ids generation failed: {e}")
+                        return
+                elif ctx.strict_j_mode and eff_max is not None and eff_max > 32:
+                    try:
+                        valid_ids, used_split = _generate_ids_from_dataset(ctx.dataset_split)
+                        if len(valid_ids) < eff_max:
+                            res.success = False
+                            res.errors.append(
+                                f"Strict J ids source too small: required >= {eff_max}, got {len(valid_ids)} from dataset split {used_split}"
+                            )
+                            return
+                        ids_source = "generated_dataset"
+                        ids_source_note = f"strict_j + max_samples={eff_max}>32: generated dataset ids (split={used_split}) to avoid probe-32 cap"
+                    except Exception as e:
+                        res.success = False
+                        res.errors.append(f"Strict J ids generation failed for max_samples={eff_max}: {e}")
+                        return
                 else:
-                    # _require_cmd_ok already set res.success=False and errors
-                    res.gates["J3"] = False
-                    return
+                    probe_dir = ctx.work_dir / "probe"
+                    probe_dir.mkdir(parents=True, exist_ok=True)
+                    probe_cfg = ctx.work_dir / "probe_config.yaml"
+                    probe_cfg.write_text("model_id: distilgpt2\nrun_name: probe\n", encoding="utf-8")
+                    
+                    cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(probe_cfg).with_run_name("probe").arg("--seed", "42").arg("--max_samples", "32").arg("--evidence_dir", probe_dir).arg("--split", ctx.dataset_split).build()
+                    if J1.record_if_violation(cmd, res, "probe cmd"): return
+                    probe_res = CmdRunner.run(cmd, ctx.env_overrides, stream_output=True)
+                    if probe_res:
+                        merged_probe = probe_res.stderr if probe_res.stderr else probe_res.stdout
+                        l2_asset_probe = parse_l2_asset_audit(merged_probe or b"")
+                        if "mmad_root_resolved" in l2_asset_probe:
+                            res.artifacts["mmad_root_resolved"] = l2_asset_probe["mmad_root_resolved"]
+                        if "mmad_asset_mode" in l2_asset_probe:
+                            res.artifacts["mmad_asset_mode"] = l2_asset_probe["mmad_asset_mode"]
+                        probe_l2 = parse_l2_json_from_cmd(probe_res)
+                        if isinstance(probe_l2, dict):
+                            if "error" in probe_l2:
+                                res.artifacts["probe_l2_error"] = probe_l2.get("error")
+                            if "dataset_splits_available" in probe_l2:
+                                res.artifacts["probe_dataset_splits_available"] = probe_l2.get("dataset_splits_available")
+                            if "remediation" in probe_l2:
+                                res.artifacts["probe_remediation"] = probe_l2.get("remediation")
+                    
+                    if _require_cmd_ok(res, probe_res, "Probe", "ProbeIds"):
+                        zip_path, _, _ = resolve_evidence_zip(probe_dir)
+                        if zip_path is not None and zip_path.exists():
+                            with zipfile.ZipFile(zip_path, "r") as zf:
+                                for n in zf.namelist():
+                                    if n.endswith("trace.json"):
+                                        try:
+                                            d = json.load(zf.open(n))
+                                            if "sample_id" in d: valid_ids.append(d["sample_id"])
+                                        except: pass
+                        valid_ids = sorted(list(set(valid_ids)))[:32]
+                        ids_source = "probe"
+                        ids_source_note = "default probe ids source (max_samples=32)"
+                    else:
+                        # _require_cmd_ok already set res.success=False and errors
+                        res.gates["J3"] = False
+                        return
 
             if not valid_ids:
                  res.success = False
@@ -742,6 +782,7 @@ class ProbeIds(Stage):
             res.artifacts["ids_sha256"] = hashlib.sha256("\n".join(valid_ids).encode()).hexdigest()
             res.artifacts["audit_ids_total"] = len(valid_ids)
             res.artifacts["audit_ids_source"] = ids_source or "generated/ids.txt"
+            res.artifacts["ids_source_note"] = ids_source_note or "ids source selected by data binding policy"
 
 class AgentInfer06(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
@@ -1930,6 +1971,7 @@ def run_workload(args):
     res.artifacts["audit_effective_max_samples"] = "NONE" if ctx.allow_full_dataset else int(ctx.get_effective_max_samples())
     res.artifacts["audit_ids_total"] = 0
     res.artifacts["audit_ids_source"] = "NOT_SET"
+    res.artifacts["ids_source_note"] = "NOT_SET"
 
     # SENTINEL MODE
     if args.sentinel_ref:
