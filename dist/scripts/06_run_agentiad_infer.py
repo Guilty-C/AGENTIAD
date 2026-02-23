@@ -560,6 +560,24 @@ def _decode_hf_image(dataset_id: str, value: Any) -> "PIL.Image.Image":
         raise ImageLoadError("decode_error", f"Failed to decode hub image: {type(e).__name__}: {e}", {"path": str(local_path)}) from e
 
 
+def _read_image_bytes_and_sha(path: str) -> Tuple[Optional[bytes], Optional[str], int]:
+    p = Path(path)
+    if not p.exists():
+        return None, None, 0
+    try:
+        b = p.read_bytes()
+    except Exception:
+        return None, None, 0
+    return b, hashlib.sha256(b).hexdigest().upper(), len(b)
+
+
+def _pil_from_bytes_rgb(b: bytes) -> "PIL.Image.Image":
+    import io
+    from PIL import Image as PILImage
+
+    return PILImage.open(io.BytesIO(b)).convert("RGB")
+
+
 def _compute_correct(gt_label: Any, pred_label: Any) -> int:
     gt = _normalize_yesno(gt_label)
     pred = _normalize_yesno(pred_label)
@@ -744,6 +762,7 @@ def main() -> int:
     parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter to load")
     parser.add_argument("--local_files_only", type=str, default=None, help="Force local files only (true/false/1/0)")
     parser.add_argument("--allow_full_dataset", action="store_true", help="Allow full dataset traversal")
+    parser.add_argument("--perf", default=None, type=str, help="Enable lightweight perf summary (true/false/1/0/yes/no/on/off).")
     args = parser.parse_args()
 
     from agentiad_repro.utils import ensure_dir, load_paths, sha256_text, utc_now_iso, write_json
@@ -825,6 +844,10 @@ def main() -> int:
 
     cli_progress = None if args.progress is None else (str(args.progress).strip().lower() not in false_set)
     progress_enabled = bool(cli_progress) if cli_progress is not None else True
+    env_perf_val = os.environ.get("AGENTIAD_PERF", None)
+    env_perf = None if env_perf_val is None else (str(env_perf_val).strip().lower() not in false_set)
+    cli_perf = None if args.perf is None else (str(args.perf).strip().lower() not in false_set)
+    perf_enabled = cli_perf if cli_perf is not None else (env_perf if env_perf is not None else False)
 
     model_short = re.sub(r"[^a-zA-Z0-9]+", "_", vlm_model_id.strip())[-40:].strip("_") or "model"
     run_name = str(args.run_name) if args.run_name is not None else str(cfg.get("run_name", "")).strip()
@@ -1229,6 +1252,10 @@ def main() -> int:
     git_commit = _git_commit()
     n_samples_with_tool_call = 0
     tool_calls_total = 0
+    perf_saved_second_reads = 0
+    perf_crop_events = 0
+    perf_ref_events = 0
+    perf_io_decode_seconds = 0.0
     pbar = None
     progress_fallback = False
     progress_start_ts = 0.0
@@ -1533,20 +1560,27 @@ def main() -> int:
                 crop_path, bbox_used = crop_image_normalized(bbox_norm, img, sample_dir)
             
             # Fingerprinting for J2
-            pz_sha = hashlib.sha256(Path(crop_path).read_bytes()).hexdigest().upper() if Path(crop_path).exists() else None
+            pz_t0 = time.perf_counter() if perf_enabled else 0.0
+            pz_bytes, pz_sha, pz_size = _read_image_bytes_and_sha(crop_path)
+            if perf_enabled:
+                perf_crop_events += 1
+                perf_saved_second_reads += 1
             tool_pz_res = {
                 "crop_path": crop_path, 
                 "bbox_2d": bbox_used,
                 "result_sha": pz_sha,
-                "size": Path(crop_path).stat().st_size if Path(crop_path).exists() else 0,
+                "size": int(pz_size),
             }
 
             crop_img = None
             try:
-                from PIL import Image as PILImage
-                crop_img = PILImage.open(crop_path).convert("RGB")
+                if pz_bytes is None:
+                    raise RuntimeError("crop bytes unavailable")
+                crop_img = _pil_from_bytes_rgb(pz_bytes)
             except Exception:
                 crop_img = img
+            if perf_enabled:
+                perf_io_decode_seconds += max(0.0, time.perf_counter() - pz_t0)
 
             if args.dry_run:
                 raw1 = _vlm_generate_dry([crop_img], prompt_crop, sample_id, seed)
@@ -1604,28 +1638,36 @@ def main() -> int:
                     sample_dir,
                 )
                 
-                cr_sha = hashlib.sha256(Path(ref_path).read_bytes()).hexdigest().upper() if Path(ref_path).exists() else None
+                ref_t0 = time.perf_counter() if perf_enabled else 0.0
+                ref_bytes, ref_sha, ref_size = _read_image_bytes_and_sha(ref_path)
+                if perf_enabled:
+                    perf_ref_events += 1
+                    perf_saved_second_reads += 1
                 tool_cr_res = {
                     "ref_path": ref_path, 
                     "ref_sample_id": ref_sample_id,
-                    "result_sha": cr_sha,
-                    "size": Path(ref_path).stat().st_size if Path(ref_path).exists() else 0,
+                    "result_sha": ref_sha,
+                    "size": int(ref_size),
                 }
 
                 if args.dry_run:
-                    from PIL import Image as PILImage
                     try:
-                        ref_img = PILImage.open(ref_path).convert("RGB")
+                        if ref_bytes is None:
+                            raise RuntimeError("ref bytes unavailable")
+                        ref_img = _pil_from_bytes_rgb(ref_bytes)
                         raw2 = _vlm_generate_dry([crop_img, ref_img], prompt_cr, sample_id, seed)
                     except Exception:
                         raw2 = _vlm_generate_dry([crop_img, crop_img], prompt_cr, sample_id, seed)
                 else:
                     try:
-                        from PIL import Image as PILImage
-                        ref_img = PILImage.open(ref_path).convert("RGB")
+                        if ref_bytes is None:
+                            raise RuntimeError("ref bytes unavailable")
+                        ref_img = _pil_from_bytes_rgb(ref_bytes)
                         raw2 = _vlm_generate(processor, model, [crop_img, ref_img], prompt_cr, generation_config)
                     except Exception:
                         raw2 = _vlm_generate(processor, model, [crop_img], prompt_cr, generation_config)
+                if perf_enabled:
+                    perf_io_decode_seconds += max(0.0, time.perf_counter() - ref_t0)
                     
 
                 parsed2, meta2 = _parse_agent_json(raw2)
@@ -1823,6 +1865,16 @@ def main() -> int:
 
     # Contract: Single line JSON to stderr (to keep stdout clean for harness)
     print(f"L2_RESULT_JSON={json.dumps(result_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
+    if perf_enabled:
+        print(
+            f"[06_run_agentiad_infer.py][perf] saved_second_reads={int(perf_saved_second_reads)} "
+            f"(crop_events={int(perf_crop_events)}, ref_events={int(perf_ref_events)})",
+            file=sys.stderr,
+        )
+        print(
+            f"[06_run_agentiad_infer.py][perf] io_decode_seconds_total={perf_io_decode_seconds:.4f}",
+            file=sys.stderr,
+        )
 
     if args.evidence_dir:
         _package_evidence(Path(args.evidence_dir).resolve())
