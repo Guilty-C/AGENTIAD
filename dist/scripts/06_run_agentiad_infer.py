@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 # Bootstrap src path
@@ -822,17 +823,8 @@ def main() -> int:
     cli_enable_tools = None if args.enable_tools is None else (str(args.enable_tools).strip().lower() not in false_set)
     enable_tools = cli_enable_tools if args.enable_tools is not None else enable_tools_cfg
 
-    progress_cfg_val = cfg.get("progress", False)
-    if isinstance(progress_cfg_val, bool):
-        progress_cfg = bool(progress_cfg_val)
-    elif isinstance(progress_cfg_val, (int, float)):
-        progress_cfg = bool(progress_cfg_val)
-    else:
-        progress_cfg = str(progress_cfg_val).strip().lower() not in false_set
-    env_progress_val = os.environ.get("AGENTIAD_PROGRESS", None)
-    env_progress = None if env_progress_val is None else (str(env_progress_val).strip().lower() not in false_set)
     cli_progress = None if args.progress is None else (str(args.progress).strip().lower() not in false_set)
-    progress_enabled = cli_progress if cli_progress is not None else env_progress if env_progress is not None else bool(progress_cfg)
+    progress_enabled = bool(cli_progress) if cli_progress is not None else True
 
     model_short = re.sub(r"[^a-zA-Z0-9]+", "_", vlm_model_id.strip())[-40:].strip("_") or "model"
     run_name = str(args.run_name) if args.run_name is not None else str(cfg.get("run_name", "")).strip()
@@ -875,6 +867,64 @@ def main() -> int:
     processor = None
     model = None
     generation_config = None
+
+    def _ensure_pad_token_id_explicit(processor_obj: Any, model_obj: Any, generation_cfg_obj: Any) -> None:
+        tok = getattr(processor_obj, "tokenizer", None)
+        if tok is None and processor_obj is not None:
+            if hasattr(processor_obj, "eos_token_id") or hasattr(processor_obj, "pad_token_id"):
+                tok = processor_obj
+
+        def _is_pad_invalid(pad_id: Any, eos_id: Any) -> bool:
+            if pad_id is None:
+                return True
+            if isinstance(pad_id, int):
+                if pad_id < 0:
+                    return True
+                if pad_id == 0 and isinstance(eos_id, int) and eos_id > 0:
+                    return True
+            return False
+
+        resolved_pad_id = None
+        if tok is not None:
+            eos_id = getattr(tok, "eos_token_id", None)
+            pad_id = getattr(tok, "pad_token_id", None)
+            if eos_id is not None and _is_pad_invalid(pad_id, eos_id):
+                if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
+                    try:
+                        tok.pad_token = tok.eos_token
+                    except Exception:
+                        pass
+                try:
+                    tok.pad_token_id = int(eos_id)
+                except Exception:
+                    pass
+            resolved_pad_id = getattr(tok, "pad_token_id", None)
+            if resolved_pad_id is None and eos_id is not None:
+                resolved_pad_id = int(eos_id)
+
+        if resolved_pad_id is None:
+            for cfg_obj in [generation_cfg_obj, getattr(model_obj, "generation_config", None), getattr(model_obj, "config", None)]:
+                if cfg_obj is None:
+                    continue
+                pad_id = getattr(cfg_obj, "pad_token_id", None)
+                if pad_id is not None:
+                    resolved_pad_id = pad_id
+                    break
+                eos_id = getattr(cfg_obj, "eos_token_id", None)
+                if eos_id is not None:
+                    resolved_pad_id = eos_id
+                    break
+
+        if resolved_pad_id is None:
+            return
+
+        for cfg_obj in [getattr(model_obj, "config", None), getattr(model_obj, "generation_config", None), generation_cfg_obj]:
+            if cfg_obj is None:
+                continue
+            try:
+                cfg_obj.pad_token_id = int(resolved_pad_id)
+            except Exception:
+                pass
 
     if not args.dry_run:
         try:
@@ -933,6 +983,7 @@ def main() -> int:
                     processor.pad_token = processor.eos_token
                     processor.pad_token_id = processor.eos_token_id
                  processor.padding_side = "left"
+        _ensure_pad_token_id_explicit(processor, model, generation_config)
 
         def _resolve_torch_dtype(spec: Any, use_cuda0: bool) -> Any:
             if spec is None:
@@ -1022,6 +1073,7 @@ def main() -> int:
             elif not accelerate_available:
                 model = model.to(device)
             model.eval()
+        _ensure_pad_token_id_explicit(processor, model, generation_config)
 
         generation_config = GenerationConfig(
             max_new_tokens=int(max_new_tokens),
@@ -1029,6 +1081,7 @@ def main() -> int:
             temperature=0.0,
             top_p=1.0,
         )
+        _ensure_pad_token_id_explicit(processor, model, generation_config)
 
         if dataset_id.endswith(".json") or dataset_id.endswith(".jsonl"):
             ds = load_dataset("json", data_files=dataset_id)
@@ -1178,24 +1231,55 @@ def main() -> int:
     tool_calls_total = 0
     pbar = None
     progress_fallback = False
+    progress_start_ts = 0.0
+    progress_total = int(max_samples)
+    progress_step = 1
+    progress_meter_fn = None
+    progress_last_printed = 0
+    progress_script_prefix = "[06_run_agentiad_infer.py]"
     if progress_enabled:
-        try:
-            from tqdm.auto import tqdm  # type: ignore
+        if sys.stderr.isatty():
+            try:
+                from tqdm.auto import tqdm  # type: ignore
 
-            pbar = tqdm(
-                total=int(max_samples),
-                unit="sample",
-                dynamic_ncols=True,
-                file=sys.stderr,
-                desc=run_name,
-            )
-        except Exception:
-            pbar = None
+                pbar = tqdm(
+                    total=progress_total,
+                    unit="sample",
+                    dynamic_ncols=True,
+                    file=sys.stderr,
+                    desc=run_name,
+                )
+            except Exception:
+                pbar = None
+                progress_fallback = True
+        else:
             progress_fallback = True
+        if progress_fallback:
+            progress_start_ts = time.monotonic()
+            progress_step = max(1, (int(progress_total) + 99) // 100)
+            try:
+                from tqdm import tqdm as _tqdm_cls  # type: ignore
+                progress_meter_fn = _tqdm_cls.format_meter
+            except Exception:
+                progress_meter_fn = None
 
-    def _stderr_progress(done: int, total: int, attempts_i: int) -> None:
-        sys.stderr.write("\r[" + str(int(done)) + "/" + str(int(total)) + "] loop_attempts=" + str(int(attempts_i)))
-        sys.stderr.flush()
+    def _stderr_progress(done: int, total: int) -> None:
+        nonlocal progress_last_printed
+        if not progress_fallback:
+            return
+        total_i = max(1, int(total))
+        done_i = max(0, min(int(done), total_i))
+        if done_i != total_i and (done_i % progress_step != 0):
+            return
+        if done_i == progress_last_printed:
+            return
+        elapsed = max(0.0, time.monotonic() - progress_start_ts)
+        if progress_meter_fn is not None:
+            meter = progress_meter_fn(done_i, total_i, elapsed)
+        else:
+            meter = f"{done_i}/{total_i} [{elapsed:.1f}s]"
+        print(f"{progress_script_prefix} {meter}", file=sys.stderr, flush=True)
+        progress_last_printed = done_i
 
     def _trace_has_tool_call(trace_path: Path, fallback_trace: Mapping[str, Any]) -> bool:
         tr: Any = None
@@ -1430,7 +1514,10 @@ def main() -> int:
                 )
                 n_success += 1
                 if progress_enabled:
-                     if pbar is not None: pbar.update(1)
+                     if pbar is not None:
+                         pbar.update(1)
+                     elif progress_fallback:
+                         _stderr_progress(len(rows), progress_total)
                 continue
 
             # Tool Execution Logic (PZ -> CR)
@@ -1614,7 +1701,7 @@ def main() -> int:
                 if pbar is not None:
                     pbar.update(1)
                 elif progress_fallback:
-                    _stderr_progress(len(rows), int(max_samples), int(attempts))
+                    _stderr_progress(len(rows), progress_total)
 
         import pandas as pd
 
@@ -1692,8 +1779,6 @@ def main() -> int:
                     pbar.close()
                 except Exception:
                     pass
-            sys.stderr.write("\n")
-            sys.stderr.flush()
 
     # Gather result summary
     result_summary = {
