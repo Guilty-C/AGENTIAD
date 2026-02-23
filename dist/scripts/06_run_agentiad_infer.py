@@ -60,7 +60,13 @@ PaperContract = _load_paper_contract_cls()
 MMAD_ROOT_RESOLVED: Optional[Path] = None
 MMAD_ASSET_MODE: str = "unknown"
 _LOCAL_DIR_ENTRY_CACHE: Dict[str, Dict[str, Path]] = {}
-_CHAT_TEXT_CACHE: Dict[Tuple[int, str], str] = {}
+_CHAT_TEXT_CACHE: Dict[Tuple[str, int, str], str] = {}
+
+
+def _chat_template_key(processor: Any, n_images: int, prompt: str) -> Tuple[str, int, str]:
+    tpl = str(getattr(processor, "chat_template", "") or "")
+    tpl_sig = hashlib.sha256(tpl.encode("utf-8")).hexdigest()[:16]
+    return (tpl_sig, int(n_images), prompt)
 
 
 def _read_text(path: Path) -> str:
@@ -633,7 +639,7 @@ def _vlm_generate(
         try:
             if hasattr(processor, "apply_chat_template") and getattr(processor, "chat_template", None):
                 try:
-                    cache_key = (len(imgs), prompt)
+                    cache_key = _chat_template_key(processor, len(imgs), prompt)
                     text = _CHAT_TEXT_CACHE.get(cache_key, "")
                     if not text:
                         messages: List[Dict[str, Any]] = [
@@ -646,7 +652,7 @@ def _vlm_generate(
                         _CHAT_TEXT_CACHE[cache_key] = text
                     inputs = processor(text=[text], images=imgs, return_tensors="pt")
                 except Exception:
-                    cache_key_text = (0, prompt)
+                    cache_key_text = _chat_template_key(processor, 0, prompt)
                     text = _CHAT_TEXT_CACHE.get(cache_key_text, "")
                     if not text:
                         messages_text: List[Dict[str, Any]] = [
