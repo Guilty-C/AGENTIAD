@@ -60,6 +60,7 @@ PaperContract = _load_paper_contract_cls()
 MMAD_ROOT_RESOLVED: Optional[Path] = None
 MMAD_ASSET_MODE: str = "unknown"
 _LOCAL_DIR_ENTRY_CACHE: Dict[str, Dict[str, Path]] = {}
+_CHAT_TEXT_CACHE: Dict[Tuple[int, str], str] = {}
 
 
 def _read_text(path: Path) -> str:
@@ -620,28 +621,42 @@ def _vlm_generate(
         import torch
 
         model_device = _infer_model_device(model)
-        imgs = [im.convert("RGB") for im in images]
+        # Upstream image loading/cropping normalizes images to RGB already.
+        # Keep zero-copy where possible; only convert when an input explicitly reports non-RGB mode.
+        imgs = list(images)
+        for i, im in enumerate(imgs):
+            mode = getattr(im, "mode", None)
+            if hasattr(im, "convert") and mode not in {None, "RGB"}:
+                imgs[i] = im.convert("RGB")
         
         inputs = {}
         try:
             if hasattr(processor, "apply_chat_template") and getattr(processor, "chat_template", None):
                 try:
-                    messages: List[Dict[str, Any]] = [
-                        {
-                            "role": "user",
-                            "content": [{"type": "image"} for _ in imgs] + [{"type": "text", "text": prompt}],
-                        }
-                    ]
-                    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    cache_key = (len(imgs), prompt)
+                    text = _CHAT_TEXT_CACHE.get(cache_key, "")
+                    if not text:
+                        messages: List[Dict[str, Any]] = [
+                            {
+                                "role": "user",
+                                "content": [{"type": "image"} for _ in imgs] + [{"type": "text", "text": prompt}],
+                            }
+                        ]
+                        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        _CHAT_TEXT_CACHE[cache_key] = text
                     inputs = processor(text=[text], images=imgs, return_tensors="pt")
                 except Exception:
-                    messages_text: List[Dict[str, Any]] = [
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        }
-                    ]
-                    text = processor.apply_chat_template(messages_text, tokenize=False, add_generation_prompt=True)
+                    cache_key_text = (0, prompt)
+                    text = _CHAT_TEXT_CACHE.get(cache_key_text, "")
+                    if not text:
+                        messages_text: List[Dict[str, Any]] = [
+                            {
+                                "role": "user",
+                                "content": prompt,
+                            }
+                        ]
+                        text = processor.apply_chat_template(messages_text, tokenize=False, add_generation_prompt=True)
+                        _CHAT_TEXT_CACHE[cache_key_text] = text
                     inputs = processor(text=[text], return_tensors="pt")
             else:
                 try:
