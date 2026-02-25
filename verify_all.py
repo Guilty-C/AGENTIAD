@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 import pathlib
 import re
+import csv
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
@@ -52,6 +53,8 @@ class StageContext:
     strict_j_mode: bool = False
     dataset_split: str = "test"
     env_overrides: Dict[str, str] = field(default_factory=dict)
+    vlm_model_id: Optional[str] = None
+    vlm_model_source: str = "config"
     scripts_dir: Path = field(default_factory=lambda: DIST_SCRIPTS)
     cached_cfg_max_samples: Optional[int] = None
 
@@ -427,6 +430,33 @@ def parse_l2_json_from_cmd(cmd_res: Optional[CmdResult]) -> Optional[Dict[str, A
     except Exception as e:
         print(f"Warning: Failed to parse L2_RESULT_JSON: {e}", file=sys.stderr)
     return None
+
+
+def _read_first_model_id_from_csv(csv_path: Path) -> Optional[str]:
+    try:
+        if not csv_path.exists() or not csv_path.is_file():
+            return None
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            first = next(reader, None)
+            if not isinstance(first, dict):
+                return None
+            val = str(first.get("model_id", "") or "").strip()
+            return val or None
+    except Exception:
+        return None
+
+
+def _is_placeholder_vlm_model_id(model_id: str) -> bool:
+    s = str(model_id or "").strip().lower()
+    if not s:
+        return False
+    leaf = s.rsplit("/", 1)[-1]
+    if leaf in {"distilgpt2", "gpt2"}:
+        return True
+    if leaf.startswith("distil"):
+        return True
+    return False
 
 class CSVHash:
     @staticmethod
@@ -829,7 +859,14 @@ class ProbeIds(Stage):
 class AgentInfer06(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
         mr_cfg = ctx.work_dir / "mr_config.yaml"
-        if not mr_cfg.exists(): mr_cfg.write_text("model_id: distilgpt2\nrun_name: minireal\n", encoding="utf-8")
+        if ctx.phase2_full_infer:
+            if ctx.vlm_model_id:
+                quoted = json.dumps(str(ctx.vlm_model_id), ensure_ascii=False)
+                mr_cfg.write_text(f"vlm_model_id: {quoted}\nrun_name: minireal\n", encoding="utf-8")
+            elif not mr_cfg.exists():
+                mr_cfg.write_text("model_id: distilgpt2\nrun_name: minireal\n", encoding="utf-8")
+        elif not mr_cfg.exists():
+            mr_cfg.write_text("model_id: distilgpt2\nrun_name: minireal\n", encoding="utf-8")
         (ctx.work_dir / "L1_baseline.csv").write_text("idx,split,answer,pred,correct,method,triggered\n")
         
         if ctx.no_adapter: return 
@@ -863,6 +900,7 @@ class AgentInfer06(Stage):
                 merged_output = b""
                 if cmd_res:
                     merged_output = cmd_res.stderr if cmd_res.stderr else cmd_res.stdout
+                merged_text = (merged_output or b"").decode("utf-8", errors="replace")
                 l2_asset_info = parse_l2_asset_audit(merged_output or b"")
                 if "mmad_root_resolved" in l2_asset_info:
                     res.artifacts["mmad_root_resolved"] = l2_asset_info["mmad_root_resolved"]
@@ -880,9 +918,17 @@ class AgentInfer06(Stage):
                 l2_effective_n = None
                 seed_audit_mismatch_recorded = False
                 l2_data = parse_l2_json_from_cmd(cmd_res)
+                actual_model_id = ""
                 if isinstance(l2_data, dict):
                     l2_dataset_split = str(l2_data.get("dataset_split", "") or "")
                     res.artifacts[f"seed_{seed}_l2_dataset_split"] = l2_dataset_split
+                    actual_model_id = str(
+                        l2_data.get("vlm_model_id", "") or l2_data.get("model_id", "")
+                    ).strip()
+                    if not actual_model_id:
+                        out_csv_raw = str(l2_data.get("out_csv", "") or "").strip()
+                        if out_csv_raw:
+                            actual_model_id = _read_first_model_id_from_csv(Path(out_csv_raw)) or ""
                     if ctx.strict_j_mode and l2_dataset_split and l2_dataset_split != ctx.dataset_split:
                         seed_audit_mismatch_recorded = True
                         res.artifacts["evidence_checks"].append({
@@ -980,8 +1026,46 @@ class AgentInfer06(Stage):
                                     remediation = (
                                         "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
                                     )
-                                    if remediation not in res.remediations:
-                                        res.remediations.append(remediation)
+                                if remediation not in res.remediations:
+                                    res.remediations.append(remediation)
+
+                if not actual_model_id and isinstance(l2_data, dict):
+                    out_csv_raw = str(l2_data.get("out_csv", "") or "").strip()
+                    if out_csv_raw:
+                        actual_model_id = _read_first_model_id_from_csv(Path(out_csv_raw)) or ""
+                if not actual_model_id:
+                    actual_model_id = "UNKNOWN"
+
+                res.artifacts[f"seed_{seed}_audit_vlm_model_id"] = actual_model_id
+                if "audit_vlm_model_id" not in res.artifacts or not str(res.artifacts.get("audit_vlm_model_id", "")).strip():
+                    res.artifacts["audit_vlm_model_id"] = actual_model_id
+                    res.artifacts["audit_vlm_model_source"] = ctx.vlm_model_source
+
+                if ctx.phase2_full_infer:
+                    fallback_marker = "[OfflineFallback] Activating fallback to distilgpt2"
+                    explicit_user_model = ctx.vlm_model_source in {"cli", "env"} and bool(ctx.vlm_model_id)
+                    remediation = (
+                        "Model fallback detected. Set --vlm-model-local-dir to a downloaded VLM directory "
+                        "(e.g. /data2/lrrelevant/hf_offline/models/Qwen2.5-VL-3B-Instruct-AWQ) and rerun phase2_full_infer."
+                    )
+                    if fallback_marker in merged_text:
+                        res.success = False
+                        res.gates["J2"] = False
+                        res.errors.append(
+                            f"S{seed}-06 hard-fail: detected model load fallback to distilgpt2. {remediation}"
+                        )
+                        if remediation not in res.remediations:
+                            res.remediations.append(remediation)
+                        return
+                    if _is_placeholder_vlm_model_id(actual_model_id) and not explicit_user_model:
+                        res.success = False
+                        res.gates["J2"] = False
+                        res.errors.append(
+                            f"S{seed}-06 hard-fail: placeholder model_id '{actual_model_id}' detected in phase2_full_infer. {remediation}"
+                        )
+                        if remediation not in res.remediations:
+                            res.remediations.append(remediation)
+                        return
 
                 eff_max = ctx.get_effective_max_samples()
                 subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
@@ -1950,6 +2034,26 @@ def run_workload(args):
                 "measurements": {"evidence_check_sec": 0.0},
                 "remediations": ["Use --dataset-split train for MMAD single-split dataset."],
             }
+
+    phase2_vlm_model_id: Optional[str] = None
+    phase2_vlm_model_source = "config"
+    if is_phase2_full:
+        cli_local = str(args.vlm_model_local_dir or "").strip()
+        cli_id = str(args.vlm_model_id or "").strip()
+        env_local = str(os.environ.get("VLM_MODEL_LOCAL_DIR", "") or "").strip()
+        env_id = str(os.environ.get("VLM_MODEL_ID", "") or "").strip()
+        if cli_local:
+            phase2_vlm_model_id = cli_local
+            phase2_vlm_model_source = "cli"
+        elif cli_id:
+            phase2_vlm_model_id = cli_id
+            phase2_vlm_model_source = "cli"
+        elif env_local:
+            phase2_vlm_model_id = env_local
+            phase2_vlm_model_source = "env"
+        elif env_id:
+            phase2_vlm_model_id = env_id
+            phase2_vlm_model_source = "env"
     
     work_dir = Path(args.output_dir).resolve()
 
@@ -2045,7 +2149,9 @@ def run_workload(args):
         phase2_full_infer=is_phase2_full,
         strict_j_mode=(args.mode == "strict_j"),
         dataset_split=args.dataset_split,
-        env_overrides=env_overrides
+        env_overrides=env_overrides,
+        vlm_model_id=phase2_vlm_model_id,
+        vlm_model_source=phase2_vlm_model_source,
     )
     
     res = StageResult()
@@ -2057,6 +2163,11 @@ def run_workload(args):
     res.artifacts["ids_source_note"] = "NOT_SET"
     if is_phase2_full:
         res.artifacts["ids_source_note"] = "phase2_full_infer forces full coverage"
+        res.artifacts["audit_vlm_model_source"] = phase2_vlm_model_source
+        if phase2_vlm_model_id:
+            res.artifacts["audit_requested_vlm_model_id"] = phase2_vlm_model_id
+        else:
+            res.artifacts["using_default_vlm_model_id"] = True
 
     # SENTINEL MODE
     if args.sentinel_ref:
@@ -2195,6 +2306,8 @@ def build_arg_parser():
     parser.add_argument("--no-adapter", action="store_true", dest="no_adapter", help="Skip adapter checks")
     parser.add_argument("--allow-full-dataset", action="store_true", dest="allow_full_dataset", help="Allow full dataset runs")
     parser.add_argument("--dataset-split", type=str, default="test", dest="dataset_split", help="Dataset split for phase1")
+    parser.add_argument("--vlm-model-id", type=str, default=None, dest="vlm_model_id", help="Explicit VLM model id (repo id or local path)")
+    parser.add_argument("--vlm-model-local-dir", type=str, default=None, dest="vlm_model_local_dir", help="Explicit local VLM model directory; higher priority than --vlm-model-id")
     parser.add_argument("--sentinel-ref", type=str, default="", dest="sentinel_ref", help="Sentinel reference directory")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Random seeds")
     return parser
