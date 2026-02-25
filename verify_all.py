@@ -55,6 +55,7 @@ class StageContext:
     env_overrides: Dict[str, str] = field(default_factory=dict)
     vlm_model_id: Optional[str] = None
     vlm_model_source: str = "config"
+    vlm_max_side: Optional[int] = None
     scripts_dir: Path = field(default_factory=lambda: DIST_SCRIPTS)
     cached_cfg_max_samples: Optional[int] = None
 
@@ -508,7 +509,21 @@ def _count_phase2_execution_errors_from_zip(ev_zip: Path, csv_name: str) -> Dict
                 defect_type = str(final_obj.get("defect_type", "") or "").strip().lower()
                 required_keys_ok = all(k in final_obj for k in ["anomaly", "bbox", "defect_type", "confidence"])
                 anomaly_ok = anomaly in {"yes", "no", "unknown"}
-                if not required_keys_ok or not anomaly_ok:
+                bbox_val = final_obj.get("bbox")
+                bbox_ok = False
+                if isinstance(bbox_val, (list, tuple)) and len(bbox_val) == 4:
+                    try:
+                        x1 = float(bbox_val[0])
+                        y1 = float(bbox_val[1])
+                        x2 = float(bbox_val[2])
+                        y2 = float(bbox_val[3])
+                        in_range = all(0.0 <= v <= 1.0 for v in [x1, y1, x2, y2])
+                        bbox_ok = in_range and (x2 > x1) and (y2 > y1)
+                    except Exception:
+                        bbox_ok = False
+                defect_type_ok = isinstance(final_obj.get("defect_type"), str) and bool(str(final_obj.get("defect_type")).strip())
+                confidence_ok = final_obj.get("confidence", "__MISSING__") is None
+                if not (required_keys_ok and anomaly_ok and bbox_ok and defect_type_ok and confidence_ok):
                     out["strict_schema_invalid_count"] += 1
                 if anomaly == "unknown":
                     out["unknown_count"] += 1
@@ -954,6 +969,8 @@ class AgentInfer06(Stage):
                 
                 cmd = CmdBuilder(ctx.get_script("06_run_agentiad_infer.py")).with_config(mr_cfg).with_run_name(f"mr_s{seed}").arg("--seed", seed).arg("--id_list", ctx.work_dir / "ids.txt").with_evidence_dir(ev_06)
                 cmd.arg("--split", ctx.dataset_split)
+                if ctx.phase2_full_infer and ctx.vlm_max_side is not None:
+                    cmd.arg("--vlm-max-side", int(ctx.vlm_max_side))
                 
                 if ctx.phase1_baseline:
                     cmd.arg("--enable_tools", "false")
@@ -2267,6 +2284,7 @@ def run_workload(args):
         env_overrides=env_overrides,
         vlm_model_id=phase2_vlm_model_id,
         vlm_model_source=phase2_vlm_model_source,
+        vlm_max_side=args.vlm_max_side,
     )
     
     res = StageResult()
@@ -2427,6 +2445,7 @@ def build_arg_parser():
     parser.add_argument("--dataset-split", type=str, default="test", dest="dataset_split", help="Dataset split for phase1")
     parser.add_argument("--vlm-model-id", type=str, default=None, dest="vlm_model_id", help="Explicit VLM model id (repo id or local path)")
     parser.add_argument("--vlm-model-local-dir", type=str, default=None, dest="vlm_model_local_dir", help="Explicit local VLM model directory; higher priority than --vlm-model-id")
+    parser.add_argument("--vlm-max-side", type=int, default=None, dest="vlm_max_side", help="Override VLM max image side for phase2 infer")
     parser.add_argument("--sentinel-ref", type=str, default="", dest="sentinel_ref", help="Sentinel reference directory")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Random seeds")
     return parser

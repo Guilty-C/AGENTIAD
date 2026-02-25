@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 import argparse
 import gc
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -62,7 +63,7 @@ MMAD_ROOT_RESOLVED: Optional[Path] = None
 MMAD_ASSET_MODE: str = "unknown"
 _LOCAL_DIR_ENTRY_CACHE: Dict[str, Dict[str, Path]] = {}
 _CHAT_TEXT_CACHE: Dict[Tuple[str, int, str], str] = {}
-_LAST_VLM_EXCEPTION: Optional[Dict[str, str]] = None
+_LAST_VLM_EXCEPTIONS: List[Dict[str, Any]] = []
 
 
 def _chat_template_key(processor: Any, n_images: int, prompt: str) -> Tuple[str, int, str]:
@@ -618,11 +619,21 @@ def _cleanup_cuda_memory() -> None:
         pass
 
 
-def _take_last_vlm_exception() -> Optional[Dict[str, str]]:
-    global _LAST_VLM_EXCEPTION
-    err = _LAST_VLM_EXCEPTION
-    _LAST_VLM_EXCEPTION = None
+def _take_last_vlm_exception() -> Optional[Dict[str, Any]]:
+    global _LAST_VLM_EXCEPTIONS
+    if not _LAST_VLM_EXCEPTIONS:
+        return None
+    err = _LAST_VLM_EXCEPTIONS.pop(0)
     return err
+
+
+def _is_retryable_vlm_error(exc: Exception) -> bool:
+    s = str(exc or "").strip().lower()
+    return (
+        ("out of memory" in s)
+        or ("cuda driver error: invalid argument" in s)
+        or ("device kernel image is invalid" in s)
+    )
 
 
 def _compute_correct(gt_label: Any, pred_label: Any) -> int:
@@ -660,116 +671,140 @@ def _vlm_generate(
     prompt: str,
     generation_config: Any,
 ) -> str:
-    global _LAST_VLM_EXCEPTION
-    _LAST_VLM_EXCEPTION = None
-    inputs = {}
-    gen_ids = None
-    decode_ids = None
-    input_ids = None
-    try:
-        if model is None:
-            return '<answer>{"anomaly_present": "unknown", "top_anomaly": "offline_fallback", "visual_descriptions": []}</answer>'
+    global _LAST_VLM_EXCEPTIONS
+    _LAST_VLM_EXCEPTIONS = []
+    if model is None:
+        return '<answer>{"anomaly_present": "unknown", "top_anomaly": "offline_fallback", "visual_descriptions": []}</answer>'
 
-        import torch
+    import torch
 
-        model_device = _infer_model_device(model)
-        # Upstream image loading/cropping normalizes images to RGB already.
-        # Keep zero-copy where possible; only convert when an input explicitly reports non-RGB mode.
-        imgs = list(images)
-        for i, im in enumerate(imgs):
-            mode = getattr(im, "mode", None)
-            if hasattr(im, "convert") and mode not in {None, "RGB"}:
-                imgs[i] = im.convert("RGB")
-        
+    model_device = _infer_model_device(model)
+    imgs = list(images)
+    for i, im in enumerate(imgs):
+        mode = getattr(im, "mode", None)
+        if hasattr(im, "convert") and mode not in {None, "RGB"}:
+            imgs[i] = im.convert("RGB")
+
+    def _record_exc(attempt: int, exc: Exception) -> None:
+        _LAST_VLM_EXCEPTIONS.append(
+            {
+                "attempt": int(attempt),
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+        )
+
+    def _prepare_inputs(local_imgs: Sequence["PIL.Image.Image"]) -> Dict[str, Any]:
+        inputs: Dict[str, Any] = {}
         try:
             if hasattr(processor, "apply_chat_template") and getattr(processor, "chat_template", None):
                 try:
-                    cache_key = _chat_template_key(processor, len(imgs), prompt)
+                    cache_key = _chat_template_key(processor, len(local_imgs), prompt)
                     text = _CHAT_TEXT_CACHE.get(cache_key, "")
                     if not text:
                         messages: List[Dict[str, Any]] = [
                             {
                                 "role": "user",
-                                "content": [{"type": "image"} for _ in imgs] + [{"type": "text", "text": prompt}],
+                                "content": [{"type": "image"} for _ in local_imgs] + [{"type": "text", "text": prompt}],
                             }
                         ]
                         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                         _CHAT_TEXT_CACHE[cache_key] = text
-                    inputs = processor(text=[text], images=imgs, return_tensors="pt")
+                    inputs = processor(text=[text], images=list(local_imgs), return_tensors="pt")
                 except Exception:
                     cache_key_text = _chat_template_key(processor, 0, prompt)
                     text = _CHAT_TEXT_CACHE.get(cache_key_text, "")
                     if not text:
-                        messages_text: List[Dict[str, Any]] = [
-                            {
-                                "role": "user",
-                                "content": prompt,
-                            }
-                        ]
+                        messages_text: List[Dict[str, Any]] = [{"role": "user", "content": prompt}]
                         text = processor.apply_chat_template(messages_text, tokenize=False, add_generation_prompt=True)
                         _CHAT_TEXT_CACHE[cache_key_text] = text
                     inputs = processor(text=[text], return_tensors="pt")
             else:
                 try:
-                    inputs = processor(images=imgs, text=[prompt], return_tensors="pt")
+                    inputs = processor(images=list(local_imgs), text=[prompt], return_tensors="pt")
                 except Exception:
-                     inputs = processor(text=[prompt], return_tensors="pt")
-                     
+                    inputs = processor(text=[prompt], return_tensors="pt")
         except Exception:
-             inputs = processor(text=[prompt], return_tensors="pt")
+            inputs = processor(text=[prompt], return_tensors="pt")
+        return {k: (v.to(model_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
 
-        inputs = {k: (v.to(model_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
-        with torch.inference_mode():
+    def _run_once(local_imgs: Sequence["PIL.Image.Image"], conservative_sdp: bool) -> str:
+        inputs: Dict[str, Any] = {}
+        gen_ids = None
+        decode_ids = None
+        input_ids = None
+        try:
+            inputs = _prepare_inputs(local_imgs)
+            sdp_ctx = nullcontext()
+            if conservative_sdp:
+                try:
+                    sdp_kernel = getattr(getattr(torch.backends, "cuda", None), "sdp_kernel", None)
+                    if callable(sdp_kernel):
+                        sdp_ctx = sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+                except Exception:
+                    sdp_ctx = nullcontext()
+            with torch.inference_mode():
+                with sdp_ctx:
+                    try:
+                        gen_ids = model.generate(**inputs, generation_config=generation_config, use_cache=False)
+                    except TypeError:
+                        gen_ids = model.generate(**inputs, generation_config=generation_config)
+            input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else None
+            decode_ids = gen_ids
+            if input_ids is not None and hasattr(input_ids, "shape") and hasattr(gen_ids, "shape"):
+                decode_ids = gen_ids[:, input_ids.shape[1] :]
+            if hasattr(processor, "batch_decode"):
+                decoded = processor.batch_decode(decode_ids, skip_special_tokens=True)
+                return _safe_str(decoded[0]).strip() if decoded else ""
+            tok = getattr(processor, "tokenizer", None)
+            if tok is not None and hasattr(tok, "batch_decode"):
+                decoded = tok.batch_decode(decode_ids, skip_special_tokens=True)
+                return _safe_str(decoded[0]).strip() if decoded else ""
+            return _safe_str(decode_ids).strip()
+        finally:
             try:
-                gen_ids = model.generate(**inputs, generation_config=generation_config, use_cache=False)
-            except TypeError:
-                gen_ids = model.generate(**inputs, generation_config=generation_config)
-        input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else None
-        decode_ids = gen_ids
-        if input_ids is not None and hasattr(input_ids, "shape") and hasattr(gen_ids, "shape"):
-            decode_ids = gen_ids[:, input_ids.shape[1] :]
-        if hasattr(processor, "batch_decode"):
-            decoded = processor.batch_decode(decode_ids, skip_special_tokens=True)
-            return _safe_str(decoded[0]).strip() if decoded else ""
-        tok = getattr(processor, "tokenizer", None)
-        if tok is not None and hasattr(tok, "batch_decode"):
-            decoded = tok.batch_decode(decode_ids, skip_special_tokens=True)
-            return _safe_str(decoded[0]).strip() if decoded else ""
-        return _safe_str(decode_ids).strip()
-    except Exception as e:
-        print(f"DEBUG: _vlm_generate exception: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
-        _LAST_VLM_EXCEPTION = {
-            "type": type(e).__name__,
-            "message": str(e),
-        }
+                if isinstance(inputs, dict):
+                    for k in list(inputs.keys()):
+                        try:
+                            del inputs[k]
+                        except Exception:
+                            pass
+                del inputs
+            except Exception:
+                pass
+            try:
+                del input_ids
+            except Exception:
+                pass
+            try:
+                del decode_ids
+            except Exception:
+                pass
+            try:
+                del gen_ids
+            except Exception:
+                pass
+            _cleanup_cuda_memory()
+
+    try:
+        return _run_once(imgs, conservative_sdp=False)
+    except Exception as e1:
+        print(f"DEBUG: _vlm_generate attempt1 exception: {e1}", file=sys.stderr)
+        _record_exc(1, e1)
+        if _is_retryable_vlm_error(e1):
+            _cleanup_cuda_memory()
+            retry_imgs = [_resize_image_max_side(im, 512) for im in imgs]
+            try:
+                out = _run_once(retry_imgs, conservative_sdp=True)
+                _LAST_VLM_EXCEPTIONS = []
+                return out
+            except Exception as e2:
+                print(f"DEBUG: _vlm_generate attempt2 exception: {e2}", file=sys.stderr)
+                _record_exc(2, e2)
+                # Fallback output that respects contract schema (but says unknown)
+                return '<answer>{"anomaly_present": "unknown", "top_anomaly": "execution_error", "visual_descriptions": []}</answer>'
         # Fallback output that respects contract schema (but says unknown)
         return '<answer>{"anomaly_present": "unknown", "top_anomaly": "execution_error", "visual_descriptions": []}</answer>'
-    finally:
-        try:
-            if isinstance(inputs, dict):
-                for k in list(inputs.keys()):
-                    try:
-                        del inputs[k]
-                    except Exception:
-                        pass
-            del inputs
-        except Exception:
-            pass
-        try:
-            del input_ids
-        except Exception:
-            pass
-        try:
-            del decode_ids
-        except Exception:
-            pass
-        try:
-            del gen_ids
-        except Exception:
-            pass
-        _cleanup_cuda_memory()
 
 
 def _vlm_generate_dry(images: Sequence[Any], prompt: str, sample_id: str, seed: int) -> str:
@@ -1599,8 +1634,9 @@ def main() -> int:
                 _cleanup_cuda_memory()
                 continue
             err0 = _take_last_vlm_exception()
-            if err0:
+            while err0:
                 trace.setdefault("inference_errors", []).append({"round": 0, **err0})
+                err0 = _take_last_vlm_exception()
                 
             parsed0, meta0 = _parse_agent_json(raw0)
             trace["turns"].append(
@@ -1710,8 +1746,9 @@ def main() -> int:
             else:
                 raw1 = _vlm_generate(processor, model, [crop_img], prompt_crop, generation_config)
             err1 = _take_last_vlm_exception()
-            if err1:
+            while err1:
                 trace.setdefault("inference_errors", []).append({"round": 1, **err1})
+                err1 = _take_last_vlm_exception()
             parsed1, meta1 = _parse_agent_json(raw1)
             trace["turns"].append(
                 {
@@ -1795,8 +1832,9 @@ def main() -> int:
                     except Exception:
                         raw2 = _vlm_generate(processor, model, [crop_img], prompt_cr, generation_config)
                 err2 = _take_last_vlm_exception()
-                if err2:
+                while err2:
                     trace.setdefault("inference_errors", []).append({"round": 2, **err2})
+                    err2 = _take_last_vlm_exception()
                 if perf_enabled:
                     perf_io_decode_seconds += max(0.0, time.perf_counter() - ref_t0)
                     
