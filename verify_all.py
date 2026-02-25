@@ -447,6 +447,33 @@ def _read_first_model_id_from_csv(csv_path: Path) -> Optional[str]:
         return None
 
 
+def _read_first_model_id_from_trace_zip(ev_zip: Path) -> Optional[str]:
+    try:
+        if not ev_zip.exists() or not ev_zip.is_file():
+            return None
+        with zipfile.ZipFile(ev_zip, "r") as zf:
+            for name in zf.namelist():
+                if not name.endswith("trace.json"):
+                    continue
+                try:
+                    obj = json.load(zf.open(name))
+                    if not isinstance(obj, dict):
+                        continue
+                    fp = obj.get("fingerprint", {})
+                    if isinstance(fp, dict):
+                        mid = str(fp.get("model_id", "") or "").strip()
+                        if mid:
+                            return mid
+                    mid_top = str(obj.get("model_id", "") or "").strip()
+                    if mid_top:
+                        return mid_top
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    return None
+
+
 def _is_placeholder_vlm_model_id(model_id: str) -> bool:
     s = str(model_id or "").strip().lower()
     if not s:
@@ -862,7 +889,10 @@ class AgentInfer06(Stage):
         if ctx.phase2_full_infer:
             if ctx.vlm_model_id:
                 quoted = json.dumps(str(ctx.vlm_model_id), ensure_ascii=False)
-                mr_cfg.write_text(f"vlm_model_id: {quoted}\nrun_name: minireal\n", encoding="utf-8")
+                mr_cfg.write_text(
+                    f"vlm_model_id: {quoted}\nmodel_id: {quoted}\nrun_name: minireal\n",
+                    encoding="utf-8",
+                )
             elif not mr_cfg.exists():
                 mr_cfg.write_text("model_id: distilgpt2\nrun_name: minireal\n", encoding="utf-8")
         elif not mr_cfg.exists():
@@ -1033,11 +1063,16 @@ class AgentInfer06(Stage):
                     out_csv_raw = str(l2_data.get("out_csv", "") or "").strip()
                     if out_csv_raw:
                         actual_model_id = _read_first_model_id_from_csv(Path(out_csv_raw)) or ""
+                if (not actual_model_id) or str(actual_model_id).strip().upper() == "UNKNOWN":
+                    ev06_model_zip, _, _ = resolve_evidence_zip(ev_06)
+                    if ev06_model_zip is not None and ev06_model_zip.exists():
+                        actual_model_id = _read_first_model_id_from_trace_zip(ev06_model_zip) or actual_model_id
                 if not actual_model_id:
                     actual_model_id = "UNKNOWN"
 
                 res.artifacts[f"seed_{seed}_audit_vlm_model_id"] = actual_model_id
-                if "audit_vlm_model_id" not in res.artifacts or not str(res.artifacts.get("audit_vlm_model_id", "")).strip():
+                cur_audit = str(res.artifacts.get("audit_vlm_model_id", "") or "").strip()
+                if (not cur_audit) or cur_audit.upper() == "UNKNOWN":
                     res.artifacts["audit_vlm_model_id"] = actual_model_id
                     res.artifacts["audit_vlm_model_source"] = ctx.vlm_model_source
 
@@ -1998,6 +2033,7 @@ def run_workload(args):
     is_phase1 = args.mode == "phase1_baseline"
     is_phase1_acceptance_only = args.mode == "phase1_acceptance_only"
     is_phase2_full = args.mode == "phase2_full_infer"
+    phase2_seeds_policy = ""
     if is_phase1:
         args.allow_full_dataset = True
         args.seeds = [0, 1, 2]
@@ -2006,10 +2042,15 @@ def run_workload(args):
         args.seeds = [0, 1, 2]
         if args.output_dir is None: args.output_dir = "dist/outputs/phase1_baseline"
     if is_phase2_full:
-        args.allow_full_dataset = True
-        args.max_samples = None
+        if args.max_samples is None:
+            args.allow_full_dataset = True
+        else:
+            args.allow_full_dataset = False
         if args.seeds is None or args.seeds == [42]:
-            args.seeds = [0]
+            args.seeds = [0, 1, 2]
+            phase2_seeds_policy = "default_phase2_align_phase1"
+        else:
+            phase2_seeds_policy = "cli_override"
         if args.output_dir is None:
             args.output_dir = "dist/outputs/phase2_full_infer"
         if str(args.dataset_split).strip().lower() != "train":
@@ -2164,6 +2205,7 @@ def run_workload(args):
     if is_phase2_full:
         res.artifacts["ids_source_note"] = "phase2_full_infer forces full coverage"
         res.artifacts["audit_vlm_model_source"] = phase2_vlm_model_source
+        res.artifacts["audit_seeds_policy"] = phase2_seeds_policy or "cli_override"
         if phase2_vlm_model_id:
             res.artifacts["audit_requested_vlm_model_id"] = phase2_vlm_model_id
         else:
