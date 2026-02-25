@@ -2,6 +2,7 @@
 import sys
 from pathlib import Path
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -61,6 +62,7 @@ MMAD_ROOT_RESOLVED: Optional[Path] = None
 MMAD_ASSET_MODE: str = "unknown"
 _LOCAL_DIR_ENTRY_CACHE: Dict[str, Dict[str, Path]] = {}
 _CHAT_TEXT_CACHE: Dict[Tuple[str, int, str], str] = {}
+_LAST_VLM_EXCEPTION: Optional[Dict[str, str]] = None
 
 
 def _chat_template_key(processor: Any, n_images: int, prompt: str) -> Tuple[str, int, str]:
@@ -585,6 +587,44 @@ def _pil_from_bytes_rgb(b: bytes) -> "PIL.Image.Image":
     return PILImage.open(io.BytesIO(b)).convert("RGB")
 
 
+def _resize_image_max_side(img: "PIL.Image.Image", max_side: int) -> "PIL.Image.Image":
+    try:
+        ms = int(max_side)
+    except Exception:
+        ms = 0
+    if ms <= 0:
+        return img
+    w, h = img.size
+    cur_max = max(int(w), int(h))
+    if cur_max <= ms:
+        return img
+    scale = float(ms) / float(cur_max)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return img.resize((new_w, new_h))
+
+
+def _cleanup_cuda_memory() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+
+def _take_last_vlm_exception() -> Optional[Dict[str, str]]:
+    global _LAST_VLM_EXCEPTION
+    err = _LAST_VLM_EXCEPTION
+    _LAST_VLM_EXCEPTION = None
+    return err
+
+
 def _compute_correct(gt_label: Any, pred_label: Any) -> int:
     gt = _normalize_yesno(gt_label)
     pred = _normalize_yesno(pred_label)
@@ -620,6 +660,12 @@ def _vlm_generate(
     prompt: str,
     generation_config: Any,
 ) -> str:
+    global _LAST_VLM_EXCEPTION
+    _LAST_VLM_EXCEPTION = None
+    inputs = {}
+    gen_ids = None
+    decode_ids = None
+    input_ids = None
     try:
         if model is None:
             return '<answer>{"anomaly_present": "unknown", "top_anomaly": "offline_fallback", "visual_descriptions": []}</answer>'
@@ -635,7 +681,6 @@ def _vlm_generate(
             if hasattr(im, "convert") and mode not in {None, "RGB"}:
                 imgs[i] = im.convert("RGB")
         
-        inputs = {}
         try:
             if hasattr(processor, "apply_chat_template") and getattr(processor, "chat_template", None):
                 try:
@@ -675,7 +720,10 @@ def _vlm_generate(
 
         inputs = {k: (v.to(model_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
         with torch.inference_mode():
-            gen_ids = model.generate(**inputs, generation_config=generation_config)
+            try:
+                gen_ids = model.generate(**inputs, generation_config=generation_config, use_cache=False)
+            except TypeError:
+                gen_ids = model.generate(**inputs, generation_config=generation_config)
         input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else None
         decode_ids = gen_ids
         if input_ids is not None and hasattr(input_ids, "shape") and hasattr(gen_ids, "shape"):
@@ -692,8 +740,36 @@ def _vlm_generate(
         print(f"DEBUG: _vlm_generate exception: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
+        _LAST_VLM_EXCEPTION = {
+            "type": type(e).__name__,
+            "message": str(e),
+        }
         # Fallback output that respects contract schema (but says unknown)
         return '<answer>{"anomaly_present": "unknown", "top_anomaly": "execution_error", "visual_descriptions": []}</answer>'
+    finally:
+        try:
+            if isinstance(inputs, dict):
+                for k in list(inputs.keys()):
+                    try:
+                        del inputs[k]
+                    except Exception:
+                        pass
+            del inputs
+        except Exception:
+            pass
+        try:
+            del input_ids
+        except Exception:
+            pass
+        try:
+            del decode_ids
+        except Exception:
+            pass
+        try:
+            del gen_ids
+        except Exception:
+            pass
+        _cleanup_cuda_memory()
 
 
 def _vlm_generate_dry(images: Sequence[Any], prompt: str, sample_id: str, seed: int) -> str:
@@ -784,6 +860,7 @@ def main() -> int:
     parser.add_argument("--local_files_only", type=str, default=None, help="Force local files only (true/false/1/0)")
     parser.add_argument("--allow_full_dataset", action="store_true", help="Allow full dataset traversal")
     parser.add_argument("--perf", default=None, type=str, help="Enable lightweight perf summary (true/false/1/0/yes/no/on/off).")
+    parser.add_argument("--vlm-max-side", type=int, default=None, dest="vlm_max_side", help="Resize input image so long side <= this value before VLM inference.")
     args = parser.parse_args()
 
     from agentiad_repro.utils import ensure_dir, load_paths, sha256_text, utc_now_iso, write_json
@@ -821,6 +898,7 @@ def main() -> int:
     device_map = cfg.get("device_map", None)
     torch_dtype = cfg.get("torch_dtype", None)
     max_new_tokens = int(args.max_new_tokens) if args.max_new_tokens is not None else int(cfg.get("max_new_tokens", 64))
+    vlm_max_side = int(args.vlm_max_side) if args.vlm_max_side is not None else int(cfg.get("vlm_max_side", 768))
     gt_key_override = str(cfg.get("gt_key", "")).strip() or None
 
     # Use SSOT Prompt
@@ -1103,6 +1181,11 @@ def main() -> int:
                 model = None
 
         if model is not None:
+            try:
+                if hasattr(model, "config") and model.config is not None:
+                    model.config.use_cache = False
+            except Exception:
+                pass
             if not use_cuda:
                 model = model.to(device)
 
@@ -1116,6 +1199,16 @@ def main() -> int:
                     return 2
             elif not accelerate_available:
                 model = model.to(device)
+            try:
+                if hasattr(model, "generation_config") and model.generation_config is not None:
+                    model.generation_config.use_cache = False
+            except Exception:
+                pass
+            try:
+                if hasattr(model, "config") and model.config is not None:
+                    model.config.use_cache = False
+            except Exception:
+                pass
             model.eval()
         _ensure_pad_token_id_explicit(processor, model, generation_config)
 
@@ -1124,6 +1217,7 @@ def main() -> int:
             do_sample=False,
             temperature=0.0,
             top_p=1.0,
+            use_cache=False,
         )
         _ensure_pad_token_id_explicit(processor, model, generation_config)
 
@@ -1419,6 +1513,7 @@ def main() -> int:
             for field_name, field_value in image_candidates:
                 try:
                     img = _decode_hf_image(dataset_id, field_value).convert("RGB")
+                    img = _resize_image_max_side(img, vlm_max_side)
                     image_field_used = field_name
                     qv = field_value
                     break
@@ -1488,6 +1583,7 @@ def main() -> int:
                     "query_image_type": type(qv).__name__,
                     "image_mode": getattr(img, "mode", None),
                     "image_size": list(getattr(img, "size", (None, None))),
+                    "vlm_max_side": int(vlm_max_side),
                 },
                 "turns": [],
             }
@@ -1500,7 +1596,11 @@ def main() -> int:
             except Exception as e:
                 n_skipped += 1
                 skip_reasons["inference_exception"] = skip_reasons.get("inference_exception", 0) + 1
+                _cleanup_cuda_memory()
                 continue
+            err0 = _take_last_vlm_exception()
+            if err0:
+                trace.setdefault("inference_errors", []).append({"round": 0, **err0})
                 
             parsed0, meta0 = _parse_agent_json(raw0)
             trace["turns"].append(
@@ -1566,6 +1666,7 @@ def main() -> int:
                          pbar.update(1)
                      elif progress_fallback:
                          _stderr_progress(len(rows), progress_total)
+                _cleanup_cuda_memory()
                 continue
 
             # Tool Execution Logic (PZ -> CR)
@@ -1600,6 +1701,7 @@ def main() -> int:
                 crop_img = _pil_from_bytes_rgb(pz_bytes)
             except Exception:
                 crop_img = img
+            crop_img = _resize_image_max_side(crop_img, vlm_max_side)
             if perf_enabled:
                 perf_io_decode_seconds += max(0.0, time.perf_counter() - pz_t0)
 
@@ -1607,6 +1709,9 @@ def main() -> int:
                 raw1 = _vlm_generate_dry([crop_img], prompt_crop, sample_id, seed)
             else:
                 raw1 = _vlm_generate(processor, model, [crop_img], prompt_crop, generation_config)
+            err1 = _take_last_vlm_exception()
+            if err1:
+                trace.setdefault("inference_errors", []).append({"round": 1, **err1})
             parsed1, meta1 = _parse_agent_json(raw1)
             trace["turns"].append(
                 {
@@ -1676,6 +1781,7 @@ def main() -> int:
                         if ref_bytes is None:
                             raise RuntimeError("ref bytes unavailable")
                         ref_img = _pil_from_bytes_rgb(ref_bytes)
+                        ref_img = _resize_image_max_side(ref_img, vlm_max_side)
                         raw2 = _vlm_generate_dry([crop_img, ref_img], prompt_cr, sample_id, seed)
                     except Exception:
                         raw2 = _vlm_generate_dry([crop_img, crop_img], prompt_cr, sample_id, seed)
@@ -1684,9 +1790,13 @@ def main() -> int:
                         if ref_bytes is None:
                             raise RuntimeError("ref bytes unavailable")
                         ref_img = _pil_from_bytes_rgb(ref_bytes)
+                        ref_img = _resize_image_max_side(ref_img, vlm_max_side)
                         raw2 = _vlm_generate(processor, model, [crop_img, ref_img], prompt_cr, generation_config)
                     except Exception:
                         raw2 = _vlm_generate(processor, model, [crop_img], prompt_cr, generation_config)
+                err2 = _take_last_vlm_exception()
+                if err2:
+                    trace.setdefault("inference_errors", []).append({"round": 2, **err2})
                 if perf_enabled:
                     perf_io_decode_seconds += max(0.0, time.perf_counter() - ref_t0)
                     
@@ -1765,6 +1875,7 @@ def main() -> int:
                     pbar.update(1)
                 elif progress_fallback:
                     _stderr_progress(len(rows), progress_total)
+            _cleanup_cuda_memory()
 
         import pandas as pd
 

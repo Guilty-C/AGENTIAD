@@ -474,6 +474,51 @@ def _read_first_model_id_from_trace_zip(ev_zip: Path) -> Optional[str]:
     return None
 
 
+def _count_phase2_execution_errors_from_zip(ev_zip: Path, csv_name: str) -> Dict[str, int]:
+    out = {
+        "execution_error_count": 0,
+        "unknown_count": 0,
+        "strict_schema_invalid_count": 0,
+        "rows_total": 0,
+    }
+    try:
+        if not ev_zip.exists() or not ev_zip.is_file():
+            return out
+        with zipfile.ZipFile(ev_zip, "r") as zf:
+            if csv_name not in zf.namelist():
+                return out
+            content = zf.read(csv_name).decode("utf-8", errors="replace")
+            reader = csv.DictReader(content.splitlines())
+            for row in reader:
+                out["rows_total"] += 1
+                raw_output = str((row or {}).get("raw_output", "") or "").strip()
+                if not raw_output:
+                    out["strict_schema_invalid_count"] += 1
+                    continue
+                try:
+                    raw_obj = json.loads(raw_output)
+                except Exception:
+                    out["strict_schema_invalid_count"] += 1
+                    continue
+                final_obj = raw_obj.get("final") if isinstance(raw_obj, dict) else None
+                if not isinstance(final_obj, dict):
+                    out["strict_schema_invalid_count"] += 1
+                    continue
+                anomaly = str(final_obj.get("anomaly", "") or "").strip().lower()
+                defect_type = str(final_obj.get("defect_type", "") or "").strip().lower()
+                required_keys_ok = all(k in final_obj for k in ["anomaly", "bbox", "defect_type", "confidence"])
+                anomaly_ok = anomaly in {"yes", "no", "unknown"}
+                if not required_keys_ok or not anomaly_ok:
+                    out["strict_schema_invalid_count"] += 1
+                if anomaly == "unknown":
+                    out["unknown_count"] += 1
+                if defect_type == "execution_error":
+                    out["execution_error_count"] += 1
+    except Exception:
+        return out
+    return out
+
+
 def _is_placeholder_vlm_model_id(model_id: str) -> bool:
     s = str(model_id or "").strip().lower()
     if not s:
@@ -1128,6 +1173,35 @@ class AgentInfer06(Stage):
                     })
                 res.measurements["evidence_check_sec"] = res.measurements.get("evidence_check_sec", 0.0) + dur
                 if code != "OK": res.success = False; res.errors.append(f"S{seed}-06 Evidence: {msg}")
+                if ctx.phase2_full_infer and ev06_zip is not None and ev06_zip.exists():
+                    csv_name = f"tables/agentiad_infer_mr_s{seed}.csv"
+                    phase2_counts = _count_phase2_execution_errors_from_zip(ev06_zip, csv_name)
+                    exec_cnt = int(phase2_counts.get("execution_error_count", 0))
+                    unknown_cnt = int(phase2_counts.get("unknown_count", 0))
+                    schema_bad_cnt = int(phase2_counts.get("strict_schema_invalid_count", 0))
+                    res.artifacts[f"seed_{seed}_execution_error_count"] = exec_cnt
+                    res.artifacts[f"seed_{seed}_unknown_count"] = unknown_cnt
+                    res.artifacts[f"seed_{seed}_strict_schema_invalid_count"] = schema_bad_cnt
+                    res.artifacts["execution_error_count"] = int(res.artifacts.get("execution_error_count", 0)) + exec_cnt
+                    res.artifacts["unknown_count"] = int(res.artifacts.get("unknown_count", 0)) + unknown_cnt
+                    res.artifacts["strict_schema_invalid_count"] = int(res.artifacts.get("strict_schema_invalid_count", 0)) + schema_bad_cnt
+                    print(
+                        f"[Phase2Audit] seed={seed} execution_error_count={exec_cnt} unknown_count={unknown_cnt} strict_schema_invalid_count={schema_bad_cnt}",
+                        file=sys.stderr,
+                    )
+                    if exec_cnt > 0 or unknown_cnt > 0 or schema_bad_cnt > 0:
+                        remediation = (
+                            "Phase2 hard gate failed. Reduce VLM memory pressure via --vlm-max-side (e.g. 640), "
+                            "and verify GPU memory/driver stability."
+                        )
+                        res.success = False
+                        res.gates["J2"] = False
+                        res.errors.append(
+                            f"S{seed}-06 hard-fail: execution_error_count={exec_cnt}, unknown_count={unknown_cnt}, strict_schema_invalid_count={schema_bad_cnt}. {remediation}"
+                        )
+                        if remediation not in res.remediations:
+                            res.remediations.append(remediation)
+                        return
 
 class BuildTraj08(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
@@ -2206,6 +2280,9 @@ def run_workload(args):
         res.artifacts["ids_source_note"] = "phase2_full_infer forces full coverage"
         res.artifacts["audit_vlm_model_source"] = phase2_vlm_model_source
         res.artifacts["audit_seeds_policy"] = phase2_seeds_policy or "cli_override"
+        res.artifacts["execution_error_count"] = 0
+        res.artifacts["unknown_count"] = 0
+        res.artifacts["strict_schema_invalid_count"] = 0
         if phase2_vlm_model_id:
             res.artifacts["audit_requested_vlm_model_id"] = phase2_vlm_model_id
         else:
