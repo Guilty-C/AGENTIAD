@@ -610,6 +610,10 @@ def _cleanup_cuda_memory() -> None:
         import torch
 
         if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
             torch.cuda.empty_cache()
     except Exception:
         pass
@@ -625,15 +629,6 @@ def _take_last_vlm_exception() -> Optional[Dict[str, Any]]:
         return None
     err = _LAST_VLM_EXCEPTIONS.pop(0)
     return err
-
-
-def _is_retryable_vlm_error(exc: Exception) -> bool:
-    s = str(exc or "").strip().lower()
-    return (
-        ("out of memory" in s)
-        or ("cuda driver error: invalid argument" in s)
-        or ("device kernel image is invalid" in s)
-    )
 
 
 def _compute_correct(gt_label: Any, pred_label: Any) -> int:
@@ -670,6 +665,8 @@ def _vlm_generate(
     images: Sequence["PIL.Image.Image"],
     prompt: str,
     generation_config: Any,
+    sdp_backend: str = "auto",
+    max_retries: int = 2,
 ) -> str:
     global _LAST_VLM_EXCEPTIONS
     _LAST_VLM_EXCEPTIONS = []
@@ -728,7 +725,7 @@ def _vlm_generate(
             inputs = processor(text=[prompt], return_tensors="pt")
         return {k: (v.to(model_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
 
-    def _run_once(local_imgs: Sequence["PIL.Image.Image"], conservative_sdp: bool) -> str:
+    def _run_once(local_imgs: Sequence["PIL.Image.Image"], use_math_sdp: bool) -> str:
         inputs: Dict[str, Any] = {}
         gen_ids = None
         decode_ids = None
@@ -736,7 +733,7 @@ def _vlm_generate(
         try:
             inputs = _prepare_inputs(local_imgs)
             sdp_ctx = nullcontext()
-            if conservative_sdp:
+            if use_math_sdp:
                 try:
                     sdp_kernel = getattr(getattr(torch.backends, "cuda", None), "sdp_kernel", None)
                     if callable(sdp_kernel):
@@ -786,25 +783,19 @@ def _vlm_generate(
                 pass
             _cleanup_cuda_memory()
 
-    try:
-        return _run_once(imgs, conservative_sdp=False)
-    except Exception as e1:
-        print(f"DEBUG: _vlm_generate attempt1 exception: {e1}", file=sys.stderr)
-        _record_exc(1, e1)
-        if _is_retryable_vlm_error(e1):
+    retries = max(0, int(max_retries))
+    for attempt in range(retries + 1):
+        try:
+            use_math = str(sdp_backend).strip().lower() == "math"
+            out = _run_once(imgs, use_math_sdp=use_math)
+            _LAST_VLM_EXCEPTIONS = []
+            return out
+        except Exception as e:
+            print(f"DEBUG: _vlm_generate attempt{attempt} exception: {e}", file=sys.stderr)
+            _record_exc(attempt, e)
             _cleanup_cuda_memory()
-            retry_imgs = [_resize_image_max_side(im, 512) for im in imgs]
-            try:
-                out = _run_once(retry_imgs, conservative_sdp=True)
-                _LAST_VLM_EXCEPTIONS = []
-                return out
-            except Exception as e2:
-                print(f"DEBUG: _vlm_generate attempt2 exception: {e2}", file=sys.stderr)
-                _record_exc(2, e2)
-                # Fallback output that respects contract schema (but says unknown)
-                return '<answer>{"anomaly_present": "unknown", "top_anomaly": "execution_error", "visual_descriptions": []}</answer>'
-        # Fallback output that respects contract schema (but says unknown)
-        return '<answer>{"anomaly_present": "unknown", "top_anomaly": "execution_error", "visual_descriptions": []}</answer>'
+    # Fallback output that respects contract schema (but says unknown)
+    return '<answer>{"anomaly_present": "unknown", "top_anomaly": "execution_error", "visual_descriptions": []}</answer>'
 
 
 def _vlm_generate_dry(images: Sequence[Any], prompt: str, sample_id: str, seed: int) -> str:
@@ -896,6 +887,8 @@ def main() -> int:
     parser.add_argument("--allow_full_dataset", action="store_true", help="Allow full dataset traversal")
     parser.add_argument("--perf", default=None, type=str, help="Enable lightweight perf summary (true/false/1/0/yes/no/on/off).")
     parser.add_argument("--vlm-max-side", type=int, default=None, dest="vlm_max_side", help="Resize input image so long side <= this value before VLM inference.")
+    parser.add_argument("--sdp-backend", type=str, default=None, dest="sdp_backend", help="SDP backend policy: auto or math")
+    parser.add_argument("--vlm-retry-n", type=int, default=None, dest="vlm_retry_n", help="VLM retries after first attempt (0 means no retry)")
     args = parser.parse_args()
 
     from agentiad_repro.utils import ensure_dir, load_paths, sha256_text, utc_now_iso, write_json
@@ -934,6 +927,23 @@ def main() -> int:
     torch_dtype = cfg.get("torch_dtype", None)
     max_new_tokens = int(args.max_new_tokens) if args.max_new_tokens is not None else int(cfg.get("max_new_tokens", 64))
     vlm_max_side = int(args.vlm_max_side) if args.vlm_max_side is not None else int(cfg.get("vlm_max_side", 768))
+    env_sdp_backend = str(os.environ.get("VLM_SDP_BACKEND", "auto") or "auto").strip().lower()
+    cfg_sdp_backend = str(cfg.get("sdp_backend", "") or "").strip().lower()
+    cli_sdp_backend = str(args.sdp_backend or "").strip().lower()
+    sdp_backend = cli_sdp_backend or cfg_sdp_backend or env_sdp_backend or "auto"
+    if sdp_backend not in {"auto", "math"}:
+        sdp_backend = "auto"
+    env_retry_raw = str(os.environ.get("VLM_MAX_RETRIES", "") or "").strip()
+    cfg_retry_raw = cfg.get("max_retries", None)
+    if args.vlm_retry_n is not None:
+        max_retries = int(args.vlm_retry_n)
+    elif cfg_retry_raw is not None and str(cfg_retry_raw).strip() != "":
+        max_retries = int(cfg_retry_raw)
+    elif env_retry_raw:
+        max_retries = int(env_retry_raw)
+    else:
+        max_retries = 2
+    max_retries = max(0, int(max_retries))
     gt_key_override = str(cfg.get("gt_key", "")).strip() or None
 
     # Use SSOT Prompt
@@ -1611,6 +1621,9 @@ def main() -> int:
                     "config_hash": config_hash,
                     "git_commit": git_commit,
                     "uncertainty_rule": cr_rule,
+                    "vlm_max_side": int(vlm_max_side),
+                    "sdp_backend": str(sdp_backend),
+                    "max_retries": int(max_retries),
                 },
                 "input": {
                     "query_image": qv if isinstance(qv, str) else "<in_memory_image>",
@@ -1627,7 +1640,7 @@ def main() -> int:
                 if args.dry_run:
                     raw0 = _vlm_generate_dry([img], prompt_global, sample_id, seed)
                 else:
-                    raw0 = _vlm_generate(processor, model, [img], prompt_global, generation_config)
+                    raw0 = _vlm_generate(processor, model, [img], prompt_global, generation_config, sdp_backend=sdp_backend, max_retries=max_retries)
             except Exception as e:
                 n_skipped += 1
                 skip_reasons["inference_exception"] = skip_reasons.get("inference_exception", 0) + 1
@@ -1744,7 +1757,7 @@ def main() -> int:
             if args.dry_run:
                 raw1 = _vlm_generate_dry([crop_img], prompt_crop, sample_id, seed)
             else:
-                raw1 = _vlm_generate(processor, model, [crop_img], prompt_crop, generation_config)
+                raw1 = _vlm_generate(processor, model, [crop_img], prompt_crop, generation_config, sdp_backend=sdp_backend, max_retries=max_retries)
             err1 = _take_last_vlm_exception()
             while err1:
                 trace.setdefault("inference_errors", []).append({"round": 1, **err1})
@@ -1828,9 +1841,9 @@ def main() -> int:
                             raise RuntimeError("ref bytes unavailable")
                         ref_img = _pil_from_bytes_rgb(ref_bytes)
                         ref_img = _resize_image_max_side(ref_img, vlm_max_side)
-                        raw2 = _vlm_generate(processor, model, [crop_img, ref_img], prompt_cr, generation_config)
+                        raw2 = _vlm_generate(processor, model, [crop_img, ref_img], prompt_cr, generation_config, sdp_backend=sdp_backend, max_retries=max_retries)
                     except Exception:
-                        raw2 = _vlm_generate(processor, model, [crop_img], prompt_cr, generation_config)
+                        raw2 = _vlm_generate(processor, model, [crop_img], prompt_cr, generation_config, sdp_backend=sdp_backend, max_retries=max_retries)
                 err2 = _take_last_vlm_exception()
                 while err2:
                     trace.setdefault("inference_errors", []).append({"round": 2, **err2})

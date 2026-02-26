@@ -56,6 +56,8 @@ class StageContext:
     vlm_model_id: Optional[str] = None
     vlm_model_source: str = "config"
     vlm_max_side: Optional[int] = None
+    sdp_backend: Optional[str] = None
+    vlm_retry_n: Optional[int] = None
     scripts_dir: Path = field(default_factory=lambda: DIST_SCRIPTS)
     cached_cfg_max_samples: Optional[int] = None
 
@@ -947,13 +949,33 @@ class AgentInfer06(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
         mr_cfg = ctx.work_dir / "mr_config.yaml"
         if ctx.phase2_full_infer:
+            cfg_obj: Dict[str, Any] = {}
+            if mr_cfg.exists():
+                try:
+                    import yaml
+
+                    loaded = yaml.safe_load(mr_cfg.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        cfg_obj = dict(loaded)
+                except Exception:
+                    cfg_obj = {}
             if ctx.vlm_model_id:
-                quoted = json.dumps(str(ctx.vlm_model_id), ensure_ascii=False)
-                mr_cfg.write_text(
-                    f"vlm_model_id: {quoted}\nmodel_id: {quoted}\nrun_name: minireal\n",
-                    encoding="utf-8",
-                )
-            elif not mr_cfg.exists():
+                cfg_obj["vlm_model_id"] = str(ctx.vlm_model_id)
+                cfg_obj["model_id"] = str(ctx.vlm_model_id)
+            elif "model_id" not in cfg_obj and "vlm_model_id" not in cfg_obj:
+                cfg_obj["model_id"] = "distilgpt2"
+            if ctx.vlm_max_side is not None:
+                cfg_obj["vlm_max_side"] = int(ctx.vlm_max_side)
+            if ctx.sdp_backend is not None:
+                cfg_obj["sdp_backend"] = str(ctx.sdp_backend)
+            if ctx.vlm_retry_n is not None:
+                cfg_obj["max_retries"] = int(ctx.vlm_retry_n)
+            cfg_obj["run_name"] = "minireal"
+            try:
+                import yaml
+
+                mr_cfg.write_text(yaml.safe_dump(cfg_obj, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            except Exception:
                 mr_cfg.write_text("model_id: distilgpt2\nrun_name: minireal\n", encoding="utf-8")
         elif not mr_cfg.exists():
             mr_cfg.write_text("model_id: distilgpt2\nrun_name: minireal\n", encoding="utf-8")
@@ -971,6 +993,10 @@ class AgentInfer06(Stage):
                 cmd.arg("--split", ctx.dataset_split)
                 if ctx.phase2_full_infer and ctx.vlm_max_side is not None:
                     cmd.arg("--vlm-max-side", int(ctx.vlm_max_side))
+                if ctx.phase2_full_infer and ctx.sdp_backend is not None:
+                    cmd.arg("--sdp-backend", str(ctx.sdp_backend))
+                if ctx.phase2_full_infer and ctx.vlm_retry_n is not None:
+                    cmd.arg("--vlm-retry-n", int(ctx.vlm_retry_n))
                 
                 if ctx.phase1_baseline:
                     cmd.arg("--enable_tools", "false")
@@ -2285,6 +2311,8 @@ def run_workload(args):
         vlm_model_id=phase2_vlm_model_id,
         vlm_model_source=phase2_vlm_model_source,
         vlm_max_side=args.vlm_max_side,
+        sdp_backend=args.sdp_backend,
+        vlm_retry_n=args.vlm_retry_n,
     )
     
     res = StageResult()
@@ -2301,6 +2329,9 @@ def run_workload(args):
         res.artifacts["execution_error_count"] = 0
         res.artifacts["unknown_count"] = 0
         res.artifacts["strict_schema_invalid_count"] = 0
+        res.artifacts["audit_vlm_max_side"] = args.vlm_max_side
+        res.artifacts["audit_sdp_backend"] = args.sdp_backend
+        res.artifacts["audit_vlm_retry_n"] = args.vlm_retry_n
         if phase2_vlm_model_id:
             res.artifacts["audit_requested_vlm_model_id"] = phase2_vlm_model_id
         else:
@@ -2446,6 +2477,8 @@ def build_arg_parser():
     parser.add_argument("--vlm-model-id", type=str, default=None, dest="vlm_model_id", help="Explicit VLM model id (repo id or local path)")
     parser.add_argument("--vlm-model-local-dir", type=str, default=None, dest="vlm_model_local_dir", help="Explicit local VLM model directory; higher priority than --vlm-model-id")
     parser.add_argument("--vlm-max-side", type=int, default=None, dest="vlm_max_side", help="Override VLM max image side for phase2 infer")
+    parser.add_argument("--sdp-backend", type=str, default=None, dest="sdp_backend", help="Override SDP backend for phase2 infer (auto/math)")
+    parser.add_argument("--vlm-retry-n", type=int, default=None, dest="vlm_retry_n", help="Override VLM retry count for phase2 infer")
     parser.add_argument("--sentinel-ref", type=str, default="", dest="sentinel_ref", help="Sentinel reference directory")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Random seeds")
     return parser
