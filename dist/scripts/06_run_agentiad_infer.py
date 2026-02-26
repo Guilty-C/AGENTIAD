@@ -631,6 +631,25 @@ def _take_last_vlm_exception() -> Optional[Dict[str, Any]]:
     return err
 
 
+def _sdp_context(torch_mod: Any, backend: str):
+    b = str(backend or "auto").strip().lower()
+    if b == "auto":
+        return nullcontext()
+    try:
+        sdp_kernel = getattr(getattr(torch_mod.backends, "cuda", None), "sdp_kernel", None)
+        if not callable(sdp_kernel):
+            return nullcontext()
+        if b == "math":
+            return sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+        if b == "flash":
+            return sdp_kernel(enable_flash=True, enable_mem_efficient=False, enable_math=False)
+        if b == "mem_efficient":
+            return sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=False)
+    except Exception:
+        return nullcontext()
+    return nullcontext()
+
+
 def _compute_correct(gt_label: Any, pred_label: Any) -> int:
     gt = _normalize_yesno(gt_label)
     pred = _normalize_yesno(pred_label)
@@ -725,21 +744,14 @@ def _vlm_generate(
             inputs = processor(text=[prompt], return_tensors="pt")
         return {k: (v.to(model_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
 
-    def _run_once(local_imgs: Sequence["PIL.Image.Image"], use_math_sdp: bool) -> str:
+    def _run_once(local_imgs: Sequence["PIL.Image.Image"], backend_for_attempt: str) -> str:
         inputs: Dict[str, Any] = {}
         gen_ids = None
         decode_ids = None
         input_ids = None
         try:
             inputs = _prepare_inputs(local_imgs)
-            sdp_ctx = nullcontext()
-            if use_math_sdp:
-                try:
-                    sdp_kernel = getattr(getattr(torch.backends, "cuda", None), "sdp_kernel", None)
-                    if callable(sdp_kernel):
-                        sdp_ctx = sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
-                except Exception:
-                    sdp_ctx = nullcontext()
+            sdp_ctx = _sdp_context(torch, backend_for_attempt)
             with torch.inference_mode():
                 with sdp_ctx:
                     try:
@@ -786,8 +798,7 @@ def _vlm_generate(
     retries = max(0, int(max_retries))
     for attempt in range(retries + 1):
         try:
-            use_math = str(sdp_backend).strip().lower() == "math"
-            out = _run_once(imgs, use_math_sdp=use_math)
+            out = _run_once(imgs, backend_for_attempt=sdp_backend)
             _LAST_VLM_EXCEPTIONS = []
             return out
         except Exception as e:
@@ -887,8 +898,8 @@ def main() -> int:
     parser.add_argument("--allow_full_dataset", action="store_true", help="Allow full dataset traversal")
     parser.add_argument("--perf", default=None, type=str, help="Enable lightweight perf summary (true/false/1/0/yes/no/on/off).")
     parser.add_argument("--vlm-max-side", type=int, default=None, dest="vlm_max_side", help="Resize input image so long side <= this value before VLM inference.")
-    parser.add_argument("--sdp-backend", type=str, default=None, dest="sdp_backend", help="SDP backend policy: auto or math")
-    parser.add_argument("--vlm-retry-n", type=int, default=None, dest="vlm_retry_n", help="VLM retries after first attempt (0 means no retry)")
+    parser.add_argument("--sdp-backend", type=str, default="auto", dest="sdp_backend", help="SDP backend policy: auto, math, flash, mem_efficient")
+    parser.add_argument("--vlm-retry-n", type=int, default=2, dest="vlm_retry_n", help="VLM retries after first attempt (0 means no retry)")
     args = parser.parse_args()
 
     from agentiad_repro.utils import ensure_dir, load_paths, sha256_text, utc_now_iso, write_json
@@ -931,10 +942,10 @@ def main() -> int:
     cfg_sdp_backend = str(cfg.get("sdp_backend", "") or "").strip().lower()
     cli_sdp_backend = str(args.sdp_backend or "").strip().lower()
     sdp_backend = cli_sdp_backend or cfg_sdp_backend or env_sdp_backend or "auto"
-    if sdp_backend not in {"auto", "math"}:
+    if sdp_backend not in {"auto", "math", "flash", "mem_efficient"}:
         sdp_backend = "auto"
     env_retry_raw = str(os.environ.get("VLM_MAX_RETRIES", "") or "").strip()
-    cfg_retry_raw = cfg.get("max_retries", None)
+    cfg_retry_raw = cfg.get("vlm_retry_n", cfg.get("max_retries", None))
     if args.vlm_retry_n is not None:
         max_retries = int(args.vlm_retry_n)
     elif cfg_retry_raw is not None and str(cfg_retry_raw).strip() != "":
@@ -1647,11 +1658,16 @@ def main() -> int:
                 _cleanup_cuda_memory()
                 continue
             err0 = _take_last_vlm_exception()
+            errs0: List[Dict[str, Any]] = []
             while err0:
-                trace.setdefault("inference_errors", []).append({"round": 0, **err0})
+                errs0.append({"round": 0, **err0})
                 err0 = _take_last_vlm_exception()
                 
             parsed0, meta0 = _parse_agent_json(raw0)
+            if not isinstance(meta0, dict):
+                meta0 = {}
+            if errs0:
+                meta0["inference_errors"] = errs0
             trace["turns"].append(
                 {
                     "round": 0,
@@ -1759,10 +1775,15 @@ def main() -> int:
             else:
                 raw1 = _vlm_generate(processor, model, [crop_img], prompt_crop, generation_config, sdp_backend=sdp_backend, max_retries=max_retries)
             err1 = _take_last_vlm_exception()
+            errs1: List[Dict[str, Any]] = []
             while err1:
-                trace.setdefault("inference_errors", []).append({"round": 1, **err1})
+                errs1.append({"round": 1, **err1})
                 err1 = _take_last_vlm_exception()
             parsed1, meta1 = _parse_agent_json(raw1)
+            if not isinstance(meta1, dict):
+                meta1 = {}
+            if errs1:
+                meta1["inference_errors"] = errs1
             trace["turns"].append(
                 {
                     "round": 1,
@@ -1845,14 +1866,19 @@ def main() -> int:
                     except Exception:
                         raw2 = _vlm_generate(processor, model, [crop_img], prompt_cr, generation_config, sdp_backend=sdp_backend, max_retries=max_retries)
                 err2 = _take_last_vlm_exception()
+                errs2: List[Dict[str, Any]] = []
                 while err2:
-                    trace.setdefault("inference_errors", []).append({"round": 2, **err2})
+                    errs2.append({"round": 2, **err2})
                     err2 = _take_last_vlm_exception()
                 if perf_enabled:
                     perf_io_decode_seconds += max(0.0, time.perf_counter() - ref_t0)
                     
 
                 parsed2, meta2 = _parse_agent_json(raw2)
+                if not isinstance(meta2, dict):
+                    meta2 = {}
+                if errs2:
+                    meta2["inference_errors"] = errs2
                 trace["turns"].append(
                     {
                         "round": 2,

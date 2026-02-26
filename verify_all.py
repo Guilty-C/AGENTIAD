@@ -58,6 +58,9 @@ class StageContext:
     vlm_max_side: Optional[int] = None
     sdp_backend: Optional[str] = None
     vlm_retry_n: Optional[int] = None
+    vlm_max_side_source: str = "default"
+    sdp_backend_source: str = "default"
+    vlm_retry_n_source: str = "default"
     scripts_dir: Path = field(default_factory=lambda: DIST_SCRIPTS)
     cached_cfg_max_samples: Optional[int] = None
 
@@ -969,7 +972,7 @@ class AgentInfer06(Stage):
             if ctx.sdp_backend is not None:
                 cfg_obj["sdp_backend"] = str(ctx.sdp_backend)
             if ctx.vlm_retry_n is not None:
-                cfg_obj["max_retries"] = int(ctx.vlm_retry_n)
+                cfg_obj["vlm_retry_n"] = int(ctx.vlm_retry_n)
             cfg_obj["run_name"] = "minireal"
             try:
                 import yaml
@@ -2151,6 +2154,12 @@ def run_workload(args):
     is_phase1_acceptance_only = args.mode == "phase1_acceptance_only"
     is_phase2_full = args.mode == "phase2_full_infer"
     phase2_seeds_policy = ""
+    phase2_vlm_max_side = int(args.vlm_max_side)
+    phase2_sdp_backend = str(args.sdp_backend or "auto").strip().lower()
+    phase2_vlm_retry_n = int(args.vlm_retry_n)
+    phase2_vlm_max_side_source = "default"
+    phase2_sdp_backend_source = "default"
+    phase2_vlm_retry_n_source = "default"
     if is_phase1:
         args.allow_full_dataset = True
         args.seeds = [0, 1, 2]
@@ -2196,6 +2205,40 @@ def run_workload(args):
     phase2_vlm_model_id: Optional[str] = None
     phase2_vlm_model_source = "config"
     if is_phase2_full:
+        argv = [str(x) for x in sys.argv]
+        has_vlm_max_side_cli = "--vlm-max-side" in argv
+        has_sdp_backend_cli = "--sdp-backend" in argv
+        has_vlm_retry_n_cli = "--vlm-retry-n" in argv
+        if has_vlm_max_side_cli:
+            phase2_vlm_max_side_source = "cli"
+        if has_sdp_backend_cli:
+            phase2_sdp_backend_source = "cli"
+        if has_vlm_retry_n_cli:
+            phase2_vlm_retry_n_source = "cli"
+        mr_cfg_existing = Path(args.output_dir).resolve() / "mr_config.yaml"
+        if mr_cfg_existing.exists() and (not has_vlm_max_side_cli or not has_sdp_backend_cli or not has_vlm_retry_n_cli):
+            try:
+                import yaml
+
+                loaded_cfg = yaml.safe_load(mr_cfg_existing.read_text(encoding="utf-8"))
+                if isinstance(loaded_cfg, dict):
+                    if (not has_vlm_max_side_cli) and ("vlm_max_side" in loaded_cfg):
+                        phase2_vlm_max_side = int(loaded_cfg.get("vlm_max_side"))
+                        phase2_vlm_max_side_source = "config"
+                    if (not has_sdp_backend_cli) and ("sdp_backend" in loaded_cfg):
+                        phase2_sdp_backend = str(loaded_cfg.get("sdp_backend") or "auto").strip().lower()
+                        phase2_sdp_backend_source = "config"
+                    if (not has_vlm_retry_n_cli):
+                        if "vlm_retry_n" in loaded_cfg:
+                            phase2_vlm_retry_n = int(loaded_cfg.get("vlm_retry_n"))
+                            phase2_vlm_retry_n_source = "config"
+                        elif "max_retries" in loaded_cfg:
+                            phase2_vlm_retry_n = int(loaded_cfg.get("max_retries"))
+                            phase2_vlm_retry_n_source = "config"
+            except Exception:
+                pass
+        if phase2_sdp_backend not in {"auto", "math", "flash", "mem_efficient"}:
+            phase2_sdp_backend = "auto"
         cli_local = str(args.vlm_model_local_dir or "").strip()
         cli_id = str(args.vlm_model_id or "").strip()
         env_local = str(os.environ.get("VLM_MODEL_LOCAL_DIR", "") or "").strip()
@@ -2310,9 +2353,12 @@ def run_workload(args):
         env_overrides=env_overrides,
         vlm_model_id=phase2_vlm_model_id,
         vlm_model_source=phase2_vlm_model_source,
-        vlm_max_side=args.vlm_max_side,
-        sdp_backend=args.sdp_backend,
-        vlm_retry_n=args.vlm_retry_n,
+        vlm_max_side=phase2_vlm_max_side,
+        sdp_backend=phase2_sdp_backend,
+        vlm_retry_n=phase2_vlm_retry_n,
+        vlm_max_side_source=phase2_vlm_max_side_source,
+        sdp_backend_source=phase2_sdp_backend_source,
+        vlm_retry_n_source=phase2_vlm_retry_n_source,
     )
     
     res = StageResult()
@@ -2329,9 +2375,19 @@ def run_workload(args):
         res.artifacts["execution_error_count"] = 0
         res.artifacts["unknown_count"] = 0
         res.artifacts["strict_schema_invalid_count"] = 0
-        res.artifacts["audit_vlm_max_side"] = args.vlm_max_side
-        res.artifacts["audit_sdp_backend"] = args.sdp_backend
-        res.artifacts["audit_vlm_retry_n"] = args.vlm_retry_n
+        res.artifacts["audit_vlm_max_side"] = int(phase2_vlm_max_side)
+        res.artifacts["audit_sdp_backend"] = str(phase2_sdp_backend)
+        res.artifacts["audit_vlm_retry_n"] = int(phase2_vlm_retry_n)
+        res.artifacts["audit_vlm_max_side_source"] = phase2_vlm_max_side_source
+        res.artifacts["audit_sdp_backend_source"] = phase2_sdp_backend_source
+        res.artifacts["audit_vlm_retry_n_source"] = phase2_vlm_retry_n_source
+        for seed in args.seeds:
+            res.artifacts[f"seed_{seed}_audit_vlm_max_side"] = int(phase2_vlm_max_side)
+            res.artifacts[f"seed_{seed}_audit_sdp_backend"] = str(phase2_sdp_backend)
+            res.artifacts[f"seed_{seed}_audit_vlm_retry_n"] = int(phase2_vlm_retry_n)
+            res.artifacts[f"seed_{seed}_audit_vlm_max_side_source"] = phase2_vlm_max_side_source
+            res.artifacts[f"seed_{seed}_audit_sdp_backend_source"] = phase2_sdp_backend_source
+            res.artifacts[f"seed_{seed}_audit_vlm_retry_n_source"] = phase2_vlm_retry_n_source
         if phase2_vlm_model_id:
             res.artifacts["audit_requested_vlm_model_id"] = phase2_vlm_model_id
         else:
@@ -2476,9 +2532,9 @@ def build_arg_parser():
     parser.add_argument("--dataset-split", type=str, default="test", dest="dataset_split", help="Dataset split for phase1")
     parser.add_argument("--vlm-model-id", type=str, default=None, dest="vlm_model_id", help="Explicit VLM model id (repo id or local path)")
     parser.add_argument("--vlm-model-local-dir", type=str, default=None, dest="vlm_model_local_dir", help="Explicit local VLM model directory; higher priority than --vlm-model-id")
-    parser.add_argument("--vlm-max-side", type=int, default=None, dest="vlm_max_side", help="Override VLM max image side for phase2 infer")
-    parser.add_argument("--sdp-backend", type=str, default=None, dest="sdp_backend", help="Override SDP backend for phase2 infer (auto/math)")
-    parser.add_argument("--vlm-retry-n", type=int, default=None, dest="vlm_retry_n", help="Override VLM retry count for phase2 infer")
+    parser.add_argument("--vlm-max-side", type=int, default=768, dest="vlm_max_side", help="Override VLM max image side for phase2 infer")
+    parser.add_argument("--sdp-backend", type=str, default="auto", dest="sdp_backend", help="Override SDP backend for phase2 infer (auto/math/flash/mem_efficient)")
+    parser.add_argument("--vlm-retry-n", type=int, default=2, dest="vlm_retry_n", help="Override VLM retry count for phase2 infer")
     parser.add_argument("--sentinel-ref", type=str, default="", dest="sentinel_ref", help="Sentinel reference directory")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Random seeds")
     return parser
