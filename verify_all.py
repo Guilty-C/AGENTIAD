@@ -1236,10 +1236,16 @@ class AgentInfer06(Stage):
                         file=sys.stderr,
                     )
                     if exec_cnt > 0 or unknown_cnt > 0 or schema_bad_cnt > 0:
-                        remediation = (
-                            "Phase2 hard gate failed. Reduce VLM memory pressure via --vlm-max-side (e.g. 640), "
-                            "and verify GPU memory/driver stability."
-                        )
+                        if exec_cnt == 0 and (unknown_cnt > 0 or schema_bad_cnt > 0):
+                            remediation = (
+                                "Phase2 hard gate failed. execution_error_count=0 but unknown/schema_invalid detected; "
+                                "implement schema-aware repair and robust JSON parsing/normalization so every final is schema-valid."
+                            )
+                        else:
+                            remediation = (
+                                "Phase2 hard gate failed. Reduce VLM memory pressure via --vlm-max-side (e.g. 640), "
+                                "and verify GPU memory/driver stability."
+                            )
                         res.success = False
                         res.gates["J2"] = False
                         res.errors.append(

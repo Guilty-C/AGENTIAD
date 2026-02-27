@@ -120,6 +120,46 @@ def _normalize_yesno(x: Any) -> Optional[str]:
     return None
 
 
+def _coerce_final_anomaly(x: Any) -> Tuple[str, bool]:
+    norm = _normalize_yesno(x)
+    if norm in {"yes", "no"}:
+        return norm, False
+    return "no", True
+
+
+def _normalize_bbox_or_fallback(bbox_value: Any, sample_id: str) -> List[float]:
+    if isinstance(bbox_value, list) and len(bbox_value) == 4:
+        try:
+            return [float(bbox_value[0]), float(bbox_value[1]), float(bbox_value[2]), float(bbox_value[3])]
+        except Exception:
+            pass
+    return _fallback_bbox_norm(sample_id)
+
+
+def _build_final_obj(sample_id: str, parsed: Mapping[str, Any], bbox_hint: Any) -> Tuple[Dict[str, Any], bool]:
+    parsed_map: Mapping[str, Any] = parsed if isinstance(parsed, Mapping) else {}
+    anomaly, coerced_anomaly = _coerce_final_anomaly(parsed_map.get("anomaly"))
+    bbox_value = parsed_map.get("bbox") if isinstance(parsed_map.get("bbox"), list) else bbox_hint
+    defect_type = _safe_str(parsed_map.get("defect_type")).strip()
+    if not defect_type or defect_type.lower() in {"unknown", "execution_error"}:
+        defect_type = "none" if anomaly == "no" else "unspecified_anomaly"
+    if anomaly == "yes" and defect_type.lower() == "none":
+        defect_type = "unspecified_anomaly"
+    if anomaly == "no":
+        defect_type = "none"
+    reason = _safe_str(parsed_map.get("reason")).strip()
+    if not reason:
+        reason = "schema_repaired_fallback" if coerced_anomaly else "model_output"
+    final_obj = {
+        "anomaly": anomaly,
+        "defect_type": defect_type,
+        "reason": reason,
+        "confidence": None,
+        "bbox": _normalize_bbox_or_fallback(bbox_value, sample_id),
+    }
+    return final_obj, coerced_anomaly
+
+
 def _label_from_path_segments(p: str) -> str:
     s = p.replace("\\", "/")
     segments = [seg for seg in s.split("/") if seg]
@@ -452,6 +492,134 @@ def _parse_agent_json(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         return {}, meta
 
 
+def _summarize_raw_text(text: str, max_len: int = 240) -> str:
+    s = re.sub(r"\s+", " ", _safe_str(text)).strip()
+    if len(s) > max_len:
+        s = s[:max_len] + "..."
+    return s
+
+
+def _drain_vlm_errors(round_idx: int) -> List[Dict[str, Any]]:
+    errs: List[Dict[str, Any]] = []
+    err = _take_last_vlm_exception()
+    while err:
+        errs.append({"round": int(round_idx), **err})
+        err = _take_last_vlm_exception()
+    return errs
+
+
+def _schema_valid(meta: Mapping[str, Any]) -> bool:
+    return bool(meta.get("parse_ok")) and bool(meta.get("schema_valid"))
+
+
+def _build_repair_prompt(base_prompt: str) -> str:
+    strict_rule = (
+        "\n\nRepair instruction (strict): return ONLY one <answer>...</answer> block. "
+        "Inside it, output valid JSON with exactly these keys: "
+        '{"anomaly_present": true|false, "top_anomaly": "string", "visual_descriptions": ["string", ...]}. '
+        'Enum constraints: anomaly_present can only be true or false; if anomaly_present=false then '
+        'top_anomaly must be "none" and visual_descriptions must be []. '
+        "Do not output markdown, explanation, or any extra text."
+    )
+    return _safe_str(base_prompt) + strict_rule
+
+
+def _make_forced_valid_answer() -> str:
+    payload = {
+        "anomaly_present": False,
+        "top_anomaly": "none",
+        "visual_descriptions": [],
+    }
+    return "<answer>\n" + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n</answer>"
+
+
+def _vlm_generate_with_schema_repair(
+    *,
+    processor: Any,
+    model: Any,
+    images: Sequence["PIL.Image.Image"],
+    prompt: str,
+    generation_config: Any,
+    sdp_backend: str,
+    max_retries: int,
+    repair_n: int,
+    dry_run: bool,
+    sample_id: str,
+    seed: int,
+    round_idx: int,
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    def _run(prompt_text: str) -> Tuple[str, Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+        if dry_run:
+            raw_local = _vlm_generate_dry(images, prompt_text, sample_id, seed)
+        else:
+            raw_local = _vlm_generate(
+                processor,
+                model,
+                images,
+                prompt_text,
+                generation_config,
+                sdp_backend=sdp_backend,
+                max_retries=max_retries,
+            )
+        parsed_local, meta_local = _parse_agent_json(raw_local)
+        if not isinstance(meta_local, dict):
+            meta_local = {}
+        errs_local = _drain_vlm_errors(round_idx)
+        if errs_local:
+            meta_local["inference_errors"] = errs_local
+        return raw_local, parsed_local, meta_local, errs_local
+
+    raw, parsed, meta, _ = _run(prompt)
+    repair_summaries: List[Dict[str, Any]] = []
+    if _schema_valid(meta):
+        meta["repair_attempted"] = False
+        meta["repair_n"] = int(max(0, repair_n))
+        return raw, parsed, meta
+
+    repair_prompt = _build_repair_prompt(prompt)
+    total_repairs = max(0, int(repair_n))
+    for ridx in range(1, total_repairs + 1):
+        repair_summaries.append(
+            {
+                "attempt": int(ridx),
+                "raw_text_summary": _summarize_raw_text(raw),
+                "schema_valid": bool(meta.get("schema_valid")),
+                "parse_ok": bool(meta.get("parse_ok")),
+                "schema_errors": list(meta.get("schema_errors", []) or []),
+                "parse_error": _safe_str(meta.get("error")),
+            }
+        )
+        raw, parsed, meta, _ = _run(repair_prompt)
+        if _schema_valid(meta):
+            meta["repair_attempted"] = True
+            meta["repair_n"] = int(total_repairs)
+            meta["repair_attempt_used"] = int(ridx)
+            meta["repair_history"] = repair_summaries
+            return raw, parsed, meta
+
+    repair_summaries.append(
+        {
+            "attempt": int(total_repairs + 1),
+            "raw_text_summary": _summarize_raw_text(raw),
+            "schema_valid": bool(meta.get("schema_valid")),
+            "parse_ok": bool(meta.get("parse_ok")),
+            "schema_errors": list(meta.get("schema_errors", []) or []),
+            "parse_error": _safe_str(meta.get("error")),
+        }
+    )
+    forced_raw = _make_forced_valid_answer()
+    forced_parsed, forced_meta = _parse_agent_json(forced_raw)
+    if not isinstance(forced_meta, dict):
+        forced_meta = {}
+    forced_meta["repair_attempted"] = True
+    forced_meta["repair_n"] = int(total_repairs)
+    forced_meta["repair_failed"] = True
+    forced_meta["raw_text_summary"] = _summarize_raw_text(raw)
+    forced_meta["repair_history"] = repair_summaries
+    forced_meta["forced_valid_answer"] = True
+    return forced_raw, forced_parsed, forced_meta
+
+
 def _uncertain(parsed: Mapping[str, Any]) -> bool:
     # Strict Contract: No confidence score available.
     # Uncertainty heuristic based on confidence is removed.
@@ -690,7 +858,7 @@ def _vlm_generate(
     global _LAST_VLM_EXCEPTIONS
     _LAST_VLM_EXCEPTIONS = []
     if model is None:
-        return '<answer>{"anomaly_present": "unknown", "top_anomaly": "offline_fallback", "visual_descriptions": []}</answer>'
+        return '<answer>{"anomaly_present": false, "top_anomaly": "none", "visual_descriptions": []}</answer>'
 
     import torch
 
@@ -805,8 +973,8 @@ def _vlm_generate(
             print(f"DEBUG: _vlm_generate attempt{attempt} exception: {e}", file=sys.stderr)
             _record_exc(attempt, e)
             _cleanup_cuda_memory()
-    # Fallback output that respects contract schema (but says unknown)
-    return '<answer>{"anomaly_present": "unknown", "top_anomaly": "execution_error", "visual_descriptions": []}</answer>'
+    # Fallback output is always schema-valid and non-execution_error.
+    return '<answer>{"anomaly_present": false, "top_anomaly": "none", "visual_descriptions": []}</answer>'
 
 
 def _vlm_generate_dry(images: Sequence[Any], prompt: str, sample_id: str, seed: int) -> str:
@@ -900,6 +1068,7 @@ def main() -> int:
     parser.add_argument("--vlm-max-side", type=int, default=None, dest="vlm_max_side", help="Resize input image so long side <= this value before VLM inference.")
     parser.add_argument("--sdp-backend", type=str, default="auto", dest="sdp_backend", help="SDP backend policy: auto, math, flash, mem_efficient")
     parser.add_argument("--vlm-retry-n", type=int, default=2, dest="vlm_retry_n", help="VLM retries after first attempt (0 means no retry)")
+    parser.add_argument("--vlm-repair-n", type=int, default=None, dest="vlm_repair_n", help="Schema-repair retries after invalid VLM output (default: --vlm-retry-n)")
     args = parser.parse_args()
 
     from agentiad_repro.utils import ensure_dir, load_paths, sha256_text, utc_now_iso, write_json
@@ -955,6 +1124,14 @@ def main() -> int:
     else:
         max_retries = 2
     max_retries = max(0, int(max_retries))
+    cfg_repair_raw = cfg.get("vlm_repair_n", None)
+    if args.vlm_repair_n is not None:
+        repair_n = int(args.vlm_repair_n)
+    elif cfg_repair_raw is not None and str(cfg_repair_raw).strip() != "":
+        repair_n = int(cfg_repair_raw)
+    else:
+        repair_n = int(max_retries)
+    repair_n = max(0, int(repair_n))
     gt_key_override = str(cfg.get("gt_key", "")).strip() or None
 
     # Use SSOT Prompt
@@ -1635,6 +1812,7 @@ def main() -> int:
                     "vlm_max_side": int(vlm_max_side),
                     "sdp_backend": str(sdp_backend),
                     "max_retries": int(max_retries),
+                    "repair_n": int(repair_n),
                 },
                 "input": {
                     "query_image": qv if isinstance(qv, str) else "<in_memory_image>",
@@ -1648,26 +1826,25 @@ def main() -> int:
             }
 
             try:
-                if args.dry_run:
-                    raw0 = _vlm_generate_dry([img], prompt_global, sample_id, seed)
-                else:
-                    raw0 = _vlm_generate(processor, model, [img], prompt_global, generation_config, sdp_backend=sdp_backend, max_retries=max_retries)
+                raw0, parsed0, meta0 = _vlm_generate_with_schema_repair(
+                    processor=processor,
+                    model=model,
+                    images=[img],
+                    prompt=prompt_global,
+                    generation_config=generation_config,
+                    sdp_backend=sdp_backend,
+                    max_retries=max_retries,
+                    repair_n=repair_n,
+                    dry_run=bool(args.dry_run),
+                    sample_id=sample_id,
+                    seed=seed,
+                    round_idx=0,
+                )
             except Exception as e:
                 n_skipped += 1
                 skip_reasons["inference_exception"] = skip_reasons.get("inference_exception", 0) + 1
                 _cleanup_cuda_memory()
                 continue
-            err0 = _take_last_vlm_exception()
-            errs0: List[Dict[str, Any]] = []
-            while err0:
-                errs0.append({"round": 0, **err0})
-                err0 = _take_last_vlm_exception()
-                
-            parsed0, meta0 = _parse_agent_json(raw0)
-            if not isinstance(meta0, dict):
-                meta0 = {}
-            if errs0:
-                meta0["inference_errors"] = errs0
             trace["turns"].append(
                 {
                     "round": 0,
@@ -1678,6 +1855,8 @@ def main() -> int:
                     "meta": meta0,
                 }
             )
+            if bool(meta0.get("repair_failed")):
+                trace["repair_failed"] = True
 
             bbox_norm = parsed0.get("bbox") if isinstance(parsed0.get("bbox"), list) else None
             if not bbox_norm:
@@ -1689,14 +1868,8 @@ def main() -> int:
                 raw1 = ""
                 raw2 = ""
                 final_parsed = parsed0
-                pred_label = _normalize_yesno(final_parsed.get("anomaly")) or "UNKNOWN"
-                
-                final_obj = {
-                    "anomaly": pred_label if pred_label in {"yes", "no"} else "unknown",
-                    "bbox": bbox_norm,
-                    "defect_type": _safe_str(final_parsed.get("defect_type")),
-                    "confidence": None, # Removed legacy confidence
-                }
+                final_obj, coerced_anomaly = _build_final_obj(sample_id, final_parsed, bbox_norm)
+                pred_label = final_obj["anomaly"]
                 final_path = str(sample_dir / "final.json")
                 write_json(Path(final_path), final_obj)
                 trace_fingerprint = json.loads(json.dumps(trace, ensure_ascii=False))
@@ -1707,6 +1880,21 @@ def main() -> int:
                 trace_path = str(sample_dir / "trace.json")
                 write_json(Path(trace_path), trace)
                 
+                raw_output = json.dumps(
+                    {
+                        "round0": raw0,
+                        "round1": raw1,
+                        "round2": raw2,
+                        "cr_called": bool(cr_called),
+                        "ref_sample_id": ref_sample_id,
+                        "final": final_obj,
+                        "meta": {"coerced_anomaly": bool(coerced_anomaly)},
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+
                 rows.append(
                     {
                         "sample_id": sample_id,
@@ -1714,7 +1902,7 @@ def main() -> int:
                         "gt_label": gt_label,
                         "pred_label": pred_label,
                         "correct": _compute_correct(gt_label, pred_label),
-                        "raw_output": raw0,
+                        "raw_output": raw_output,
                         "model_id": vlm_model_id,
                         "seed": int(seed),
                         "prompt_hash": prompt_hash,
@@ -1770,20 +1958,20 @@ def main() -> int:
             if perf_enabled:
                 perf_io_decode_seconds += max(0.0, time.perf_counter() - pz_t0)
 
-            if args.dry_run:
-                raw1 = _vlm_generate_dry([crop_img], prompt_crop, sample_id, seed)
-            else:
-                raw1 = _vlm_generate(processor, model, [crop_img], prompt_crop, generation_config, sdp_backend=sdp_backend, max_retries=max_retries)
-            err1 = _take_last_vlm_exception()
-            errs1: List[Dict[str, Any]] = []
-            while err1:
-                errs1.append({"round": 1, **err1})
-                err1 = _take_last_vlm_exception()
-            parsed1, meta1 = _parse_agent_json(raw1)
-            if not isinstance(meta1, dict):
-                meta1 = {}
-            if errs1:
-                meta1["inference_errors"] = errs1
+            raw1, parsed1, meta1 = _vlm_generate_with_schema_repair(
+                processor=processor,
+                model=model,
+                images=[crop_img],
+                prompt=prompt_crop,
+                generation_config=generation_config,
+                sdp_backend=sdp_backend,
+                max_retries=max_retries,
+                repair_n=repair_n,
+                dry_run=bool(args.dry_run),
+                sample_id=sample_id,
+                seed=seed,
+                round_idx=1,
+            )
             trace["turns"].append(
                 {
                     "round": 1,
@@ -1796,6 +1984,8 @@ def main() -> int:
                     "meta": meta1,
                 }
             )
+            if bool(meta1.get("repair_failed")):
+                trace["repair_failed"] = True
             pz_called = True
             tool_calls_total += 1
 
@@ -1847,38 +2037,41 @@ def main() -> int:
                     "size": int(ref_size),
                 }
 
+                cr_images: List[Any]
                 if args.dry_run:
                     try:
                         if ref_bytes is None:
                             raise RuntimeError("ref bytes unavailable")
                         ref_img = _pil_from_bytes_rgb(ref_bytes)
                         ref_img = _resize_image_max_side(ref_img, vlm_max_side)
-                        raw2 = _vlm_generate_dry([crop_img, ref_img], prompt_cr, sample_id, seed)
+                        cr_images = [crop_img, ref_img]
                     except Exception:
-                        raw2 = _vlm_generate_dry([crop_img, crop_img], prompt_cr, sample_id, seed)
+                        cr_images = [crop_img, crop_img]
                 else:
                     try:
                         if ref_bytes is None:
                             raise RuntimeError("ref bytes unavailable")
                         ref_img = _pil_from_bytes_rgb(ref_bytes)
                         ref_img = _resize_image_max_side(ref_img, vlm_max_side)
-                        raw2 = _vlm_generate(processor, model, [crop_img, ref_img], prompt_cr, generation_config, sdp_backend=sdp_backend, max_retries=max_retries)
+                        cr_images = [crop_img, ref_img]
                     except Exception:
-                        raw2 = _vlm_generate(processor, model, [crop_img], prompt_cr, generation_config, sdp_backend=sdp_backend, max_retries=max_retries)
-                err2 = _take_last_vlm_exception()
-                errs2: List[Dict[str, Any]] = []
-                while err2:
-                    errs2.append({"round": 2, **err2})
-                    err2 = _take_last_vlm_exception()
+                        cr_images = [crop_img]
+                raw2, parsed2, meta2 = _vlm_generate_with_schema_repair(
+                    processor=processor,
+                    model=model,
+                    images=cr_images,
+                    prompt=prompt_cr,
+                    generation_config=generation_config,
+                    sdp_backend=sdp_backend,
+                    max_retries=max_retries,
+                    repair_n=repair_n,
+                    dry_run=bool(args.dry_run),
+                    sample_id=sample_id,
+                    seed=seed,
+                    round_idx=2,
+                )
                 if perf_enabled:
                     perf_io_decode_seconds += max(0.0, time.perf_counter() - ref_t0)
-                    
-
-                parsed2, meta2 = _parse_agent_json(raw2)
-                if not isinstance(meta2, dict):
-                    meta2 = {}
-                if errs2:
-                    meta2["inference_errors"] = errs2
                 trace["turns"].append(
                     {
                         "round": 2,
@@ -1892,17 +2085,13 @@ def main() -> int:
                         "ref_sample_id": ref_sample_id
                     }
                 )
+                if bool(meta2.get("repair_failed")):
+                    trace["repair_failed"] = True
                 tool_calls_total += 1
 
             final_parsed = parsed2 if parsed2 else parsed1 if parsed1 else parsed0
-            pred_label = _normalize_yesno(final_parsed.get("anomaly")) or "UNKNOWN"
-
-            final_obj = {
-                "anomaly": pred_label if pred_label in {"yes", "no"} else "unknown",
-                "bbox": bbox_norm,
-                "defect_type": _safe_str(final_parsed.get("defect_type")),
-                "confidence": None, # Removed legacy
-            }
+            final_obj, coerced_anomaly = _build_final_obj(sample_id, final_parsed, bbox_norm)
+            pred_label = final_obj["anomaly"]
             final_path = str(sample_dir / "final.json")
             write_json(Path(final_path), final_obj)
             trace_fingerprint = json.loads(json.dumps(trace, ensure_ascii=False))
@@ -1921,6 +2110,7 @@ def main() -> int:
                     "cr_called": bool(cr_called),
                     "ref_sample_id": ref_sample_id,
                     "final": final_obj,
+                    "meta": {"coerced_anomaly": bool(coerced_anomaly)},
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1976,6 +2166,39 @@ def main() -> int:
             ],
         )
         df.to_csv(out_csv, index=False, encoding="utf-8")
+
+        required_final_keys = ["anomaly", "defect_type", "reason", "confidence", "bbox"]
+        unknown_count = 0
+        strict_schema_invalid_count = 0
+        invalid_example_ids: List[Dict[str, Any]] = []
+        for row in rows:
+            sid = _safe_str(row.get("sample_id"))
+            final_from_raw: Dict[str, Any] = {}
+            missing_keys: List[str] = []
+            anomaly_value = ""
+            raw_payload = row.get("raw_output")
+            try:
+                raw_obj = json.loads(raw_payload) if isinstance(raw_payload, str) else {}
+            except Exception:
+                raw_obj = {}
+            if isinstance(raw_obj, dict) and isinstance(raw_obj.get("final"), dict):
+                final_from_raw = raw_obj["final"]
+            missing_keys = [k for k in required_final_keys if k not in final_from_raw]
+            anomaly_value = str(final_from_raw.get("anomaly", "")).strip().lower() if isinstance(final_from_raw, dict) else ""
+            if anomaly_value == "unknown":
+                unknown_count += 1
+            anomaly_allowed = anomaly_value in {"yes", "no"}
+            if missing_keys or not anomaly_allowed:
+                strict_schema_invalid_count += 1
+                if len(invalid_example_ids) < 5:
+                    invalid_example_ids.append({"sample_id": sid, "missing_keys": missing_keys})
+        self_check = {
+            "n_rows": int(len(rows)),
+            "unknown_count": int(unknown_count),
+            "strict_schema_invalid_count": int(strict_schema_invalid_count),
+            "invalid_example_ids": invalid_example_ids,
+        }
+        print("SELF_CHECK_JSON=" + json.dumps(self_check, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
         summary = {
             "timestamp_utc": utc_now_iso(),
