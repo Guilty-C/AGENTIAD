@@ -560,6 +560,319 @@ def _count_phase2_execution_errors_from_zip(ev_zip: Path, csv_name: str) -> Dict
     return out
 
 
+def _phase2_sanity_check_evidence_zip(
+    zip_path: str,
+    seed: int,
+    expected_n: Optional[int],
+    require_toolcall_rate: bool = True,
+    require_trace_policy: str = "auto",  # "auto"|"must_exist"|"must_not_exist"
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "ok": True,
+        "zip_path": str(zip_path),
+        "seed": int(seed),
+        "expected_n": expected_n,
+        "missing_member": [],
+        "csv_member": None,
+        "summary_member": None,
+        "summary": {},
+        "csv_fields": [],
+        "row_count": 0,
+        "row_count_expected": expected_n,
+        "sample_id_empty_count": 0,
+        "raw_output_parse_invalid": 0,
+        "final_not_dict": 0,
+        "final_missing_keys": {"anomaly": 0, "defect_type": 0, "bbox": 0, "confidence": 0, "reason": 0},
+        "invalid_anomaly": 0,
+        "toolcall_rate_avg": None,
+        "trace_policy": {
+            "require": str(require_trace_policy),
+            "trace_emitted_summary": None,
+            "trace_count": 0,
+            "ok": True,
+            "detail": "",
+        },
+        "examples": {
+            "raw_output_parse_invalid": [],
+            "final_not_dict": [],
+            "sample_id_empty": [],
+            "missing_key_anomaly": [],
+            "missing_key_defect_type": [],
+            "missing_key_bbox": [],
+            "missing_key_confidence": [],
+            "missing_key_reason": [],
+            "invalid_anomaly": [],
+        },
+        "errors": [],
+    }
+
+    def _add_example(bucket: str, sid: str) -> None:
+        ex = out["examples"].setdefault(bucket, [])
+        if len(ex) < 10:
+            ex.append(str(sid))
+
+    zp = Path(zip_path)
+    if not zp.exists() or not zp.is_file():
+        out["ok"] = False
+        out["errors"].append(f"zip_missing:{zp}")
+        return out
+
+    try:
+        with zipfile.ZipFile(zp, "r") as zf:
+            members = zf.namelist()
+            csv_member = f"tables/agentiad_infer_mr_s{int(seed)}.csv"
+            if csv_member not in members:
+                cands = [m for m in members if m.startswith("tables/") and m.endswith(".csv")]
+                out["missing_member"].append({"required": csv_member, "candidates": cands[:20]})
+                out["ok"] = False
+            else:
+                out["csv_member"] = csv_member
+
+            expected_summary = f"logs/agentiad_infer_summary_mr_s{int(seed)}.json"
+            summary_member = expected_summary if expected_summary in members else None
+            if summary_member is None:
+                log_cands = [m for m in members if m.startswith("logs/") and "agentiad_infer_summary" in m and m.endswith(".json")]
+                seed_tag = f"_s{int(seed)}"
+                seeded = [m for m in log_cands if seed_tag in m]
+                summary_member = seeded[0] if seeded else (log_cands[0] if log_cands else None)
+                if summary_member is None:
+                    out["missing_member"].append({"required": expected_summary, "candidates": log_cands[:20]})
+                    out["ok"] = False
+            out["summary_member"] = summary_member
+
+            summary_obj: Dict[str, Any] = {}
+            if summary_member is not None:
+                try:
+                    summary_obj = json.loads(zf.read(summary_member).decode("utf-8", errors="replace"))
+                    if not isinstance(summary_obj, dict):
+                        summary_obj = {}
+                        out["ok"] = False
+                        out["errors"].append("summary_not_dict")
+                except Exception as e:
+                    out["ok"] = False
+                    out["errors"].append(f"summary_parse_error:{type(e).__name__}")
+                    summary_obj = {}
+            out["summary"] = {
+                "n_attempted": summary_obj.get("n_attempted"),
+                "n_success": summary_obj.get("n_success"),
+                "n_skipped": summary_obj.get("n_skipped"),
+                "out_csv": summary_obj.get("out_csv"),
+                "trace_root": summary_obj.get("trace_root") or summary_obj.get("trace_dir"),
+                "toolcall_rate_avg": summary_obj.get("toolcall_rate_avg"),
+                "toolcall_rate": summary_obj.get("toolcall_rate"),
+                "trace_emitted": summary_obj.get("trace_emitted"),
+                "trace_count": summary_obj.get("trace_count"),
+            }
+
+            trace_members = [m for m in members if m.endswith("trace.json")]
+            out["trace_policy"]["trace_count"] = int(len(trace_members))
+            trace_emitted = summary_obj.get("trace_emitted")
+            out["trace_policy"]["trace_emitted_summary"] = trace_emitted if isinstance(trace_emitted, bool) else None
+
+            rows_total = 0
+            tool_rows = 0
+            if out["csv_member"] is not None:
+                try:
+                    content = zf.read(out["csv_member"]).decode("utf-8", errors="replace")
+                    reader = csv.DictReader(content.splitlines())
+                    out["csv_fields"] = list(reader.fieldnames or [])
+                    if "sample_id" not in out["csv_fields"] or "raw_output" not in out["csv_fields"]:
+                        out["ok"] = False
+                        out["errors"].append("csv_missing_required_fields")
+                    for row in reader:
+                        rows_total += 1
+                        sid = str((row or {}).get("sample_id", "") or "").strip()
+                        if not sid:
+                            out["sample_id_empty_count"] += 1
+                            _add_example("sample_id_empty", f"row_{rows_total}")
+                        try:
+                            pz_called = int(str((row or {}).get("pz_called", "0") or "0"))
+                        except Exception:
+                            pz_called = 0
+                        try:
+                            cr_called = int(str((row or {}).get("cr_called", "0") or "0"))
+                        except Exception:
+                            cr_called = 0
+                        if (pz_called > 0) or (cr_called > 0):
+                            tool_rows += 1
+
+                        raw_output = str((row or {}).get("raw_output", "") or "").strip()
+                        raw_obj: Any = None
+                        if not raw_output:
+                            out["raw_output_parse_invalid"] += 1
+                            _add_example("raw_output_parse_invalid", sid or f"row_{rows_total}")
+                            continue
+                        try:
+                            raw_obj = json.loads(raw_output)
+                        except Exception:
+                            out["raw_output_parse_invalid"] += 1
+                            _add_example("raw_output_parse_invalid", sid or f"row_{rows_total}")
+                            continue
+                        if not isinstance(raw_obj, dict):
+                            out["raw_output_parse_invalid"] += 1
+                            _add_example("raw_output_parse_invalid", sid or f"row_{rows_total}")
+                            continue
+                        final_obj = raw_obj.get("final")
+                        if not isinstance(final_obj, dict):
+                            out["final_not_dict"] += 1
+                            _add_example("final_not_dict", sid or f"row_{rows_total}")
+                            continue
+                        for k in ["anomaly", "defect_type", "bbox", "confidence", "reason"]:
+                            if k not in final_obj:
+                                out["final_missing_keys"][k] += 1
+                                _add_example(f"missing_key_{k}", sid or f"row_{rows_total}")
+                        anomaly = str(final_obj.get("anomaly", "") or "").strip().lower()
+                        if anomaly not in {"yes", "no", "unknown"}:
+                            out["invalid_anomaly"] += 1
+                            _add_example("invalid_anomaly", sid or f"row_{rows_total}")
+                except Exception as e:
+                    out["ok"] = False
+                    out["errors"].append(f"csv_read_error:{type(e).__name__}")
+
+            out["row_count"] = int(rows_total)
+            if expected_n is not None and rows_total != int(expected_n):
+                out["ok"] = False
+                out["errors"].append("row_count_mismatch")
+            if int(out["sample_id_empty_count"]) > 0:
+                out["ok"] = False
+                out["errors"].append("sample_id_empty")
+            if int(out["raw_output_parse_invalid"]) > 0:
+                out["ok"] = False
+                out["errors"].append("raw_output_parse_invalid")
+            if int(out["final_not_dict"]) > 0:
+                out["ok"] = False
+                out["errors"].append("final_not_dict")
+            if any(int(v) > 0 for v in out["final_missing_keys"].values()):
+                out["ok"] = False
+                out["errors"].append("final_missing_keys")
+            if int(out["invalid_anomaly"]) > 0:
+                out["ok"] = False
+                out["errors"].append("invalid_anomaly")
+
+            tool_rate = summary_obj.get("toolcall_rate_avg", None)
+            if tool_rate is None:
+                tool_rate = summary_obj.get("toolcall_rate", None)
+            if tool_rate is None and rows_total > 0:
+                tool_rate = float(tool_rows) / float(rows_total)
+            try:
+                out["toolcall_rate_avg"] = float(tool_rate) if tool_rate is not None else None
+            except Exception:
+                out["toolcall_rate_avg"] = None
+            if require_toolcall_rate and (out["toolcall_rate_avg"] is None or float(out["toolcall_rate_avg"]) <= 0.0):
+                out["ok"] = False
+                out["errors"].append("toolcall_rate_zero")
+
+            policy = str(require_trace_policy or "auto").strip().lower()
+            trace_ok = True
+            trace_detail = ""
+            if policy == "must_exist":
+                trace_ok = int(len(trace_members)) > 0
+                trace_detail = f"must_exist: found_trace_count={len(trace_members)}"
+            elif policy == "must_not_exist":
+                trace_ok = int(len(trace_members)) == 0
+                trace_detail = f"must_not_exist: found_trace_count={len(trace_members)}"
+            else:
+                if isinstance(trace_emitted, bool):
+                    if trace_emitted:
+                        trace_ok = int(len(trace_members)) > 0
+                    else:
+                        trace_ok = int(len(trace_members)) == 0
+                    trace_detail = (
+                        f"auto: trace_emitted={trace_emitted}, found_trace_count={len(trace_members)}"
+                    )
+                else:
+                    trace_ok = True
+                    trace_detail = f"auto: summary trace_emitted missing, found_trace_count={len(trace_members)}"
+            out["trace_policy"]["ok"] = bool(trace_ok)
+            out["trace_policy"]["detail"] = trace_detail
+            if not trace_ok:
+                out["ok"] = False
+                out["errors"].append("trace_policy_mismatch")
+    except zipfile.BadZipFile:
+        out["ok"] = False
+        out["errors"].append("bad_zip")
+        return out
+    except Exception as e:
+        out["ok"] = False
+        out["errors"].append(f"sanity_exception:{type(e).__name__}")
+        return out
+
+    if out["missing_member"]:
+        out["ok"] = False
+        out["errors"].append("missing_member")
+    return out
+
+
+def _phase2_fail_fast_abort(res: "StageResult", reason: str) -> None:
+    res.gates["J2"] = False
+    res.success = False
+    msg = f"Phase2Sanity fail-fast: {reason}"
+    res.errors.append(msg)
+    print(msg, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _phase2_report_and_abort(
+    res: "StageResult",
+    seed: int,
+    ev_zip: Path,
+    sanity: Dict[str, Any],
+) -> None:
+    print(f"[Phase2Sanity] FAIL seed={seed} zip={ev_zip}", file=sys.stderr)
+    for mm in sanity.get("missing_member", []) or []:
+        print(f"  - missing_member: {mm}", file=sys.stderr)
+    print(f"  - csv_fields: {sanity.get('csv_fields', [])}", file=sys.stderr)
+    print(
+        f"  - row_count: got {sanity.get('row_count')} expected {sanity.get('row_count_expected')}",
+        file=sys.stderr,
+    )
+    print(
+        "  - raw_output_parse_invalid: "
+        f"{sanity.get('raw_output_parse_invalid', 0)} "
+        f"(examples: {sanity.get('examples', {}).get('raw_output_parse_invalid', [])})",
+        file=sys.stderr,
+    )
+    print(
+        "  - final_not_dict: "
+        f"{sanity.get('final_not_dict', 0)} "
+        f"(examples: {sanity.get('examples', {}).get('final_not_dict', [])})",
+        file=sys.stderr,
+    )
+    print(f"  - final_missing_keys: {sanity.get('final_missing_keys', {})}", file=sys.stderr)
+    print(f"  - invalid_anomaly: {sanity.get('invalid_anomaly', 0)}", file=sys.stderr)
+    print(f"  - toolcall_rate_avg: {sanity.get('toolcall_rate_avg')}", file=sys.stderr)
+    tp = sanity.get("trace_policy", {}) or {}
+    print(
+        f"  - trace_policy: require={tp.get('require')} ok={tp.get('ok')} detail={tp.get('detail')}",
+        file=sys.stderr,
+    )
+    reason = ", ".join(sanity.get("errors", []) or ["unknown_sanity_failure"])
+    _phase2_fail_fast_abort(res, reason)
+
+
+def _phase2_missing_zip_fail_fast(
+    res: "StageResult",
+    output_dir: Path,
+    ev_dir: Path,
+    seed: int,
+) -> None:
+    entries: List[str] = []
+    if ev_dir.exists() and ev_dir.is_dir():
+        try:
+            entries = [p.name for p in sorted(ev_dir.iterdir(), key=lambda x: x.name)[:30]]
+        except Exception:
+            entries = []
+    print(
+        "Expected evidence zip missing; likely output-dir template typo or braces expansion issue",
+        file=sys.stderr,
+    )
+    print(f"  - seed: {seed}", file=sys.stderr)
+    print(f"  - resolved output_dir: {output_dir}", file=sys.stderr)
+    print(f"  - expected ev_06 dir: {ev_dir}", file=sys.stderr)
+    print(f"  - ev_06 listing(top30): {entries}", file=sys.stderr)
+    _phase2_fail_fast_abort(res, "expected_evidence_zip_missing")
+
+
 def handle_remediation(errors: Sequence[str]) -> List[str]:
     """
     Checks errors and suggests remediation steps for schema issues.
@@ -1255,10 +1568,23 @@ class AgentInfer06(Stage):
 
                 ev06_zip, ev06_note, ev06_found = resolve_evidence_zip(ev_06)
                 if ev06_zip is None:
+                    if ctx.phase2_full_infer:
+                        _phase2_missing_zip_fail_fast(res, ctx.work_dir, ev_06, int(seed))
                     code = "MISSING_ZIP"
                     msg = f"Missing zip: expected evidence_package.zip in {ev_06}; found {ev06_found}"
                     dur = 0.0
                 else:
+                    if ctx.phase2_full_infer:
+                        sanity = _phase2_sanity_check_evidence_zip(
+                            zip_path=str(ev06_zip),
+                            seed=int(seed),
+                            expected_n=subset_size,
+                            require_toolcall_rate=True,
+                            require_trace_policy="auto",
+                        )
+                        res.artifacts[f"seed_{seed}_phase2_sanity"] = sanity
+                        if not bool(sanity.get("ok")):
+                            _phase2_report_and_abort(res, int(seed), ev06_zip, sanity)
                     code, msg, dur = Evidence.verify_zip(ev06_zip, "06_run_agentiad_infer.py", expected_trace_count=subset_size)
                     if ev06_note:
                         msg = f"{msg} ({ev06_note})"

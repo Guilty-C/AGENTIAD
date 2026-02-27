@@ -2,6 +2,7 @@
 import sys
 from pathlib import Path
 import argparse
+import csv
 import gc
 from contextlib import nullcontext
 import hashlib
@@ -182,6 +183,86 @@ def _build_final_obj(sample_id: str, parsed: Mapping[str, Any], bbox_hint: Any) 
         "bbox": _normalize_bbox_or_fallback(bbox_value, sample_id),
     }
     return final_obj, coerced_anomaly
+
+
+def _append_trace_error(trace: Optional[Dict[str, Any]], code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> None:
+    if not isinstance(trace, dict):
+        return
+    errs = trace.get("inference_errors")
+    if not isinstance(errs, list):
+        errs = []
+        trace["inference_errors"] = errs
+    item: Dict[str, Any] = {"code": str(code), "message": str(message)}
+    if isinstance(detail, dict) and detail:
+        item["detail"] = detail
+    errs.append(item)
+
+
+def _prepare_raw_output_json(
+    *,
+    sample_id: str,
+    raw_payload: Any,
+    bbox_hint: Any,
+) -> Tuple[str, Dict[str, Any], bool]:
+    """
+    Ensure raw_output is JSON-serializable and contains a schema-valid final dict.
+    Returns (json_text_single_line, normalized_obj, roundtrip_ok).
+    """
+    normalized: Dict[str, Any]
+    if isinstance(raw_payload, dict):
+        normalized = dict(raw_payload)
+    else:
+        normalized = {"meta": {"sanity_coerced": True, "sanity_reason": "raw_output_not_dict"}}
+    meta_obj = normalized.get("meta")
+    if not isinstance(meta_obj, dict):
+        meta_obj = {}
+        normalized["meta"] = meta_obj
+
+    final_in = normalized.get("final")
+    final_map = final_in if isinstance(final_in, Mapping) else {}
+    final_obj, _ = _build_final_obj(sample_id, final_map, bbox_hint)
+    if not isinstance(final_in, dict):
+        meta_obj["sanity_coerced"] = True
+        meta_obj["sanity_reason"] = "final_not_dict"
+    normalized["final"] = final_obj
+
+    try:
+        s = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        s = s.replace("\r", " ").replace("\n", " ")
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
+            raise ValueError("roundtrip_not_dict")
+        m2 = obj.get("meta")
+        if not isinstance(m2, dict):
+            m2 = {}
+            obj["meta"] = m2
+        m2["roundtrip_ok"] = True
+        s2 = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        s2 = s2.replace("\r", " ").replace("\n", " ")
+        return s2, obj, True
+    except Exception as e:
+        fallback = {
+            "round0": "",
+            "round1": "",
+            "round2": "",
+            "cr_called": False,
+            "ref_sample_id": "",
+            "final": {
+                "anomaly": "no",
+                "defect_type": "execution_error",
+                "reason": "raw_output_roundtrip_failed",
+                "confidence": None,
+                "bbox": _normalize_bbox_or_fallback(bbox_hint, sample_id),
+            },
+            "meta": {
+                "sanity_coerced": True,
+                "roundtrip_ok": False,
+                "roundtrip_error": f"{type(e).__name__}: {e}",
+            },
+        }
+        s3 = json.dumps(fallback, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        s3 = s3.replace("\r", " ").replace("\n", " ")
+        return s3, fallback, False
 
 
 def _label_from_path_segments(p: str) -> str:
@@ -1649,6 +1730,7 @@ def main() -> int:
     git_commit = _git_commit()
     n_samples_with_tool_call = 0
     tool_calls_total = 0
+    csv_write_fail_count = 0
     perf_saved_second_reads = 0
     perf_crop_events = 0
     perf_ref_events = 0
@@ -1929,20 +2011,32 @@ def main() -> int:
                 trace_path = str(sample_dir / "trace.json")
                 write_json(Path(trace_path), trace)
                 
-                raw_output = json.dumps(
-                    {
-                        "round0": raw0,
-                        "round1": raw1,
-                        "round2": raw2,
-                        "cr_called": bool(cr_called),
-                        "ref_sample_id": ref_sample_id,
-                        "final": final_obj,
-                        "meta": {"coerced_anomaly": bool(coerced_anomaly)},
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
+                raw_output_obj: Dict[str, Any] = {
+                    "round0": raw0,
+                    "round1": raw1,
+                    "round2": raw2,
+                    "cr_called": bool(cr_called),
+                    "ref_sample_id": ref_sample_id,
+                    "final": final_obj,
+                    "meta": {"coerced_anomaly": bool(coerced_anomaly)},
+                }
+                raw_output, raw_output_norm, roundtrip_ok = _prepare_raw_output_json(
+                    sample_id=sample_id,
+                    raw_payload=raw_output_obj,
+                    bbox_hint=bbox_norm,
                 )
+                if not roundtrip_ok:
+                    _append_trace_error(
+                        trace,
+                        "raw_output_roundtrip_failed",
+                        "raw_output JSON roundtrip failed; fallback final applied",
+                        {"sample_id": sample_id},
+                    )
+                if isinstance(raw_output_norm.get("final"), dict):
+                    final_obj = dict(raw_output_norm.get("final"))  # keep CSV final and final.json aligned
+                    pred_label = str(final_obj.get("anomaly", "no"))
+                write_json(Path(final_path), final_obj)
+                write_json(Path(trace_path), trace)
 
                 rows.append(
                     {
@@ -2151,20 +2245,32 @@ def main() -> int:
             trace_path = str(sample_dir / "trace.json")
             write_json(Path(trace_path), trace)
 
-            raw_output = json.dumps(
-                {
-                    "round0": raw0,
-                    "round1": raw1,
-                    "round2": raw2,
-                    "cr_called": bool(cr_called),
-                    "ref_sample_id": ref_sample_id,
-                    "final": final_obj,
-                    "meta": {"coerced_anomaly": bool(coerced_anomaly)},
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
+            raw_output_obj = {
+                "round0": raw0,
+                "round1": raw1,
+                "round2": raw2,
+                "cr_called": bool(cr_called),
+                "ref_sample_id": ref_sample_id,
+                "final": final_obj,
+                "meta": {"coerced_anomaly": bool(coerced_anomaly)},
+            }
+            raw_output, raw_output_norm, roundtrip_ok = _prepare_raw_output_json(
+                sample_id=sample_id,
+                raw_payload=raw_output_obj,
+                bbox_hint=bbox_norm,
             )
+            if not roundtrip_ok:
+                _append_trace_error(
+                    trace,
+                    "raw_output_roundtrip_failed",
+                    "raw_output JSON roundtrip failed; fallback final applied",
+                    {"sample_id": sample_id},
+                )
+            if isinstance(raw_output_norm.get("final"), dict):
+                final_obj = dict(raw_output_norm.get("final"))
+                pred_label = str(final_obj.get("anomaly", "no"))
+            write_json(Path(final_path), final_obj)
+            write_json(Path(trace_path), trace)
 
             rows.append(
                 {
@@ -2193,28 +2299,40 @@ def main() -> int:
                     _stderr_progress(len(rows), progress_total)
             _cleanup_cuda_memory()
 
-        import pandas as pd
-
-        df = pd.DataFrame(
-            rows,
-            columns=[
-                "sample_id",
-                "class_name",
-                "gt_label",
-                "pred_label",
-                "correct",
-                "raw_output",
-                "model_id",
-                "seed",
-                "prompt_hash",
-                "config_hash",
-                "pz_called",
-                "cr_called",
-                "bbox_norm",
-                "ref_sample_id",
-            ],
-        )
-        df.to_csv(out_csv, index=False, encoding="utf-8")
+        csv_columns = [
+            "sample_id",
+            "class_name",
+            "gt_label",
+            "pred_label",
+            "correct",
+            "raw_output",
+            "model_id",
+            "seed",
+            "prompt_hash",
+            "config_hash",
+            "pz_called",
+            "cr_called",
+            "bbox_norm",
+            "ref_sample_id",
+        ]
+        with open(out_csv, "w", encoding="utf-8", newline="") as f_csv:
+            writer = csv.DictWriter(f_csv, fieldnames=csv_columns, extrasaction="ignore", quoting=csv.QUOTE_MINIMAL)
+            writer.writeheader()
+            for row in rows:
+                rec = {k: row.get(k) for k in csv_columns}
+                raw_text = rec.get("raw_output")
+                if isinstance(raw_text, str):
+                    rec["raw_output"] = raw_text.replace("\r", " ").replace("\n", " ")
+                try:
+                    writer.writerow(rec)
+                except Exception:
+                    csv_write_fail_count += 1
+                    # Last-resort string coercion to avoid truncating the run output.
+                    fallback_row = {k: ("" if rec.get(k) is None else str(rec.get(k))) for k in csv_columns}
+                    try:
+                        writer.writerow(fallback_row)
+                    except Exception:
+                        pass
 
         required_final_keys = ["anomaly", "defect_type", "reason", "confidence", "bbox"]
         unknown_count = 0
@@ -2277,11 +2395,16 @@ def main() -> int:
             "missing_dataset_prefixes": missing_dataset_prefixes,
             "missing_example_files": missing_example_files,
             "toolcall_rate": (float(n_samples_with_tool_call) / float(len(rows))) if rows else 0.0,
+            "toolcall_rate_avg": (float(n_samples_with_tool_call) / float(len(rows))) if rows else 0.0,
             "tool_calls_total": int(tool_calls_total),
+            "csv_write_fail_count": int(csv_write_fail_count),
             "uncertainty_rule": cr_rule,
             "out_csv": str(out_csv),
             "trace_dir": str(trace_root),
         }
+        trace_files = list(trace_root.rglob("trace.json")) if trace_root.exists() else []
+        summary["trace_count"] = int(len(trace_files))
+        summary["trace_emitted"] = bool(len(trace_files) > 0)
         csv_sha = hashlib.sha256(out_csv.read_bytes()).hexdigest().upper() if out_csv.exists() else None
         summary["csv_sha256"] = csv_sha
         write_json(out_summary, summary)
