@@ -17,7 +17,7 @@ import pathlib
 import re
 import csv
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Sequence, Set
 
 # --- Configuration & Paths ---
 
@@ -486,7 +486,14 @@ def _count_phase2_execution_errors_from_zip(ev_zip: Path, csv_name: str) -> Dict
         "unknown_count": 0,
         "strict_schema_invalid_count": 0,
         "rows_total": 0,
+        "schema_error_examples": [],
     }
+    schema_errors: List[str] = []
+
+    def _record_schema_error(code: str) -> None:
+        if len(schema_errors) < 100:
+            schema_errors.append(str(code))
+
     try:
         if not ev_zip.exists() or not ev_zip.is_file():
             return out
@@ -500,15 +507,18 @@ def _count_phase2_execution_errors_from_zip(ev_zip: Path, csv_name: str) -> Dict
                 raw_output = str((row or {}).get("raw_output", "") or "").strip()
                 if not raw_output:
                     out["strict_schema_invalid_count"] += 1
+                    _record_schema_error("raw_output_empty")
                     continue
                 try:
                     raw_obj = json.loads(raw_output)
                 except Exception:
                     out["strict_schema_invalid_count"] += 1
+                    _record_schema_error("invalid_json_parse")
                     continue
                 final_obj = raw_obj.get("final") if isinstance(raw_obj, dict) else None
                 if not isinstance(final_obj, dict):
                     out["strict_schema_invalid_count"] += 1
+                    _record_schema_error("final_not_dict")
                     continue
                 anomaly = str(final_obj.get("anomaly", "") or "").strip().lower()
                 defect_type = str(final_obj.get("defect_type", "") or "").strip().lower()
@@ -530,13 +540,56 @@ def _count_phase2_execution_errors_from_zip(ev_zip: Path, csv_name: str) -> Dict
                 confidence_ok = final_obj.get("confidence", "__MISSING__") is None
                 if not (required_keys_ok and anomaly_ok and bbox_ok and defect_type_ok and confidence_ok):
                     out["strict_schema_invalid_count"] += 1
+                    if not required_keys_ok:
+                        _record_schema_error("missing_required_keys")
+                    if not anomaly_ok:
+                        _record_schema_error("invalid_anomaly")
+                    if not bbox_ok:
+                        _record_schema_error("invalid_bbox")
+                    if not defect_type_ok:
+                        _record_schema_error("invalid_defect_type")
+                    if not confidence_ok:
+                        _record_schema_error("invalid_confidence")
                 if anomaly == "unknown":
                     out["unknown_count"] += 1
                 if defect_type == "execution_error":
                     out["execution_error_count"] += 1
     except Exception:
         return out
+    out["schema_error_examples"] = schema_errors[:20]
     return out
+
+
+def handle_remediation(errors: Sequence[str]) -> List[str]:
+    """
+    Checks errors and suggests remediation steps for schema issues.
+    """
+    remediation: List[str] = []
+    for error in errors:
+        if error == "final_not_dict":
+            remediation.append("Schema error: `final` is not an object. Ensure every row writes `final` as a JSON dict.")
+        elif error == "invalid_json_parse":
+            remediation.append("Schema error: failed to parse `raw_output`. Ensure `raw_output` is valid JSON with a `final` object.")
+        elif error == "missing_required_keys":
+            remediation.append("Schema violation: `final` must include `anomaly`, `defect_type`, `bbox`, and `confidence`.")
+        elif error == "invalid_anomaly":
+            remediation.append("Schema violation: `final.anomaly` must be `yes` or `no`; default invalid values to `no`.")
+        elif error == "invalid_defect_type":
+            remediation.append("Schema violation: `final.defect_type` must be a non-empty string; default missing/invalid values to `none`.")
+        elif error == "invalid_bbox":
+            remediation.append("Schema violation: `final.bbox` must be a normalized 4-value box with x2>x1 and y2>y1.")
+        elif error == "invalid_confidence":
+            remediation.append("Schema violation: `final.confidence` must be null.")
+        elif error == "raw_output_empty":
+            remediation.append("Schema error: `raw_output` is empty. Ensure inference always writes a schema-valid fallback result.")
+    # Preserve order while deduplicating.
+    dedup: List[str] = []
+    seen: Set[str] = set()
+    for msg in remediation:
+        if msg not in seen:
+            seen.add(msg)
+            dedup.append(msg)
+    return dedup
 
 
 def _is_placeholder_vlm_model_id(model_id: str) -> bool:
@@ -1237,10 +1290,14 @@ class AgentInfer06(Stage):
                     )
                     if exec_cnt > 0 or unknown_cnt > 0 or schema_bad_cnt > 0:
                         if exec_cnt == 0 and (unknown_cnt > 0 or schema_bad_cnt > 0):
+                            schema_errors = phase2_counts.get("schema_error_examples", []) if isinstance(phase2_counts, dict) else []
+                            schema_msgs = handle_remediation(schema_errors if isinstance(schema_errors, list) else [])
                             remediation = (
                                 "Phase2 hard gate failed. execution_error_count=0 but unknown/schema_invalid detected; "
-                                "implement schema-aware repair and robust JSON parsing/normalization so every final is schema-valid."
+                                "focus remediation on schema repair for `final` and strict JSON normalization."
                             )
+                            if schema_msgs:
+                                remediation = remediation + " " + " ".join(schema_msgs)
                         else:
                             remediation = (
                                 "Phase2 hard gate failed. Reduce VLM memory pressure via --vlm-max-side (e.g. 640), "

@@ -127,6 +127,23 @@ def _coerce_final_anomaly(x: Any) -> Tuple[str, bool]:
     return "no", True
 
 
+def schema_repair(final: Any) -> Dict[str, Any]:
+    """
+    Applies strict schema repair to the `final` field.
+    - Ensures `anomaly` is one of ['yes', 'no']
+    - Ensures `defect_type` is non-empty
+    - Adds missing `reason`
+    """
+    out: Dict[str, Any] = dict(final) if isinstance(final, dict) else {}
+    anomaly = _normalize_yesno(out.get("anomaly"))
+    out["anomaly"] = anomaly if anomaly in {"yes", "no"} else "no"
+    defect_type = _safe_str(out.get("defect_type")).strip()
+    out["defect_type"] = defect_type if defect_type else "none"
+    reason = _safe_str(out.get("reason")).strip()
+    out["reason"] = reason if reason else "model_output"
+    return out
+
+
 def _normalize_bbox_or_fallback(bbox_value: Any, sample_id: str) -> List[float]:
     if isinstance(bbox_value, list) and len(bbox_value) == 4:
         try:
@@ -150,10 +167,17 @@ def _build_final_obj(sample_id: str, parsed: Mapping[str, Any], bbox_hint: Any) 
     reason = _safe_str(parsed_map.get("reason")).strip()
     if not reason:
         reason = "schema_repaired_fallback" if coerced_anomaly else "model_output"
+    repaired_core = schema_repair(
+        {
+            "anomaly": anomaly,
+            "defect_type": defect_type,
+            "reason": reason,
+        }
+    )
     final_obj = {
-        "anomaly": anomaly,
-        "defect_type": defect_type,
-        "reason": reason,
+        "anomaly": repaired_core["anomaly"],
+        "defect_type": repaired_core["defect_type"],
+        "reason": repaired_core["reason"],
         "confidence": None,
         "bbox": _normalize_bbox_or_fallback(bbox_value, sample_id),
     }
@@ -508,8 +532,12 @@ def _drain_vlm_errors(round_idx: int) -> List[Dict[str, Any]]:
     return errs
 
 
-def _schema_valid(meta: Mapping[str, Any]) -> bool:
-    return bool(meta.get("parse_ok")) and bool(meta.get("schema_valid"))
+def _schema_valid(meta: Mapping[str, Any], parsed: Mapping[str, Any]) -> bool:
+    if not (bool(meta.get("parse_ok")) and bool(meta.get("schema_valid"))):
+        return False
+    anomaly_ok = _normalize_yesno(parsed.get("anomaly")) in {"yes", "no"}
+    defect_type_ok = bool(_safe_str(parsed.get("defect_type")).strip())
+    return bool(anomaly_ok and defect_type_ok)
 
 
 def _build_repair_prompt(base_prompt: str) -> str:
@@ -518,7 +546,8 @@ def _build_repair_prompt(base_prompt: str) -> str:
         "Inside it, output valid JSON with exactly these keys: "
         '{"anomaly_present": true|false, "top_anomaly": "string", "visual_descriptions": ["string", ...]}. '
         'Enum constraints: anomaly_present can only be true or false; if anomaly_present=false then '
-        'top_anomaly must be "none" and visual_descriptions must be []. '
+        'top_anomaly must be "none" and visual_descriptions must be []. If anomaly_present=true then '
+        'top_anomaly must be a non-empty defect label (not "none", not "unknown"). '
         "Do not output markdown, explanation, or any extra text."
     )
     return _safe_str(base_prompt) + strict_rule
@@ -571,7 +600,7 @@ def _vlm_generate_with_schema_repair(
 
     raw, parsed, meta, _ = _run(prompt)
     repair_summaries: List[Dict[str, Any]] = []
-    if _schema_valid(meta):
+    if _schema_valid(meta, parsed):
         meta["repair_attempted"] = False
         meta["repair_n"] = int(max(0, repair_n))
         return raw, parsed, meta
@@ -583,29 +612,49 @@ def _vlm_generate_with_schema_repair(
             {
                 "attempt": int(ridx),
                 "raw_text_summary": _summarize_raw_text(raw),
-                "schema_valid": bool(meta.get("schema_valid")),
+                "schema_valid": bool(_schema_valid(meta, parsed)),
                 "parse_ok": bool(meta.get("parse_ok")),
                 "schema_errors": list(meta.get("schema_errors", []) or []),
                 "parse_error": _safe_str(meta.get("error")),
+                "anomaly_value": _safe_str(parsed.get("anomaly")),
+                "defect_type_value": _safe_str(parsed.get("defect_type")),
+                "repair_failed": True,
             }
         )
+        print(
+            f"[schema_repair] sample_id={sample_id} round={round_idx} attempt={ridx}/{total_repairs} failed "
+            f"parse_ok={bool(meta.get('parse_ok'))} contract_schema_valid={bool(meta.get('schema_valid'))} "
+            f"anomaly={_safe_str(parsed.get('anomaly'))} defect_type={_safe_str(parsed.get('defect_type'))} "
+            f"errors={list(meta.get('schema_errors', []) or [])} parse_error={_safe_str(meta.get('error'))}",
+            file=sys.stderr,
+        )
         raw, parsed, meta, _ = _run(repair_prompt)
-        if _schema_valid(meta):
+        if _schema_valid(meta, parsed):
             meta["repair_attempted"] = True
             meta["repair_n"] = int(total_repairs)
             meta["repair_attempt_used"] = int(ridx)
             meta["repair_history"] = repair_summaries
+            if repair_summaries:
+                meta["repair_failed"] = True
             return raw, parsed, meta
 
     repair_summaries.append(
         {
             "attempt": int(total_repairs + 1),
             "raw_text_summary": _summarize_raw_text(raw),
-            "schema_valid": bool(meta.get("schema_valid")),
+            "schema_valid": bool(_schema_valid(meta, parsed)),
             "parse_ok": bool(meta.get("parse_ok")),
             "schema_errors": list(meta.get("schema_errors", []) or []),
             "parse_error": _safe_str(meta.get("error")),
+            "anomaly_value": _safe_str(parsed.get("anomaly")),
+            "defect_type_value": _safe_str(parsed.get("defect_type")),
+            "repair_failed": True,
         }
+    )
+    print(
+        f"[schema_repair] sample_id={sample_id} round={round_idx} exhausted_retries={total_repairs}; "
+        "forcing schema-valid fallback final.",
+        file=sys.stderr,
     )
     forced_raw = _make_forced_valid_answer()
     forced_parsed, forced_meta = _parse_agent_json(forced_raw)
