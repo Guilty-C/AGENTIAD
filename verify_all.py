@@ -1,4 +1,4 @@
-# [REMOTE EXECUTION DETECTED? CHECK GUIDELINES]
+﻿# [REMOTE EXECUTION DETECTED? CHECK GUIDELINES]
 # This project enforces a strict "Zero-Pollution" remote execution protocol for shared lab servers.
 # See REMOTE_EXECUTION_GUIDE.txt for the mandatory "Upload -> Tmp Run -> Cleanup" workflow.
 
@@ -329,6 +329,11 @@ def _resolve_hf_home_and_cache(env: Dict[str, str]) -> tuple[Path, Path]:
         hub_cache = hf_home / "hub"
     return hf_home.resolve(), hub_cache.resolve()
 
+def _platform_copy_model_cmd() -> str:
+    if os.name == "nt":
+        return "Copy-Item -Recurse -Force <DOWNLOADED_MODEL_DIR> <LOCAL_VLM_DIR>"
+    return "cp -a <DOWNLOADED_MODEL_DIR> <LOCAL_VLM_DIR>"
+
 def _looks_like_repo_id(model_id: str) -> bool:
     s = str(model_id or "").strip()
     return bool(s) and not Path(s).expanduser().exists()
@@ -401,7 +406,7 @@ def _check_offline_local_vlm_ready(
     hf_endpoint = str(env.get("HF_ENDPOINT", "")).strip()
     remediation_model = eff_model if _looks_like_repo_id(eff_model) else "Qwen/Qwen2.5-VL-3B-Instruct"
     remediation_a = (
-        "Copy-Item -Recurse -Force <DOWNLOADED_MODEL_DIR> <LOCAL_VLM_DIR>; "
+        f"{_platform_copy_model_cmd()}; "
         "python verify_all.py --mode phase2_full --output-dir <OUTPUT_DIR> --seeds 0 --strict-contract "
         "--vlm-model-local-dir <LOCAL_VLM_DIR>"
     )
@@ -1808,11 +1813,9 @@ class AgentInfer06(Stage):
                                     res.errors.append(
                                         f"Phase1 dataset completeness failure: effective_n ({l2_effective_n}) != expected ({expected_n}); n_skipped={n_skipped}, skip_reasons={skip_reasons}. Remediation: export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/."
                                     )
-                                    remediation = (
-                                        "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
-                                    )
-                                if remediation not in res.remediations:
-                                    res.remediations.append(remediation)
+                                    remediation = "export MMAD_ROOT=<local_mmad_root>; MMAD_ROOT must contain DS-MVTec/ and MVTec-AD/"
+                                    if remediation not in res.remediations:
+                                        res.remediations.append(remediation)
 
                 if not actual_model_id and isinstance(l2_data, dict):
                     out_csv_raw = str(l2_data.get("out_csv", "") or "").strip()

@@ -65,6 +65,15 @@ MMAD_ASSET_MODE: str = "unknown"
 _LOCAL_DIR_ENTRY_CACHE: Dict[str, Dict[str, Path]] = {}
 _CHAT_TEXT_CACHE: Dict[Tuple[str, int, str], str] = {}
 _LAST_VLM_EXCEPTIONS: List[Dict[str, Any]] = []
+_ANSWER_END_TAG = "</answer>"
+_STRICT_ANSWER_RULE = (
+    "\n\nOutput format (MUST, no extra text):\n"
+    "1) First token must be <answer>\n"
+    "2) Last token must be </answer>\n"
+    "3) Inside tags, output ONLY compact JSON with exactly keys: "
+    '{"anomaly_present": bool, "top_anomaly": "string", "visual_descriptions": ["string", ...]}\n'
+    'Example: <answer>{"anomaly_present":false,"top_anomaly":"none","visual_descriptions":[]}</answer>'
+)
 
 
 def _chat_template_key(processor: Any, n_images: int, prompt: str) -> Tuple[str, int, str]:
@@ -97,6 +106,69 @@ def _merge_cfg(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
 
 def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
+
+def _env_flag_1(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip() == "1"
+
+def _platform_copy_model_cmd() -> str:
+    if os.name == "nt":
+        return "Copy-Item -Recurse -Force <DOWNLOADED_MODEL_DIR> <LOCAL_VLM_DIR>"
+    return "cp -a <DOWNLOADED_MODEL_DIR> <LOCAL_VLM_DIR>"
+
+def _enforce_answer_only_prompt(base_prompt: str) -> str:
+    return _safe_str(base_prompt).rstrip() + _STRICT_ANSWER_RULE
+
+def _extract_first_answer_block(text: str) -> str:
+    s = _safe_str(text).strip()
+    start = s.find(PaperContract.TAG_ANSWER_START)
+    if start < 0:
+        return s
+    end = s.find(PaperContract.TAG_ANSWER_END, start + len(PaperContract.TAG_ANSWER_START))
+    if end < 0:
+        return s[start:].strip()
+    return s[start : end + len(PaperContract.TAG_ANSWER_END)].strip()
+
+def _meta_has_missing_answer_tags(meta: Mapping[str, Any]) -> bool:
+    err = _safe_str(meta.get("error", "")).lower()
+    return "missing <answer> tags" in err
+
+def _build_answer_stop_criteria(processor: Any) -> Any:
+    try:
+        from transformers import StoppingCriteria, StoppingCriteriaList
+    except Exception:
+        return None
+
+    tok = getattr(processor, "tokenizer", None)
+    if tok is None:
+        tok = processor
+    encode = getattr(tok, "encode", None)
+    if not callable(encode):
+        return None
+    try:
+        stop_ids = encode(PaperContract.TAG_ANSWER_END, add_special_tokens=False)
+    except Exception:
+        return None
+    if isinstance(stop_ids, int):
+        stop_ids = [int(stop_ids)]
+    if not isinstance(stop_ids, list) or not stop_ids:
+        return None
+    stop_ids = [int(x) for x in stop_ids]
+
+    class _StopOnAnswerEnd(StoppingCriteria):
+        def __init__(self, token_ids: List[int]):
+            super().__init__()
+            self._ids = token_ids
+            self._n = len(token_ids)
+
+        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:
+            if input_ids is None or getattr(input_ids, "shape", None) is None:
+                return False
+            if int(input_ids.shape[1]) < self._n:
+                return False
+            tail = input_ids[0, -self._n :].tolist()
+            return [int(x) for x in tail] == self._ids
+
+    return StoppingCriteriaList([_StopOnAnswerEnd(stop_ids)])
 
 
 def _sha256_upper_text(text: str) -> str:
@@ -399,11 +471,14 @@ def _ensure_local_only_model_ready_or_raise(vlm_model_id: str, local_only: bool)
 
     remediation_model = model_id_str if "/" in model_id_str else "Qwen/Qwen2.5-VL-3B-Instruct"
     cmd_a = (
-        "Copy-Item -Recurse -Force <DOWNLOADED_MODEL_DIR> <LOCAL_VLM_DIR>; "
+        f"{_platform_copy_model_cmd()}; "
         "python verify_all.py --mode phase2_full --strict-contract --dataset-split train --seeds 0 "
         "--vlm-model-local-dir <LOCAL_VLM_DIR>"
     )
-    cmd_b = f"HF_HOME=\"{hf_home}\" HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 huggingface-cli download \"{remediation_model}\""
+    cmd_b = (
+        f"HF_HOME=\"{hf_home}\" HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "
+        f"huggingface-cli download \"{remediation_model}\" --local-dir <DOWNLOADED_MODEL_DIR>"
+    )
     raise RuntimeError(
         "Offline local-only model check failed before from_pretrained. "
         f"vlm_model_id={model_id_str or 'NOT_SET'}; "
@@ -462,7 +537,7 @@ def resolve_mmad_root(project_root: Path, paths: Any) -> Tuple[Optional[Path], s
 def _detect_mmad_asset_mode(mmad_root: Optional[Path], image_env: Dict[str, Any]) -> str:
     has_local_assets = False
     if mmad_root is not None:
-        has_local_assets = (mmad_root / "DS-MVTec").exists() and (mmad_root / "MVTec-AD").exists()
+        has_local_assets = (mmad_root / "DS-MVTec").exists() or (mmad_root / "MVTec-AD").exists()
     if has_local_assets:
         return "local_root"
     offline = any(str(image_env.get(k, "")).strip() == "1" for k in ["HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE"])
@@ -710,15 +785,7 @@ def _schema_valid(meta: Mapping[str, Any], parsed: Mapping[str, Any]) -> bool:
 
 
 def _build_repair_prompt(base_prompt: str) -> str:
-    strict_rule = (
-        "\n\nRepair instruction (strict): return ONLY one <answer>...</answer> block. "
-        "Inside it, output valid JSON with exactly these keys: "
-        '{"anomaly_present": true|false, "top_anomaly": "string", "visual_descriptions": ["string", ...]}. '
-        'Enum constraints: anomaly_present can only be true or false; if anomaly_present=false then '
-        'top_anomaly must be "none" and visual_descriptions must be []. If anomaly_present=true then '
-        'top_anomaly must be a non-empty defect label (not "none", not "unknown"). '
-        "Do not output markdown, explanation, or any extra text."
-    )
+    strict_rule = "\n\n只输出 <answer>...</answer>，不要任何其它字符；立即重写。"
     return _safe_str(base_prompt) + strict_rule
 
 
@@ -741,11 +808,14 @@ def _vlm_generate_with_schema_repair(
     sdp_backend: str,
     max_retries: int,
     repair_n: int,
+    answer_stop_criteria: Any,
     dry_run: bool,
     sample_id: str,
     seed: int,
     round_idx: int,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    schema_repair_debug = _env_flag_1("SCHEMA_REPAIR_DEBUG")
+
     def _run(prompt_text: str) -> Tuple[str, Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
         if dry_run:
             raw_local = _vlm_generate_dry(images, prompt_text, sample_id, seed)
@@ -758,7 +828,9 @@ def _vlm_generate_with_schema_repair(
                 generation_config,
                 sdp_backend=sdp_backend,
                 max_retries=max_retries,
+                answer_stop_criteria=answer_stop_criteria,
             )
+        raw_local = _extract_first_answer_block(raw_local)
         parsed_local, meta_local = _parse_agent_json(raw_local)
         if not isinstance(meta_local, dict):
             meta_local = {}
@@ -790,13 +862,14 @@ def _vlm_generate_with_schema_repair(
                 "repair_failed": True,
             }
         )
-        print(
-            f"[schema_repair] sample_id={sample_id} round={round_idx} attempt={ridx}/{total_repairs} failed "
-            f"parse_ok={bool(meta.get('parse_ok'))} contract_schema_valid={bool(meta.get('schema_valid'))} "
-            f"anomaly={_safe_str(parsed.get('anomaly'))} defect_type={_safe_str(parsed.get('defect_type'))} "
-            f"errors={list(meta.get('schema_errors', []) or [])} parse_error={_safe_str(meta.get('error'))}",
-            file=sys.stderr,
-        )
+        if schema_repair_debug:
+            print(
+                f"[schema_repair] sample_id={sample_id} round={round_idx} attempt={ridx}/{total_repairs} failed "
+                f"parse_ok={bool(meta.get('parse_ok'))} contract_schema_valid={bool(meta.get('schema_valid'))} "
+                f"anomaly={_safe_str(parsed.get('anomaly'))} defect_type={_safe_str(parsed.get('defect_type'))} "
+                f"errors={list(meta.get('schema_errors', []) or [])} parse_error={_safe_str(meta.get('error'))}",
+                file=sys.stderr,
+            )
         raw, parsed, meta, _ = _run(repair_prompt)
         if _schema_valid(meta, parsed):
             meta["repair_attempted"] = True
@@ -820,11 +893,12 @@ def _vlm_generate_with_schema_repair(
             "repair_failed": True,
         }
     )
-    print(
-        f"[schema_repair] sample_id={sample_id} round={round_idx} exhausted_retries={total_repairs}; "
-        "forcing schema-valid fallback final.",
-        file=sys.stderr,
-    )
+    if schema_repair_debug:
+        print(
+            f"[schema_repair] sample_id={sample_id} round={round_idx} exhausted_retries={total_repairs}; "
+            "forcing schema-valid fallback final.",
+            file=sys.stderr,
+        )
     forced_raw = _make_forced_valid_answer()
     forced_parsed, forced_meta = _parse_agent_json(forced_raw)
     if not isinstance(forced_meta, dict):
@@ -1072,6 +1146,7 @@ def _vlm_generate(
     generation_config: Any,
     sdp_backend: str = "auto",
     max_retries: int = 2,
+    answer_stop_criteria: Any = None,
 ) -> str:
     global _LAST_VLM_EXCEPTIONS
     _LAST_VLM_EXCEPTIONS = []
@@ -1140,10 +1215,17 @@ def _vlm_generate(
             sdp_ctx = _sdp_context(torch, backend_for_attempt)
             with torch.inference_mode():
                 with sdp_ctx:
+                    gen_kwargs: Dict[str, Any] = {"generation_config": generation_config}
+                    if answer_stop_criteria is not None:
+                        gen_kwargs["stopping_criteria"] = answer_stop_criteria
                     try:
-                        gen_ids = model.generate(**inputs, generation_config=generation_config, use_cache=False)
+                        gen_ids = model.generate(**inputs, **gen_kwargs, use_cache=False)
                     except TypeError:
-                        gen_ids = model.generate(**inputs, generation_config=generation_config)
+                        try:
+                            gen_ids = model.generate(**inputs, **gen_kwargs)
+                        except TypeError:
+                            gen_kwargs.pop("stopping_criteria", None)
+                            gen_ids = model.generate(**inputs, **gen_kwargs)
             input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else None
             decode_ids = gen_ids
             if input_ids is not None and hasattr(input_ids, "shape") and hasattr(gen_ids, "shape"):
@@ -1312,6 +1394,15 @@ def main() -> int:
         max_samples = 999999999  # Effectively infinite for this dataset
     else:
         max_samples = int(args.max_samples) if args.max_samples is not None else int(cfg.get("max_samples", 50))
+    dev_max_raw = str(os.environ.get("DEV_MAX_SAMPLES", "")).strip()
+    if dev_max_raw:
+        try:
+            dev_cap = max(1, int(dev_max_raw))
+            if dev_cap < max_samples:
+                print(f"[DEV] DEV_MAX_SAMPLES={dev_cap} applied (was {max_samples})", file=sys.stderr)
+                max_samples = dev_cap
+        except Exception:
+            print(f"[DEV] ignoring invalid DEV_MAX_SAMPLES={dev_max_raw}", file=sys.stderr)
 
     vlm_model_id = str(cfg.get("vlm_model_id", "")).strip()
     if not vlm_model_id:
@@ -1377,6 +1468,9 @@ def main() -> int:
             "Compare query and reference. Is there an anomaly? Output JSON: {\"anomaly_present\": true/false, \"top_anomaly\": \"...\"}"
         )
     )
+    prompt_global = _enforce_answer_only_prompt(prompt_global)
+    prompt_crop = _enforce_answer_only_prompt(prompt_crop)
+    prompt_cr = _enforce_answer_only_prompt(prompt_cr)
     prompt_hash = sha256_text(prompt_global + "\n---\n" + prompt_crop + "\n---\n" + prompt_cr)
 
     false_set = {"", "0", "false", "no", "off", "none", "null"}
@@ -1440,6 +1534,7 @@ def main() -> int:
     processor = None
     model = None
     generation_config = None
+    answer_stop_criteria = None
 
     def _ensure_pad_token_id_explicit(processor_obj: Any, model_obj: Any, generation_cfg_obj: Any) -> None:
         tok = getattr(processor_obj, "tokenizer", None)
@@ -1679,6 +1774,7 @@ def main() -> int:
             use_cache=False,
         )
         _ensure_pad_token_id_explicit(processor, model, generation_config)
+        answer_stop_criteria = _build_answer_stop_criteria(processor)
 
         if dataset_id.endswith(".json") or dataset_id.endswith(".jsonl"):
             ds = load_dataset("json", data_files=dataset_id)
@@ -1827,6 +1923,18 @@ def main() -> int:
     n_samples_with_tool_call = 0
     tool_calls_total = 0
     csv_write_fail_count = 0
+    schema_repair_turn_count = 0
+    schema_repair_failed_turn_count = 0
+    missing_answer_round_count = 0
+    missing_answer_sample_ids: set[str] = set()
+    schema_sample_stats: Dict[str, Dict[str, Any]] = {}
+    schema_stats_every = 200
+    schema_stats_every_raw = str(os.environ.get("SCHEMA_REPAIR_STATS_EVERY", "")).strip()
+    if schema_stats_every_raw:
+        try:
+            schema_stats_every = max(1, int(schema_stats_every_raw))
+        except Exception:
+            schema_stats_every = 200
     perf_saved_second_reads = 0
     perf_crop_events = 0
     perf_ref_events = 0
@@ -1882,6 +1990,57 @@ def main() -> int:
             meter = f"{done_i}/{total_i} [{elapsed:.1f}s]"
         print(f"{progress_script_prefix} {meter}", file=sys.stderr, flush=True)
         progress_last_printed = done_i
+
+    def _update_schema_stats(sample_id: str, round_idx: int, meta: Mapping[str, Any]) -> None:
+        nonlocal schema_repair_turn_count, schema_repair_failed_turn_count, missing_answer_round_count
+        sid = str(sample_id)
+        stat = schema_sample_stats.get(sid)
+        if not isinstance(stat, dict):
+            stat = {
+                "sample_id": sid,
+                "repair_used": False,
+                "repair_failed": False,
+                "missing_answer_tags": False,
+                "rounds": [],
+            }
+            schema_sample_stats[sid] = stat
+        if bool(meta.get("repair_attempted")):
+            schema_repair_turn_count += 1
+            stat["repair_used"] = True
+        if bool(meta.get("repair_failed")):
+            schema_repair_failed_turn_count += 1
+            stat["repair_failed"] = True
+        miss = _meta_has_missing_answer_tags(meta)
+        if miss:
+            missing_answer_round_count += 1
+            stat["missing_answer_tags"] = True
+            missing_answer_sample_ids.add(sid)
+        rounds = stat.get("rounds")
+        if not isinstance(rounds, list):
+            rounds = []
+            stat["rounds"] = rounds
+        rounds.append(
+            {
+                "round": int(round_idx),
+                "repair_attempted": bool(meta.get("repair_attempted")),
+                "repair_failed": bool(meta.get("repair_failed")),
+                "missing_answer_tags": bool(miss),
+            }
+        )
+
+    def _log_schema_stats_progress(processed: int, final: bool = False) -> None:
+        if processed <= 0:
+            return
+        if (not final) and (processed % schema_stats_every != 0):
+            return
+        missing_rate = float(len(missing_answer_sample_ids)) / float(processed)
+        print(
+            f"[schema_stats] processed={processed} repair_count={int(schema_repair_turn_count)} "
+            f"repair_failed_count={int(schema_repair_failed_turn_count)} "
+            f"missing_answer_samples={int(len(missing_answer_sample_ids))} "
+            f"missing_answer_rate={missing_rate:.4f}",
+            file=sys.stderr,
+        )
 
     def _trace_has_tool_call(trace_path: Path, fallback_trace: Mapping[str, Any]) -> bool:
         tr: Any = None
@@ -2062,6 +2221,7 @@ def main() -> int:
                     sdp_backend=sdp_backend,
                     max_retries=max_retries,
                     repair_n=repair_n,
+                    answer_stop_criteria=answer_stop_criteria,
                     dry_run=bool(args.dry_run),
                     sample_id=sample_id,
                     seed=seed,
@@ -2082,6 +2242,7 @@ def main() -> int:
                     "meta": meta0,
                 }
             )
+            _update_schema_stats(sample_id, 0, meta0)
             if bool(meta0.get("repair_failed")):
                 trace["repair_failed"] = True
 
@@ -2158,6 +2319,7 @@ def main() -> int:
                          pbar.update(1)
                      elif progress_fallback:
                          _stderr_progress(len(rows), progress_total)
+                _log_schema_stats_progress(len(rows))
                 _cleanup_cuda_memory()
                 continue
 
@@ -2206,6 +2368,7 @@ def main() -> int:
                 sdp_backend=sdp_backend,
                 max_retries=max_retries,
                 repair_n=repair_n,
+                answer_stop_criteria=answer_stop_criteria,
                 dry_run=bool(args.dry_run),
                 sample_id=sample_id,
                 seed=seed,
@@ -2223,6 +2386,7 @@ def main() -> int:
                     "meta": meta1,
                 }
             )
+            _update_schema_stats(sample_id, 1, meta1)
             if bool(meta1.get("repair_failed")):
                 trace["repair_failed"] = True
             pz_called = True
@@ -2304,6 +2468,7 @@ def main() -> int:
                     sdp_backend=sdp_backend,
                     max_retries=max_retries,
                     repair_n=repair_n,
+                    answer_stop_criteria=answer_stop_criteria,
                     dry_run=bool(args.dry_run),
                     sample_id=sample_id,
                     seed=seed,
@@ -2324,6 +2489,7 @@ def main() -> int:
                         "ref_sample_id": ref_sample_id
                     }
                 )
+                _update_schema_stats(sample_id, 2, meta2)
                 if bool(meta2.get("repair_failed")):
                     trace["repair_failed"] = True
                 tool_calls_total += 1
@@ -2393,6 +2559,7 @@ def main() -> int:
                     pbar.update(1)
                 elif progress_fallback:
                     _stderr_progress(len(rows), progress_total)
+            _log_schema_stats_progress(len(rows))
             _cleanup_cuda_memory()
 
         csv_columns = [
@@ -2498,6 +2665,29 @@ def main() -> int:
             "out_csv": str(out_csv),
             "trace_dir": str(trace_root),
         }
+        trace_main_jsonl = trace_root / "main.jsonl"
+        with open(trace_main_jsonl, "w", encoding="utf-8") as f_main:
+            for row in rows:
+                sid = str(row.get("sample_id") or "")
+                st = schema_sample_stats.get(sid, {})
+                line_obj = {
+                    "sample_id": sid,
+                    "repair_used": bool(st.get("repair_used", False)),
+                    "repair_failed": bool(st.get("repair_failed", False)),
+                    "missing_answer_tags": bool(st.get("missing_answer_tags", False)),
+                }
+                f_main.write(json.dumps(line_obj, ensure_ascii=False, sort_keys=True) + "\n")
+        missing_answer_rate = (float(len(missing_answer_sample_ids)) / float(len(rows))) if rows else 0.0
+        summary["schema_stats"] = {
+            "main_jsonl": str(trace_main_jsonl),
+            "processed_count": int(len(rows)),
+            "repair_count": int(schema_repair_turn_count),
+            "repair_failed_count": int(schema_repair_failed_turn_count),
+            "missing_answer_round_count": int(missing_answer_round_count),
+            "missing_answer_sample_count": int(len(missing_answer_sample_ids)),
+            "missing_answer_rate": float(missing_answer_rate),
+            "schema_stats_every": int(schema_stats_every),
+        }
         trace_files = list(trace_root.rglob("trace.json")) if trace_root.exists() else []
         summary["trace_count"] = int(len(trace_files))
         summary["trace_emitted"] = bool(len(trace_files) > 0)
@@ -2549,6 +2739,18 @@ def main() -> int:
         "missing_dataset_prefixes": missing_dataset_prefixes,
         "missing_example_files": missing_example_files,
     }
+    processed_count = int(len(rows))
+    missing_answer_rate = (float(len(missing_answer_sample_ids)) / float(processed_count)) if processed_count else 0.0
+    result_summary["schema_stats"] = {
+        "processed_count": processed_count,
+        "repair_count": int(schema_repair_turn_count),
+        "repair_failed_count": int(schema_repair_failed_turn_count),
+        "missing_answer_round_count": int(missing_answer_round_count),
+        "missing_answer_sample_count": int(len(missing_answer_sample_ids)),
+        "missing_answer_rate": float(missing_answer_rate),
+        "schema_stats_every": int(schema_stats_every),
+        "main_jsonl": str(trace_root / "main.jsonl"),
+    }
 
     # Log readable summary to stderr (Audit/Debug)
     # Ensure all logs go to stderr to keep stdout clean for harness
@@ -2562,6 +2764,17 @@ def main() -> int:
     if rows:
         print(f"first_sample_id={first_sample_id}", file=sys.stderr)
         print(f"first_trace_fingerprint_hash={first_hash}", file=sys.stderr)
+    _log_schema_stats_progress(processed_count, final=True)
+    print(
+        f"[schema_summary] processed={processed_count} repair_count={int(schema_repair_turn_count)} "
+        f"repair_failed_count={int(schema_repair_failed_turn_count)} "
+        f"missing_answer_samples={int(len(missing_answer_sample_ids))} "
+        f"missing_answer_rounds={int(missing_answer_round_count)} "
+        f"missing_answer_rate={missing_answer_rate:.4f} "
+        f"threshold=0.0500 pass={str(missing_answer_rate < 0.05).lower()} "
+        f"main_jsonl={str(trace_root / 'main.jsonl')}",
+        file=sys.stderr,
+    )
 
     # Contract: Single line JSON to stderr (to keep stdout clean for harness)
     print(f"L2_RESULT_JSON={json.dumps(result_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
