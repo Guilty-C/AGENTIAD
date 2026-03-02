@@ -12,12 +12,14 @@ import zipfile
 import random
 import argparse
 import time
+import platform
 from pathlib import Path
 import pathlib
 import re
 import csv
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Sequence, Set
+from contextlib import contextmanager
 
 # --- Configuration & Paths ---
 
@@ -195,6 +197,97 @@ class CmdRunner:
             except subprocess.TimeoutExpired:
                 print(f"[Cmd] {cmd[0]} TIMED OUT after {timeout}s", file=sys.stderr)
                 return None
+
+class _TeeStream:
+    def __init__(self, terminal_stream, log_fp):
+        self._terminal_stream = terminal_stream
+        self._log_fp = log_fp
+
+    def write(self, data):
+        if data is None:
+            return 0
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", errors="replace")
+        self._terminal_stream.write(data)
+        self._log_fp.write(data)
+        self.flush()
+        return len(data)
+
+    def flush(self):
+        self._terminal_stream.flush()
+        self._log_fp.flush()
+
+    def isatty(self):
+        return bool(getattr(self._terminal_stream, "isatty", lambda: False)())
+
+    @property
+    def encoding(self):
+        return getattr(self._terminal_stream, "encoding", "utf-8")
+
+    def fileno(self):
+        return self._terminal_stream.fileno()
+
+@contextmanager
+def _tee_terminal_to_log(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8", buffering=1) as log_fp:
+        orig_stdout, orig_stderr = sys.stdout, sys.stderr
+        sys.stdout = _TeeStream(orig_stdout, log_fp)
+        sys.stderr = _TeeStream(orig_stderr, log_fp)
+        try:
+            yield log_fp
+        finally:
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            finally:
+                sys.stdout = orig_stdout
+                sys.stderr = orig_stderr
+
+def _safe_subprocess_text(cmd: List[str]) -> str:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if proc.returncode == 0:
+            return (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    except Exception:
+        pass
+    return ""
+
+def _build_terminal_log_path(output_dir: Path) -> Path:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return output_dir / "logs" / f"terminal_{ts}_{os.getpid()}.txt"
+
+def _emit_terminal_log_header(log_path: Path, args: argparse.Namespace, output_dir: Path):
+    cmdline = " ".join(str(x) for x in [sys.executable, Path(__file__).name, *sys.argv[1:]])
+    git_commit = _safe_subprocess_text(["git", "rev-parse", "HEAD"])[:40]
+    if not git_commit:
+        git_commit = "UNKNOWN"
+    env_keys = [
+        "PYTHONPATH", "CUDA_VISIBLE_DEVICES", "MMAD_ROOT",
+        "HF_HOME", "TRANSFORMERS_OFFLINE", "VLM_MODEL_ID", "VLM_MODEL_LOCAL_DIR",
+    ]
+    env_summary = {k: os.environ.get(k, "") for k in env_keys if os.environ.get(k, "")}
+    print(f"[Log] terminal_log_path={log_path}")
+    print(f"[Log] start_time_local={time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[Log] cwd={Path.cwd()}")
+    print(f"[Log] output_dir={output_dir}")
+    print(f"[Log] argv={cmdline}")
+    print(f"[Log] mode={getattr(args, 'mode', 'unknown')}")
+    print(f"[Log] python={sys.version.splitlines()[0]}")
+    print(f"[Log] platform={platform.platform()}")
+    print(f"[Log] git_commit={git_commit}")
+    print(f"[Log] env_summary={json.dumps(env_summary, ensure_ascii=False, sort_keys=True)}")
+
+def _cleanup_work_dir_preserve_logs(work_dir: Path):
+    if not work_dir.exists():
+        return
+    for child in work_dir.iterdir():
+        if child.name == "logs" and child.is_dir():
+            continue
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
 
 class CmdBuilder:
     def __init__(self, script_path: Path):
@@ -2801,7 +2894,7 @@ def run_workload(args):
 
     # NORMAL WORKLOAD
     try:
-        if work_dir.exists(): shutil.rmtree(work_dir, ignore_errors=True)
+        _cleanup_work_dir_preserve_logs(work_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         return {
@@ -2946,49 +3039,58 @@ def main():
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         args.output_dir = f"outputs/workload_{timestamp}"
 
-    try:
-        res = run_workload(args)
-    except Exception as e:
-        res = {
-            "success": False,
-            "errors": [f"Unhandled Exception: {str(e)}"]
-        }
+    output_dir = Path(args.output_dir).resolve()
+    terminal_log_path = _build_terminal_log_path(output_dir)
 
-    if isinstance(res, dict):
-        payload = res
-    else:
-        payload = {
-            "success": getattr(res, "success", False),
-            "gates": getattr(res, "gates", {}),
-            "artifacts": getattr(res, "artifacts", {}),
-            "errors": getattr(res, "errors", []),
-            "measurements": getattr(res, "measurements", {}),
-        }
-    
-    print("WORKLOAD_RESULT=" + json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    if args.mode in {"phase1_baseline", "phase1_acceptance_only", "phase2_full_infer"}:
-        acceptance = payload.get("acceptance_a", {
-            "success": False,
-            "errors": ["acceptance payload missing"],
-            "seeds": [0, 1, 2],
-            "dataset_binding_hash": "",
-            "dataset_binding_hash_source": "",
-            "per_seed_metrics_path": [],
-            "summary_path": "",
-            "n_total": 0,
-            "evidence_paths": [],
-        })
-        if args.mode == "phase2_full_infer":
-            acceptance = payload.get("acceptance_b", {
+    with _tee_terminal_to_log(terminal_log_path):
+        _emit_terminal_log_header(terminal_log_path, args, output_dir)
+        try:
+            res = run_workload(args)
+        except Exception as e:
+            res = {
+                "success": False,
+                "errors": [f"Unhandled Exception: {str(e)}"]
+            }
+
+        if isinstance(res, dict):
+            payload = res
+        else:
+            payload = {
+                "success": getattr(res, "success", False),
+                "gates": getattr(res, "gates", {}),
+                "artifacts": getattr(res, "artifacts", {}),
+                "errors": getattr(res, "errors", []),
+                "measurements": getattr(res, "measurements", {}),
+            }
+
+        if not isinstance(payload.get("artifacts"), dict):
+            payload["artifacts"] = {}
+        payload["artifacts"]["terminal_log_path"] = str(terminal_log_path)
+
+        print("WORKLOAD_RESULT=" + json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        if args.mode in {"phase1_baseline", "phase1_acceptance_only", "phase2_full_infer"}:
+            acceptance = payload.get("acceptance_a", {
                 "success": False,
                 "errors": ["acceptance payload missing"],
-                "seeds": payload.get("seeds", []),
+                "seeds": [0, 1, 2],
+                "dataset_binding_hash": "",
+                "dataset_binding_hash_source": "",
+                "per_seed_metrics_path": [],
+                "summary_path": "",
+                "n_total": 0,
                 "evidence_paths": [],
-                "toolcall_rate_avg": 0.0,
             })
-        print("ACCEPTANCE_JSON=" + json.dumps(acceptance, ensure_ascii=False, sort_keys=True))
-    
-    sys.exit(0 if payload.get("success", False) else 1)
+            if args.mode == "phase2_full_infer":
+                acceptance = payload.get("acceptance_b", {
+                    "success": False,
+                    "errors": ["acceptance payload missing"],
+                    "seeds": payload.get("seeds", []),
+                    "evidence_paths": [],
+                    "toolcall_rate_avg": 0.0,
+                })
+            print("ACCEPTANCE_JSON=" + json.dumps(acceptance, ensure_ascii=False, sort_keys=True))
+        print(f"terminal_log_path={terminal_log_path}")
+        sys.exit(0 if payload.get("success", False) else 1)
 
 if __name__ == "__main__":
     main()
