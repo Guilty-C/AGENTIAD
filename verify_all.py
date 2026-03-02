@@ -55,7 +55,10 @@ class StageContext:
     strict_j_mode: bool = False
     dataset_split: str = "test"
     env_overrides: Dict[str, str] = field(default_factory=dict)
+    strict_contract: bool = False
     vlm_model_id: Optional[str] = None
+    requested_vlm_model_id: Optional[str] = None
+    requested_vlm_model_local_dir: Optional[str] = None
     vlm_model_source: str = "config"
     vlm_max_side: Optional[int] = None
     sdp_backend: Optional[str] = None
@@ -262,11 +265,27 @@ def _emit_terminal_log_header(log_path: Path, args: argparse.Namespace, output_d
     git_commit = _safe_subprocess_text(["git", "rev-parse", "HEAD"])[:40]
     if not git_commit:
         git_commit = "UNKNOWN"
-    env_keys = [
-        "PYTHONPATH", "CUDA_VISIBLE_DEVICES", "MMAD_ROOT",
-        "HF_HOME", "TRANSFORMERS_OFFLINE", "VLM_MODEL_ID", "VLM_MODEL_LOCAL_DIR",
+    hf_home = str(
+        os.environ.get("HF_HOME")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or (Path.home() / ".cache" / "huggingface")
+    )
+    env_summary = {
+        "HF_HOME": hf_home,
+        "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", ""),
+        "TRANSFORMERS_OFFLINE": os.environ.get("TRANSFORMERS_OFFLINE", ""),
+        "HF_DATASETS_OFFLINE": os.environ.get("HF_DATASETS_OFFLINE", ""),
+        "HF_ENDPOINT": os.environ.get("HF_ENDPOINT", ""),
+        "MMAD_ROOT": os.environ.get("MMAD_ROOT", ""),
+    }
+    optional_env_keys = [
+        "PYTHONPATH", "CUDA_VISIBLE_DEVICES", "VLM_MODEL_ID",
+        "VLM_MODEL_LOCAL_DIR", "HUGGINGFACE_HUB_CACHE",
     ]
-    env_summary = {k: os.environ.get(k, "") for k in env_keys if os.environ.get(k, "")}
+    for k in optional_env_keys:
+        v = os.environ.get(k, "")
+        if v:
+            env_summary[k] = v
     print(f"[Log] terminal_log_path={log_path}")
     print(f"[Log] start_time_local={time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"[Log] cwd={Path.cwd()}")
@@ -288,6 +307,164 @@ def _cleanup_work_dir_preserve_logs(work_dir: Path):
             shutil.rmtree(child, ignore_errors=True)
         else:
             child.unlink(missing_ok=True)
+
+def _is_offline_flag_1(v: Any) -> bool:
+    return str(v or "").strip() == "1"
+
+def _effective_env(env_overrides: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    env = dict(os.environ)
+    if env_overrides:
+        env.update({str(k): str(v) for k, v in env_overrides.items()})
+    return env
+
+def _resolve_hf_home_and_cache(env: Dict[str, str]) -> tuple[Path, Path]:
+    hf_home_raw = str(env.get("HF_HOME", "") or env.get("HUGGINGFACE_HUB_CACHE", "")).strip()
+    hf_home = Path(hf_home_raw).expanduser() if hf_home_raw else (Path.home() / ".cache" / "huggingface")
+    hub_cache_raw = str(env.get("HUGGINGFACE_HUB_CACHE", "")).strip()
+    if hub_cache_raw:
+        hub_cache = Path(hub_cache_raw).expanduser()
+    elif hf_home.name.lower() == "hub":
+        hub_cache = hf_home
+    else:
+        hub_cache = hf_home / "hub"
+    return hf_home.resolve(), hub_cache.resolve()
+
+def _looks_like_repo_id(model_id: str) -> bool:
+    s = str(model_id or "").strip()
+    return bool(s) and not Path(s).expanduser().exists()
+
+def _local_model_dir_ready(model_dir: Path) -> bool:
+    if not model_dir.exists() or not model_dir.is_dir():
+        return False
+    has_config = (model_dir / "config.json").exists()
+    has_tokenizer = (
+        (model_dir / "tokenizer.json").exists()
+        or (model_dir / "tokenizer_config.json").exists()
+        or (model_dir / "preprocessor_config.json").exists()
+    )
+    return bool(has_config and has_tokenizer)
+
+def _mode_requires_infer_vlm_gate(mode_name: str) -> bool:
+    mode = str(mode_name or "").strip()
+    return mode in {"default", "contract_smoke", "phase1_baseline", "phase2_full_infer", "strict_j"}
+
+def _offline_vlm_gate_required(mode_name: str, strict_contract: bool, env: Dict[str, str]) -> bool:
+    if not strict_contract:
+        return False
+    if not _mode_requires_infer_vlm_gate(mode_name):
+        return False
+    # Hard gate in strict-contract if either core offline switch is on.
+    return _is_offline_flag_1(env.get("HF_HUB_OFFLINE")) or _is_offline_flag_1(env.get("TRANSFORMERS_OFFLINE"))
+
+def _check_offline_local_vlm_ready(
+    *,
+    mode_name: str,
+    strict_contract: bool,
+    requested_model_id: str,
+    requested_local_dir: str,
+    effective_model_id: str,
+    env: Dict[str, str],
+) -> Dict[str, Any]:
+    check_required = _offline_vlm_gate_required(mode_name, strict_contract, env)
+    if not check_required:
+        return {"required": False, "ok": True, "reason": "not_required"}
+
+    hf_home, hub_cache = _resolve_hf_home_and_cache(env)
+    req_local = str(requested_local_dir or "").strip()
+    req_model = str(requested_model_id or "").strip()
+    eff_model = str(effective_model_id or req_model or "").strip()
+    checked_notes: List[str] = []
+    ready = False
+    ready_source = ""
+
+    if req_local:
+        p = Path(req_local).expanduser()
+        if p.exists() and p.is_dir() and _local_model_dir_ready(p):
+            ready = True
+            ready_source = f"vlm_model_local_dir:{p.resolve()}"
+        else:
+            checked_notes.append(f"vlm_model_local_dir_not_ready:{p}")
+
+    if (not ready) and eff_model:
+        p = Path(eff_model).expanduser()
+        if p.exists() and p.is_dir():
+            if _local_model_dir_ready(p):
+                ready = True
+                ready_source = f"vlm_model_id_local_path:{p.resolve()}"
+            else:
+                checked_notes.append(f"vlm_model_id_local_path_not_ready:{p}")
+        else:
+            checked_notes.append(f"vlm_model_id_not_local_dir:{eff_model}")
+    elif not ready and not eff_model:
+        checked_notes.append("vlm_model_id_not_set")
+
+    hf_endpoint = str(env.get("HF_ENDPOINT", "")).strip()
+    remediation_model = eff_model if _looks_like_repo_id(eff_model) else "Qwen/Qwen2.5-VL-3B-Instruct"
+    remediation_a = (
+        "Copy-Item -Recurse -Force <DOWNLOADED_MODEL_DIR> <LOCAL_VLM_DIR>; "
+        "python verify_all.py --mode phase2_full --output-dir <OUTPUT_DIR> --seeds 0 --strict-contract "
+        "--vlm-model-local-dir <LOCAL_VLM_DIR>"
+    )
+    remediation_b = (
+        f"HF_HOME=\"{hf_home}\" HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "
+        f"huggingface-cli download \"{remediation_model}\" --local-dir <DOWNLOADED_MODEL_DIR>"
+    )
+    if ready:
+        return {
+            "required": True,
+            "ok": True,
+            "ready_source": ready_source,
+            "checked_notes": checked_notes,
+            "hf_home": str(hf_home),
+            "hf_cache": str(hub_cache),
+        }
+
+    msg_lines = [
+        "离线模式必须提供本地 VLM 目录（strict-contract + offline）。",
+        f"current_vlm_model_id={eff_model or 'NOT_SET'}",
+        f"current_vlm_model_local_dir={req_local or 'NOT_SET'}",
+        f"HF_HOME={hf_home}",
+        f"HF_CACHE={hub_cache}",
+    ]
+    if hf_endpoint:
+        msg_lines.append(f"HF_ENDPOINT={hf_endpoint}")
+    msg_lines.append(f"checked={'; '.join(checked_notes) if checked_notes else 'none'}")
+    msg_lines.append("fix_a_local_dir=" + remediation_a)
+    msg_lines.append("fix_b_preload_cache=" + remediation_b)
+    return {
+        "required": True,
+        "ok": False,
+        "msg": " | ".join(msg_lines),
+        "checked_notes": checked_notes,
+        "hf_home": str(hf_home),
+        "hf_cache": str(hub_cache),
+        "remediation_a": remediation_a,
+        "remediation_b": remediation_b,
+    }
+
+def _check_offline_model_readiness_for_probe(
+    ctx: StageContext,
+) -> Dict[str, Any]:
+    env = _effective_env(ctx.env_overrides)
+    if ctx.phase2_full_infer:
+        mode_name = "phase2_full_infer"
+    elif ctx.phase1_baseline:
+        mode_name = "phase1_baseline"
+    elif ctx.strict_j_mode:
+        mode_name = "strict_j"
+    else:
+        mode_name = "contract_smoke"
+    requested_local_dir = str(ctx.requested_vlm_model_local_dir or "").strip()
+    requested_model_id = str(ctx.requested_vlm_model_id or "").strip()
+    effective_model_id = str(ctx.vlm_model_id or requested_model_id or "").strip()
+    return _check_offline_local_vlm_ready(
+        mode_name=mode_name,
+        strict_contract=bool(ctx.strict_contract),
+        requested_model_id=requested_model_id,
+        requested_local_dir=requested_local_dir,
+        effective_model_id=effective_model_id,
+        env=env,
+    )
 
 class CmdBuilder:
     def __init__(self, script_path: Path):
@@ -1263,6 +1440,34 @@ class PreflightDeps(Stage):
 
 class ProbeIds(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
+        offline_check = _check_offline_model_readiness_for_probe(ctx)
+        if offline_check.get("required"):
+            res.artifacts["offline_model_check"] = {
+                "required": True,
+                "ok": bool(offline_check.get("ok", False)),
+                "hf_home": offline_check.get("hf_home", ""),
+                "hf_cache": offline_check.get("hf_cache", ""),
+                "checked_notes": offline_check.get("checked_notes", []),
+                "ready_source": offline_check.get("ready_source", ""),
+            }
+            if not offline_check.get("ok", False):
+                res.success = False
+                err_msg = str(offline_check.get("msg", "offline model readiness check failed"))
+                res.errors.append(err_msg)
+                res.gates["J2"] = False
+                res.artifacts["evidence_checks"].append({
+                    "stage": "Probe",
+                    "stable_stage": "ProbeIds",
+                    "label": "Probe",
+                    "code": "OFFLINE_MODEL_NOT_READY",
+                    "msg": err_msg,
+                })
+                for rk in ["remediation_a", "remediation_b"]:
+                    rv = str(offline_check.get(rk, "")).strip()
+                    if rv and rv not in res.remediations:
+                        res.remediations.append(rv)
+                return
+
         if ctx.phase1_baseline or ctx.phase2_full_infer:
             with Timer("Phase1 Dataset Binding"):
                 try:
@@ -2629,6 +2834,41 @@ def run_cmd(cmd, env_overrides=None, cwd=None, timeout=None, stream_output=False
 def verify_evidence_zip_optimized(zip_path, script_name, expected_trace_count=None):
     return Evidence.verify_zip(zip_path, script_name, expected_trace_count)
 
+def _parse_seeds_value(raw_seeds: Any) -> List[int]:
+    parts: List[str] = []
+    if raw_seeds is None:
+        return [42]
+    if isinstance(raw_seeds, str):
+        parts = [raw_seeds]
+    elif isinstance(raw_seeds, (list, tuple)):
+        parts = [str(x) for x in raw_seeds]
+    else:
+        parts = [str(raw_seeds)]
+
+    tokens: List[str] = []
+    for part in parts:
+        for seg in str(part).split(","):
+            t = seg.strip()
+            if t:
+                tokens.append(t)
+    if not tokens:
+        raise ValueError("empty seeds; use --seeds 0 1 2 or --seeds 0,1,2")
+
+    parsed: List[int] = []
+    bad: List[str] = []
+    for tok in tokens:
+        if re.fullmatch(r"[+-]?\d+", tok):
+            parsed.append(int(tok))
+        else:
+            bad.append(tok)
+    if bad:
+        raise ValueError(
+            "invalid --seeds value(s): "
+            + ", ".join(bad)
+            + ". Expected integers; examples: --seeds 0 1 2 or --seeds 0,1,2"
+        )
+    return parsed
+
 
 def run_workload(args):
     # Phase 1 Baseline Logic
@@ -2685,6 +2925,8 @@ def run_workload(args):
             }
 
     phase2_vlm_model_id: Optional[str] = None
+    phase2_requested_vlm_model_id: Optional[str] = None
+    phase2_requested_vlm_local_dir: Optional[str] = None
     phase2_vlm_model_source = "config"
     if is_phase2_full:
         argv = [str(x) for x in sys.argv]
@@ -2725,6 +2967,14 @@ def run_workload(args):
         cli_id = str(args.vlm_model_id or "").strip()
         env_local = str(os.environ.get("VLM_MODEL_LOCAL_DIR", "") or "").strip()
         env_id = str(os.environ.get("VLM_MODEL_ID", "") or "").strip()
+        if cli_id:
+            phase2_requested_vlm_model_id = cli_id
+        elif env_id:
+            phase2_requested_vlm_model_id = env_id
+        if cli_local:
+            phase2_requested_vlm_local_dir = cli_local
+        elif env_local:
+            phase2_requested_vlm_local_dir = env_local
         if cli_local:
             phase2_vlm_model_id = cli_local
             phase2_vlm_model_source = "cli"
@@ -2737,6 +2987,53 @@ def run_workload(args):
         elif env_id:
             phase2_vlm_model_id = env_id
             phase2_vlm_model_source = "env"
+
+    gate_env = _effective_env()
+    gate_requested_model_id = str(args.vlm_model_id or gate_env.get("VLM_MODEL_ID", "")).strip()
+    gate_requested_local_dir = str(args.vlm_model_local_dir or gate_env.get("VLM_MODEL_LOCAL_DIR", "")).strip()
+    gate_effective_model_id = str(phase2_vlm_model_id or gate_requested_model_id).strip()
+    offline_gate = _check_offline_local_vlm_ready(
+        mode_name=str(args.mode),
+        strict_contract=bool(getattr(args, "strict_contract", False)),
+        requested_model_id=gate_requested_model_id,
+        requested_local_dir=gate_requested_local_dir,
+        effective_model_id=gate_effective_model_id,
+        env=gate_env,
+    )
+    if offline_gate.get("required") and not offline_gate.get("ok", False):
+        err_msg = str(offline_gate.get("msg", "Offline mode requires a local VLM directory (strict-contract + offline)."))
+        remediations = []
+        for key in ("remediation_a", "remediation_b"):
+            value = str(offline_gate.get(key, "")).strip()
+            if value:
+                remediations.append(value)
+        return {
+            "success": False,
+            "gates": {"J2": False, "J3": False},
+            "artifacts": {
+                "allow_flags_used": False,
+                "allow_flags_violation": False,
+                "evidence_checks": [{
+                    "stage": "Probe",
+                    "stable_stage": "ProbeIds",
+                    "label": "Probe",
+                    "code": "OFFLINE_VLM_LOCAL_REQUIRED",
+                    "msg": err_msg,
+                }],
+                "gates_na": {},
+                "offline_model_check": {
+                    "required": True,
+                    "ok": False,
+                    "hf_home": offline_gate.get("hf_home", ""),
+                    "hf_cache": offline_gate.get("hf_cache", ""),
+                    "checked_notes": offline_gate.get("checked_notes", []),
+                    "ready_source": "",
+                },
+            },
+            "errors": [err_msg],
+            "measurements": {"evidence_check_sec": 0.0},
+            "remediations": remediations,
+        }
     
     work_dir = Path(args.output_dir).resolve()
 
@@ -2831,9 +3128,12 @@ def run_workload(args):
         phase1_baseline=is_phase1,
         phase2_full_infer=is_phase2_full,
         strict_j_mode=(args.mode == "strict_j"),
+        strict_contract=bool(getattr(args, "strict_contract", False)),
         dataset_split=args.dataset_split,
         env_overrides=env_overrides,
         vlm_model_id=phase2_vlm_model_id,
+        requested_vlm_model_id=phase2_requested_vlm_model_id,
+        requested_vlm_model_local_dir=phase2_requested_vlm_local_dir,
         vlm_model_source=phase2_vlm_model_source,
         vlm_max_side=phase2_vlm_max_side,
         sdp_backend=phase2_sdp_backend,
@@ -3018,7 +3318,7 @@ def build_arg_parser():
     parser.add_argument("--sdp-backend", type=str, default="auto", dest="sdp_backend", help="Override SDP backend for phase2 infer (auto/math/flash/mem_efficient)")
     parser.add_argument("--vlm-retry-n", type=int, default=2, dest="vlm_retry_n", help="Override VLM retry count for phase2 infer")
     parser.add_argument("--sentinel-ref", type=str, default="", dest="sentinel_ref", help="Sentinel reference directory")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Random seeds")
+    parser.add_argument("--seeds", type=str, nargs="+", default=["42"], help="Random seeds, supports '--seeds 0 1 2' or '--seeds 0,1,2'")
     return parser
 
 def main():
@@ -3027,9 +3327,16 @@ def main():
     # CUDA_VISIBLE_DEVICES=0 python verify_all.py --mode strict_j --allow-full-dataset --dataset-split train --seeds 0 1 2
     parser = build_arg_parser()
     args = parser.parse_args()
+    if str(args.mode).strip() == "phase2_full":
+        args.mode = "phase2_full_infer"
+    try:
+        args.seeds = _parse_seeds_value(args.seeds)
+    except ValueError as e:
+        print(f"[ArgsError] {e}", file=sys.stderr)
+        sys.exit(2)
     if args.dataset_split is None:
         # MMAD is single-split in this workflow; keep historical default for other modes.
-        args.dataset_split = "train" if str(args.mode) == "build_sft_traj" else "test"
+        args.dataset_split = "train" if str(args.mode) in {"build_sft_traj", "phase2_full_infer"} else "test"
 
     if args.output_dir is None and args.mode in {"phase1_baseline", "phase1_acceptance_only"}:
         args.output_dir = "dist/outputs/phase1_baseline"

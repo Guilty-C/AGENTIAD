@@ -326,6 +326,94 @@ def _image_loader_env_snapshot() -> Dict[str, Any]:
     }
 
 
+def _model_cache_dir_name(model_id: str) -> str:
+    rid = str(model_id or "").strip().replace("\\", "/").strip("/")
+    return "models--" + rid.replace("/", "--")
+
+
+def _local_model_dir_ready(model_dir: Path) -> bool:
+    if not model_dir.exists() or not model_dir.is_dir():
+        return False
+    has_config = (model_dir / "config.json").exists()
+    has_tokenizer = (
+        (model_dir / "tokenizer.json").exists()
+        or (model_dir / "tokenizer_config.json").exists()
+        or (model_dir / "preprocessor_config.json").exists()
+    )
+    return bool(has_config and has_tokenizer)
+
+
+def _find_cached_snapshot_dir(model_id: str, hub_cache: Path) -> Optional[Path]:
+    rid = str(model_id or "").strip()
+    if not rid:
+        return None
+    cache_dir = hub_cache / _model_cache_dir_name(rid)
+    if not cache_dir.exists():
+        return None
+    snaps = cache_dir / "snapshots"
+    if snaps.exists() and snaps.is_dir():
+        for p in sorted(snaps.iterdir()):
+            if p.is_dir() and _local_model_dir_ready(p):
+                return p
+    if _local_model_dir_ready(cache_dir):
+        return cache_dir
+    return None
+
+
+def _ensure_local_only_model_ready_or_raise(vlm_model_id: str, local_only: bool) -> None:
+    if not local_only:
+        return
+    env = _image_loader_env_snapshot()
+    hf_home = Path(str(env.get("HF_HOME", "") or Path.home() / ".cache" / "huggingface")).expanduser()
+    hub_cache_raw = str(os.environ.get("HUGGINGFACE_HUB_CACHE", "")).strip()
+    if hub_cache_raw:
+        hub_cache = Path(hub_cache_raw).expanduser()
+    elif hf_home.name.lower() == "hub":
+        hub_cache = hf_home
+    else:
+        hub_cache = hf_home / "hub"
+    fallback_id = str(os.environ.get("DISTILGPT2_LOCAL_DIR", "")).strip() or "distilgpt2"
+    model_id_str = str(vlm_model_id or "").strip()
+    local_candidate = Path(model_id_str).expanduser()
+    checked: List[str] = []
+
+    if local_candidate.exists() and local_candidate.is_dir():
+        if _local_model_dir_ready(local_candidate):
+            return
+        checked.append(f"local_dir_not_ready:{local_candidate}")
+    else:
+        for cand in [model_id_str, fallback_id]:
+            c = str(cand or "").strip()
+            if not c:
+                continue
+            p = Path(c).expanduser()
+            if p.exists() and p.is_dir():
+                if _local_model_dir_ready(p):
+                    return
+                checked.append(f"local_path_not_ready:{p}")
+                continue
+            snap = _find_cached_snapshot_dir(c, hub_cache)
+            if snap is not None:
+                return
+            checked.append(f"hf_cache_miss:{c}")
+
+    remediation_model = model_id_str if "/" in model_id_str else "Qwen/Qwen2.5-VL-3B-Instruct"
+    cmd_a = (
+        "Copy-Item -Recurse -Force <DOWNLOADED_MODEL_DIR> <LOCAL_VLM_DIR>; "
+        "python verify_all.py --mode phase2_full --strict-contract --dataset-split train --seeds 0 "
+        "--vlm-model-local-dir <LOCAL_VLM_DIR>"
+    )
+    cmd_b = f"HF_HOME=\"{hf_home}\" HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 huggingface-cli download \"{remediation_model}\""
+    raise RuntimeError(
+        "Offline local-only model check failed before from_pretrained. "
+        f"vlm_model_id={model_id_str or 'NOT_SET'}; "
+        f"HF_HOME={hf_home}; HF_CACHE={hub_cache}; "
+        f"checked={'; '.join(checked) if checked else 'none'}. "
+        f"Remediation A: {cmd_a}. "
+        f"Remediation B: {cmd_b}."
+    )
+
+
 def _load_paths_yaml_candidates(project_root: Path) -> Dict[str, Any]:
     candidates = [
         project_root / "configs" / "paths.yaml",
@@ -1438,6 +1526,12 @@ def main() -> int:
              local_only = str(args.local_files_only).strip().lower() in {'true', '1', 'yes', 'on'}
         else:
              local_only = offline_env
+        if local_only:
+            try:
+                _ensure_local_only_model_ready_or_raise(vlm_model_id, local_only=True)
+            except RuntimeError as e:
+                print(str(e), file=sys.stderr)
+                return 2
 
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
