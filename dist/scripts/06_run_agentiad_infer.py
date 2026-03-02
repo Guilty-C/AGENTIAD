@@ -1463,7 +1463,8 @@ def main() -> int:
                  print(f"[OfflineFallback] Processor load failed. vlm_model_id={vlm_model_id} local_only={local_only} error={e2}", file=sys.stderr)
                  fallback_active = True
                  # Use distilgpt2 tokenizer as fallback
-                 processor = AutoTokenizer.from_pretrained("distilgpt2", local_files_only=local_only)
+                 fallback_id = os.environ.get("DISTILGPT2_LOCAL_DIR", "distilgpt2")
+                processor = AutoTokenizer.from_pretrained(fallback_id, local_files_only=local_only)
                  if processor.pad_token is None:
                     processor.pad_token = processor.eos_token
                     processor.pad_token_id = processor.eos_token_id
@@ -1532,7 +1533,8 @@ def main() -> int:
                 model = AutoModelForCausalLM.from_pretrained("distilgpt2", local_files_only=local_only)
                 # Ensure processor is compatible (distilgpt2 tokenizer)
                 try:
-                    processor = AutoTokenizer.from_pretrained("distilgpt2", local_files_only=local_only)
+                    fallback_id = os.environ.get("DISTILGPT2_LOCAL_DIR", "distilgpt2")
+                    processor = AutoTokenizer.from_pretrained(fallback_id, local_files_only=local_only)
                     if processor.pad_token is None:
                         processor.pad_token = processor.eos_token
                         processor.pad_token_id = processor.eos_token_id
