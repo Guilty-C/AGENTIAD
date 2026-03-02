@@ -2918,7 +2918,7 @@ def build_arg_parser():
     parser.add_argument("--allow-flags", action="store_true", dest="allow_flags", help="Allow unsafe flags")
     parser.add_argument("--no-adapter", action="store_true", dest="no_adapter", help="Skip adapter checks")
     parser.add_argument("--allow-full-dataset", action="store_true", dest="allow_full_dataset", help="Allow full dataset runs")
-    parser.add_argument("--dataset-split", type=str, default="test", dest="dataset_split", help="Dataset split for phase1")
+    parser.add_argument("--dataset-split", type=str, default=None, dest="dataset_split", help="Dataset split for phase1")
     parser.add_argument("--vlm-model-id", type=str, default=None, dest="vlm_model_id", help="Explicit VLM model id (repo id or local path)")
     parser.add_argument("--vlm-model-local-dir", type=str, default=None, dest="vlm_model_local_dir", help="Explicit local VLM model directory; higher priority than --vlm-model-id")
     parser.add_argument("--vlm-max-side", type=int, default=768, dest="vlm_max_side", help="Override VLM max image side for phase2 infer")
@@ -2934,6 +2934,9 @@ def main():
     # CUDA_VISIBLE_DEVICES=0 python verify_all.py --mode strict_j --allow-full-dataset --dataset-split train --seeds 0 1 2
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.dataset_split is None:
+        # MMAD is single-split in this workflow; keep historical default for other modes.
+        args.dataset_split = "train" if str(args.mode) == "build_sft_traj" else "test"
 
     if args.output_dir is None and args.mode in {"phase1_baseline", "phase1_acceptance_only"}:
         args.output_dir = "dist/outputs/phase1_baseline"
