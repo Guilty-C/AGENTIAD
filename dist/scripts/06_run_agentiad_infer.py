@@ -1460,15 +1460,15 @@ def main() -> int:
                     processor.pad_token_id = processor.eos_token_id
                 processor.padding_side = "left"
             except Exception as e2:
-                 print(f"[OfflineFallback] Processor load failed. vlm_model_id={vlm_model_id} local_only={local_only} error={e2}", file=sys.stderr)
-                 fallback_active = True
-                 # Use distilgpt2 tokenizer as fallback
-                 fallback_id = os.environ.get("DISTILGPT2_LOCAL_DIR", "distilgpt2")
+                print(f"[OfflineFallback] Processor load failed. vlm_model_id={vlm_model_id} local_only={local_only} error={e2}", file=sys.stderr)
+                fallback_active = True
+                # Use distilgpt2 tokenizer as fallback
+                fallback_id = os.environ.get("DISTILGPT2_LOCAL_DIR", "distilgpt2")
                 processor = AutoTokenizer.from_pretrained(fallback_id, local_files_only=local_only)
-                 if processor.pad_token is None:
+                if processor.pad_token is None:
                     processor.pad_token = processor.eos_token
                     processor.pad_token_id = processor.eos_token_id
-                 processor.padding_side = "left"
+                processor.padding_side = "left"
         _ensure_pad_token_id_explicit(processor, model, generation_config)
 
         def _resolve_torch_dtype(spec: Any, use_cuda0: bool) -> Any:
@@ -1530,10 +1530,10 @@ def main() -> int:
         if fallback_active:
             print(f"[OfflineFallback] Activating fallback to distilgpt2. vlm_model_id={vlm_model_id} local_only={local_only}", file=sys.stderr)
             try:
-                model = AutoModelForCausalLM.from_pretrained("distilgpt2", local_files_only=local_only)
+                fallback_id = os.environ.get("DISTILGPT2_LOCAL_DIR", "distilgpt2")
+                model = AutoModelForCausalLM.from_pretrained(fallback_id, local_files_only=local_only)
                 # Ensure processor is compatible (distilgpt2 tokenizer)
                 try:
-                    fallback_id = os.environ.get("DISTILGPT2_LOCAL_DIR", "distilgpt2")
                     processor = AutoTokenizer.from_pretrained(fallback_id, local_files_only=local_only)
                     if processor.pad_token is None:
                         processor.pad_token = processor.eos_token
