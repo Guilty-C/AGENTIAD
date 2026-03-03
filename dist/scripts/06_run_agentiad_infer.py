@@ -80,6 +80,10 @@ _MICRO_BATCH_RUNTIME_STATS: Dict[str, Any] = {
     "samples": 0,
     "batch_sizes_hist": [],
 }
+_PERF_TIMING_STATS: Dict[str, Any] = {
+    "gen_wall_seconds_total": 0.0,
+    "batch_wall_seconds_hist": [],
+}
 _ANSWER_END_TAG = "</answer>"
 _STRICT_ANSWER_RULE = (
     "\n\nOutput format (MUST, no extra text):\n"
@@ -121,6 +125,14 @@ def _merge_cfg(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
 
 def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
+
+def _timing_cuda_sync() -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
 
 def _env_flag_1(name: str) -> bool:
     return str(os.environ.get(name, "")).strip() == "1"
@@ -1249,18 +1261,22 @@ def _vlm_generate(
             with torch.inference_mode():
                 with sdp_ctx:
                     gen_kwargs: Dict[str, Any] = {"generation_config": generation_config}
-                    if generation_config is not None:
-                        try:
-                            generation_config.use_cache = bool(use_cache)
-                        except Exception:
-                            pass
-                    if answer_stop_criteria is not None:
-                        gen_kwargs["stopping_criteria"] = answer_stop_criteria
+                if generation_config is not None:
                     try:
-                        gen_ids = model.generate(**inputs, **gen_kwargs)
-                    except TypeError:
-                        gen_kwargs.pop("stopping_criteria", None)
-                        gen_ids = model.generate(**inputs, **gen_kwargs)
+                        generation_config.use_cache = bool(use_cache)
+                    except Exception:
+                        pass
+                if answer_stop_criteria is not None:
+                    gen_kwargs["stopping_criteria"] = answer_stop_criteria
+                _timing_cuda_sync()
+                gen_t0 = time.perf_counter()
+                try:
+                    gen_ids = model.generate(**inputs, **gen_kwargs)
+                except TypeError:
+                    gen_kwargs.pop("stopping_criteria", None)
+                    gen_ids = model.generate(**inputs, **gen_kwargs)
+                _timing_cuda_sync()
+                _PERF_TIMING_STATS["gen_wall_seconds_total"] = float(_PERF_TIMING_STATS.get("gen_wall_seconds_total", 0.0)) + max(0.0, time.perf_counter() - gen_t0)
             input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else None
             decode_ids = gen_ids
             if input_ids is not None and hasattr(input_ids, "shape") and hasattr(gen_ids, "shape"):
@@ -1414,11 +1430,21 @@ def _vlm_generate_batch(
                     hist = []
                     _MICRO_BATCH_RUNTIME_STATS["batch_sizes_hist"] = hist
                 hist.append(int(batch_size))
+                _timing_cuda_sync()
+                gen_t0 = time.perf_counter()
                 try:
                     gen_ids = model.generate(**inputs, **gen_kwargs)
                 except TypeError:
                     gen_kwargs.pop("stopping_criteria", None)
                     gen_ids = model.generate(**inputs, **gen_kwargs)
+                _timing_cuda_sync()
+                gen_dt = max(0.0, time.perf_counter() - gen_t0)
+                _PERF_TIMING_STATS["gen_wall_seconds_total"] = float(_PERF_TIMING_STATS.get("gen_wall_seconds_total", 0.0)) + gen_dt
+                bh = _PERF_TIMING_STATS.get("batch_wall_seconds_hist")
+                if not isinstance(bh, list):
+                    bh = []
+                    _PERF_TIMING_STATS["batch_wall_seconds_hist"] = bh
+                bh.append(float(gen_dt))
         if not hasattr(gen_ids, "shape") or int(gen_ids.shape[0]) != batch_size:
             raise RuntimeError("incompatible_tensor_shape")
         input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else None
@@ -2146,6 +2172,8 @@ def main() -> int:
     _VLM_RUNTIME_STATS.update({"generate_calls": 0, "generated_tokens_total": 0, "retry_exceptions": 0})
     _CUDA_CLEANUP_STATS.update({"calls_total": 0, "calls_error": 0, "calls_success": 0})
     _MICRO_BATCH_RUNTIME_STATS.update({"calls": 0, "samples": 0, "batch_sizes_hist": []})
+    _PERF_TIMING_STATS.update({"gen_wall_seconds_total": 0.0, "batch_wall_seconds_hist": []})
+    _timing_cuda_sync()
     run_wall_t0 = time.perf_counter()
     pbar = None
     progress_fallback = False
@@ -2927,6 +2955,9 @@ def main() -> int:
         hist_obj = _MICRO_BATCH_RUNTIME_STATS.get("batch_sizes_hist", [])
         batch_sizes_hist = [int(x) for x in hist_obj] if isinstance(hist_obj, list) else []
         micro_batch_calls_expected = (int(n_success) + max(1, int(micro_batch_size)) - 1) // max(1, int(micro_batch_size))
+        batch_wall_hist_obj = _PERF_TIMING_STATS.get("batch_wall_seconds_hist", [])
+        batch_wall_seconds_hist = [float(x) for x in batch_wall_hist_obj] if isinstance(batch_wall_hist_obj, list) else []
+        gen_wall_seconds_total = float(_PERF_TIMING_STATS.get("gen_wall_seconds_total", 0.0))
 
         summary = {
             "timestamp_utc": utc_now_iso(),
@@ -2966,6 +2997,8 @@ def main() -> int:
             "micro_batch_samples": int(micro_batch_samples),
             "micro_batch_fallback_single": int(micro_batch_fallback_single),
             "batch_sizes_hist": list(batch_sizes_hist),
+            "batch_wall_seconds_hist": list(batch_wall_seconds_hist),
+            "gen_wall_seconds_total": float(gen_wall_seconds_total),
             "micro_batch_calls_expected": int(micro_batch_calls_expected),
             "out_csv": str(out_csv),
             "trace_dir": str(trace_root),
@@ -3022,7 +3055,14 @@ def main() -> int:
     micro_batch_samples = int(_MICRO_BATCH_RUNTIME_STATS.get("samples", 0))
     hist_obj = _MICRO_BATCH_RUNTIME_STATS.get("batch_sizes_hist", [])
     batch_sizes_hist = [int(x) for x in hist_obj] if isinstance(hist_obj, list) else []
+    batch_wall_hist_obj = _PERF_TIMING_STATS.get("batch_wall_seconds_hist", [])
+    batch_wall_seconds_hist = [float(x) for x in batch_wall_hist_obj] if isinstance(batch_wall_hist_obj, list) else []
+    gen_wall_seconds_total = float(_PERF_TIMING_STATS.get("gen_wall_seconds_total", 0.0))
     micro_batch_calls_expected = (int(n_success) + max(1, int(micro_batch_size)) - 1) // max(1, int(micro_batch_size))
+    _timing_cuda_sync()
+
+    total_wall_seconds = max(0.0, time.perf_counter() - run_wall_t0)
+    postproc_wall_seconds_total = max(0.0, float(total_wall_seconds) - float(gen_wall_seconds_total))
 
     # Gather result summary
     result_summary = {
@@ -3054,6 +3094,9 @@ def main() -> int:
         "micro_batch_samples": int(micro_batch_samples),
         "micro_batch_fallback_single": int(micro_batch_fallback_single),
         "batch_sizes_hist": list(batch_sizes_hist),
+        "batch_wall_seconds_hist": list(batch_wall_seconds_hist),
+        "gen_wall_seconds_total": float(gen_wall_seconds_total),
+        "postproc_wall_seconds_total": float(postproc_wall_seconds_total),
         "micro_batch_calls_expected": int(micro_batch_calls_expected),
         "cleanup_every_n": int(cleanup_every_n),
         "missing_dataset_prefixes": missing_dataset_prefixes,
@@ -3071,7 +3114,15 @@ def main() -> int:
         "schema_stats_every": int(schema_stats_every),
         "main_jsonl": str(trace_root / "main.jsonl"),
     }
-    total_wall_seconds = max(0.0, time.perf_counter() - run_wall_t0)
+    if isinstance(summary, dict):
+        summary["gen_wall_seconds_total"] = float(gen_wall_seconds_total)
+        summary["postproc_wall_seconds_total"] = float(postproc_wall_seconds_total)
+        summary["batch_wall_seconds_hist"] = list(batch_wall_seconds_hist)
+        summary["batch_sizes_hist"] = list(batch_sizes_hist)
+        try:
+            write_json(out_summary, summary)
+        except Exception:
+            pass
     avg_sec_per_sample = (total_wall_seconds / float(processed_count)) if processed_count else 0.0
     generated_tokens_total = int(_VLM_RUNTIME_STATS.get("generated_tokens_total", 0))
     avg_gen_tokens_per_sample = (float(generated_tokens_total) / float(processed_count)) if processed_count else 0.0
@@ -3113,14 +3164,18 @@ def main() -> int:
             f"micro_batch_samples={int(micro_batch_samples)} "
             f"micro_batch_fallback_single={int(micro_batch_fallback_single)} "
             f"micro_batch_calls_expected={int(micro_batch_calls_expected)} "
-            f"batch_sizes_hist={list(batch_sizes_hist)}",
+            f"batch_sizes_hist={list(batch_sizes_hist)} "
+            f"batch_wall_seconds_hist={list(batch_wall_seconds_hist)}",
             file=sys.stderr,
         )
         print(
             f"[06_run_agentiad_infer.py][perf] total_wall_seconds={total_wall_seconds:.4f} "
+            f"gen_wall_seconds_total={float(gen_wall_seconds_total):.4f} "
+            f"postproc_wall_seconds_total={float(postproc_wall_seconds_total):.4f} "
             f"avg_sec_per_sample={avg_sec_per_sample:.4f} "
             f"avg_gen_tokens_per_sample={avg_gen_tokens_per_sample:.2f} "
-            f"max_new_tokens={int(max_new_tokens)}",
+            f"max_new_tokens={int(max_new_tokens)} "
+            f"per_sample_gen_time_attribution=amortized_batch_time_div_batch_size",
             file=sys.stderr,
         )
         print(
