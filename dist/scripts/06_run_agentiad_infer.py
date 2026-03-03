@@ -824,11 +824,14 @@ def _vlm_generate_with_schema_repair(
     sample_id: str,
     seed: int,
     round_idx: int,
+    prefetched_raw: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     schema_repair_debug = _env_flag_1("SCHEMA_REPAIR_DEBUG")
 
-    def _run(prompt_text: str) -> Tuple[str, Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
-        if dry_run:
+    def _run(prompt_text: str, raw_override: Optional[str] = None) -> Tuple[str, Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+        if raw_override is not None:
+            raw_local = _safe_str(raw_override)
+        elif dry_run:
             raw_local = _vlm_generate_dry(images, prompt_text, sample_id, seed)
         else:
             raw_local = _vlm_generate(
@@ -851,7 +854,10 @@ def _vlm_generate_with_schema_repair(
             meta_local["inference_errors"] = errs_local
         return raw_local, parsed_local, meta_local, errs_local
 
-    raw, parsed, meta, _ = _run(prompt)
+    if prefetched_raw is not None:
+        raw, parsed, meta, _ = _run(prompt, raw_override=prefetched_raw)
+    else:
+        raw, parsed, meta, _ = _run(prompt)
     repair_summaries: List[Dict[str, Any]] = []
     if _schema_valid(meta, parsed):
         meta["repair_attempted"] = False
@@ -1306,6 +1312,150 @@ def _vlm_generate(
     return '<answer>{"anomaly_present": false, "top_anomaly": "none", "visual_descriptions": []}</answer>'
 
 
+def _vlm_generate_batch(
+    processor: Any,
+    model: Any,
+    images_batch: Sequence[Sequence["PIL.Image.Image"]],
+    prompt: str,
+    generation_config: Any,
+    use_cache: bool = True,
+    sdp_backend: str = "auto",
+    answer_stop_criteria: Any = None,
+) -> List[str]:
+    global _LAST_VLM_EXCEPTIONS
+    _LAST_VLM_EXCEPTIONS = []
+    if model is None:
+        fallback = '<answer>{"anomaly_present": false, "top_anomaly": "none", "visual_descriptions": []}</answer>'
+        return [fallback for _ in images_batch]
+
+    import torch
+
+    local_batch: List[List["PIL.Image.Image"]] = []
+    for imgs in images_batch:
+        local_imgs = list(imgs)
+        if len(local_imgs) != 1:
+            raise ValueError("multi_image_sample")
+        normalized_imgs: List["PIL.Image.Image"] = []
+        for im in local_imgs:
+            mode = getattr(im, "mode", None)
+            if hasattr(im, "convert") and mode not in {None, "RGB"}:
+                normalized_imgs.append(im.convert("RGB"))
+            else:
+                normalized_imgs.append(im)
+        local_batch.append(normalized_imgs)
+    if not local_batch:
+        return []
+
+    model_device = _infer_model_device(model)
+    batch_size = int(len(local_batch))
+    inputs: Dict[str, Any] = {}
+    gen_ids = None
+    decode_ids = None
+    input_ids = None
+    try:
+        if hasattr(processor, "apply_chat_template") and getattr(processor, "chat_template", None):
+            text_batch: List[str] = []
+            for local_imgs in local_batch:
+                cache_key = _chat_template_key(processor, len(local_imgs), prompt)
+                text = _CHAT_TEXT_CACHE.get(cache_key, "")
+                if not text:
+                    messages: List[Dict[str, Any]] = [
+                        {
+                            "role": "user",
+                            "content": [{"type": "image"} for _ in local_imgs] + [{"type": "text", "text": prompt}],
+                        }
+                    ]
+                    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    _CHAT_TEXT_CACHE[cache_key] = text
+                text_batch.append(text)
+            try:
+                inputs = processor(
+                    text=text_batch,
+                    images=[imgs[0] for imgs in local_batch],
+                    padding=True,
+                    return_tensors="pt",
+                )
+            except Exception as e:
+                raise RuntimeError(f"processor_stacking_failure: {type(e).__name__}: {e}") from e
+        else:
+            try:
+                inputs = processor(
+                    images=[imgs[0] for imgs in local_batch],
+                    text=[prompt for _ in range(batch_size)],
+                    padding=True,
+                    return_tensors="pt",
+                )
+            except Exception as e:
+                raise RuntimeError(f"processor_stacking_failure: {type(e).__name__}: {e}") from e
+        inputs = {k: (v.to(model_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+        sdp_ctx = _sdp_context(torch, sdp_backend)
+        with torch.inference_mode():
+            with sdp_ctx:
+                gen_kwargs: Dict[str, Any] = {"generation_config": generation_config}
+                if generation_config is not None:
+                    try:
+                        generation_config.use_cache = bool(use_cache)
+                    except Exception:
+                        pass
+                if answer_stop_criteria is not None:
+                    gen_kwargs["stopping_criteria"] = answer_stop_criteria
+                try:
+                    gen_ids = model.generate(**inputs, **gen_kwargs)
+                except TypeError:
+                    gen_kwargs.pop("stopping_criteria", None)
+                    gen_ids = model.generate(**inputs, **gen_kwargs)
+        if not hasattr(gen_ids, "shape") or int(gen_ids.shape[0]) != batch_size:
+            raise RuntimeError("incompatible_tensor_shape")
+        input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else None
+        decode_ids = gen_ids
+        if input_ids is not None and hasattr(input_ids, "shape") and hasattr(gen_ids, "shape"):
+            if int(input_ids.shape[0]) != batch_size:
+                raise RuntimeError("incompatible_tensor_shape")
+            decode_ids = gen_ids[:, input_ids.shape[1] :]
+        token_count_total = 0
+        try:
+            if decode_ids is not None and hasattr(decode_ids, "shape") and len(decode_ids.shape) >= 2:
+                token_count_total = int(decode_ids.shape[0]) * int(decode_ids.shape[1])
+        except Exception:
+            token_count_total = 0
+        _VLM_RUNTIME_STATS["generate_calls"] = int(_VLM_RUNTIME_STATS.get("generate_calls", 0)) + int(batch_size)
+        _VLM_RUNTIME_STATS["generated_tokens_total"] = int(_VLM_RUNTIME_STATS.get("generated_tokens_total", 0)) + max(0, int(token_count_total))
+        if hasattr(processor, "batch_decode"):
+            decoded = processor.batch_decode(decode_ids, skip_special_tokens=True)
+        else:
+            tok = getattr(processor, "tokenizer", None)
+            if tok is not None and hasattr(tok, "batch_decode"):
+                decoded = tok.batch_decode(decode_ids, skip_special_tokens=True)
+            else:
+                decoded = [_safe_str(decode_ids)] * batch_size
+        if not isinstance(decoded, list) or len(decoded) != batch_size:
+            raise RuntimeError("incompatible_tensor_shape")
+        return [_safe_str(x).strip() for x in decoded]
+    finally:
+        try:
+            if isinstance(inputs, dict):
+                for k in list(inputs.keys()):
+                    try:
+                        del inputs[k]
+                    except Exception:
+                        pass
+                del inputs
+        except Exception:
+            pass
+        try:
+            del input_ids
+        except Exception:
+            pass
+        try:
+            del decode_ids
+        except Exception:
+            pass
+        try:
+            del gen_ids
+        except Exception:
+            pass
+
+
 def _vlm_generate_dry(images: Sequence[Any], prompt: str, sample_id: str, seed: int) -> str:
     h = hashlib.sha256((prompt + "|" + sample_id + "|" + str(int(seed))).encode("utf-8")).digest()
     anomaly_bool = (h[2] % 2) == 1
@@ -1395,6 +1545,7 @@ def main() -> int:
     parser.add_argument("--allow_full_dataset", action="store_true", help="Allow full dataset traversal")
     parser.add_argument("--perf", default=None, type=str, help="Enable lightweight perf summary (true/false/1/0/yes/no/on/off).")
     parser.add_argument("--use_cache", default="true", type=str, help="Enable KV-cache during generation (true/false/1/0/yes/no/on/off).")
+    parser.add_argument("--micro_batch_size", type=int, default=1, help="Round-0 VLM micro batch size (1 keeps original per-sample path).")
     parser.add_argument("--cleanup_every_n", type=int, default=0, help="Run aggressive CUDA cleanup every N successful samples (0 disables success-path cleanup).")
     parser.add_argument("--vlm-max-side", type=int, default=None, dest="vlm_max_side", help="Resize input image so long side <= this value before VLM inference.")
     parser.add_argument("--sdp-backend", type=str, default="auto", dest="sdp_backend", help="SDP backend policy: auto, math, flash, mem_efficient")
@@ -1524,6 +1675,7 @@ def main() -> int:
     cli_perf = None if args.perf is None else (str(args.perf).strip().lower() not in false_set)
     perf_enabled = cli_perf if cli_perf is not None else (env_perf if env_perf is not None else False)
     use_cache = str(args.use_cache).strip().lower() not in false_set
+    micro_batch_size = max(1, int(args.micro_batch_size))
     cleanup_every_n = max(0, int(args.cleanup_every_n))
 
     model_short = re.sub(r"[^a-zA-Z0-9]+", "_", vlm_model_id.strip())[-40:].strip("_") or "model"
@@ -1972,6 +2124,9 @@ def main() -> int:
     perf_crop_events = 0
     perf_ref_events = 0
     perf_io_decode_seconds = 0.0
+    micro_batch_calls = 0
+    micro_batch_samples = 0
+    micro_batch_fallback_single = 0
     _VLM_RUNTIME_STATS.update({"generate_calls": 0, "generated_tokens_total": 0, "retry_exceptions": 0})
     _CUDA_CLEANUP_STATS.update({"calls_total": 0, "calls_error": 0, "calls_success": 0})
     run_wall_t0 = time.perf_counter()
@@ -2086,6 +2241,14 @@ def main() -> int:
         if (processed % cleanup_every_n) != 0:
             return
         _cleanup_cuda_memory(reason="success_periodic")
+
+    def _classify_micro_batch_reason(exc: Exception) -> str:
+        msg = f"{type(exc).__name__}: {exc}".lower()
+        if "multi_image_sample" in msg:
+            return "multi_image_sample"
+        if any(tok in msg for tok in ["incompatible_tensor_shape", "shape", "dimension", "decoded_count_mismatch"]):
+            return "incompatible_tensor_shape"
+        return "processor_stacking_failure"
 
     def _trace_has_tool_call(trace_path: Path, fallback_trace: Mapping[str, Any]) -> bool:
         tr: Any = None
@@ -2245,6 +2408,7 @@ def main() -> int:
                     "use_cache": bool(use_cache),
                     "max_retries": int(max_retries),
                     "repair_n": int(repair_n),
+                    "micro_batch_size": int(micro_batch_size),
                     "cleanup_every_n": int(cleanup_every_n),
                 },
                 "input": {
@@ -2257,6 +2421,34 @@ def main() -> int:
                 },
                 "turns": [],
             }
+
+            prefetched_raw0: Optional[str] = None
+            if int(micro_batch_size) > 1 and (not bool(args.dry_run)):
+                round0_images: List[Any] = [img]
+                if len(round0_images) != 1:
+                    print(f"[micro_batch] fallback_to_single sample_id={sample_id} reason=multi_image_sample", file=sys.stderr)
+                    micro_batch_fallback_single += 1
+                else:
+                    micro_batch_calls += 1
+                    micro_batch_samples += 1
+                    try:
+                        batched_raw = _vlm_generate_batch(
+                            processor=processor,
+                            model=model,
+                            images_batch=[round0_images for _ in range(int(micro_batch_size))],
+                            prompt=prompt_global,
+                            generation_config=generation_config,
+                            use_cache=bool(use_cache),
+                            sdp_backend=sdp_backend,
+                            answer_stop_criteria=answer_stop_criteria,
+                        )
+                        if not isinstance(batched_raw, list) or not batched_raw:
+                            raise RuntimeError("incompatible_tensor_shape")
+                        prefetched_raw0 = _safe_str(batched_raw[0])
+                    except Exception as e:
+                        reason = _classify_micro_batch_reason(e)
+                        print(f"[micro_batch] fallback_to_single sample_id={sample_id} reason={reason}", file=sys.stderr)
+                        micro_batch_fallback_single += 1
 
             try:
                 raw0, parsed0, meta0 = _vlm_generate_with_schema_repair(
@@ -2274,6 +2466,7 @@ def main() -> int:
                     sample_id=sample_id,
                     seed=seed,
                     round_idx=0,
+                    prefetched_raw=prefetched_raw0,
                 )
             except Exception as e:
                 n_skipped += 1
@@ -2713,6 +2906,10 @@ def main() -> int:
             "csv_write_fail_count": int(csv_write_fail_count),
             "uncertainty_rule": cr_rule,
             "use_cache": bool(use_cache),
+            "micro_batch_size": int(micro_batch_size),
+            "micro_batch_calls": int(micro_batch_calls),
+            "micro_batch_samples": int(micro_batch_samples),
+            "micro_batch_fallback_single": int(micro_batch_fallback_single),
             "out_csv": str(out_csv),
             "trace_dir": str(trace_root),
             "cleanup_every_n": int(cleanup_every_n),
@@ -2789,6 +2986,10 @@ def main() -> int:
         "max_samples_effective": max_samples_effective,
         "dataset_split": split,
         "use_cache": bool(use_cache),
+        "micro_batch_size": int(micro_batch_size),
+        "micro_batch_calls": int(micro_batch_calls),
+        "micro_batch_samples": int(micro_batch_samples),
+        "micro_batch_fallback_single": int(micro_batch_fallback_single),
         "cleanup_every_n": int(cleanup_every_n),
         "missing_dataset_prefixes": missing_dataset_prefixes,
         "missing_example_files": missing_example_files,
@@ -2841,6 +3042,13 @@ def main() -> int:
     # Contract: Single line JSON to stderr (to keep stdout clean for harness)
     print(f"L2_RESULT_JSON={json.dumps(result_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
     if perf_enabled:
+        print(
+            f"[06_run_agentiad_infer.py][perf] micro_batch_size={int(micro_batch_size)} "
+            f"micro_batch_calls={int(micro_batch_calls)} "
+            f"micro_batch_samples={int(micro_batch_samples)} "
+            f"micro_batch_fallback_single={int(micro_batch_fallback_single)}",
+            file=sys.stderr,
+        )
         print(
             f"[06_run_agentiad_infer.py][perf] total_wall_seconds={total_wall_seconds:.4f} "
             f"avg_sec_per_sample={avg_sec_per_sample:.4f} "
