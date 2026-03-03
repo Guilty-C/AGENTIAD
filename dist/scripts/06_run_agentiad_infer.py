@@ -83,6 +83,10 @@ _MICRO_BATCH_RUNTIME_STATS: Dict[str, Any] = {
 _PERF_TIMING_STATS: Dict[str, Any] = {
     "gen_wall_seconds_total": 0.0,
     "batch_wall_seconds_hist": [],
+    "postproc_parse_seconds": 0.0,
+    "postproc_repair_seconds": 0.0,
+    "postproc_trace_io_seconds": 0.0,
+    "postproc_table_io_seconds": 0.0,
 }
 _ANSWER_END_TAG = "</answer>"
 _STRICT_ANSWER_RULE = (
@@ -133,6 +137,13 @@ def _timing_cuda_sync() -> None:
             torch.cuda.synchronize()
     except Exception:
         pass
+
+def _perf_accum_seconds(key: str, delta_seconds: float) -> None:
+    try:
+        delta = max(0.0, float(delta_seconds))
+    except Exception:
+        delta = 0.0
+    _PERF_TIMING_STATS[key] = float(_PERF_TIMING_STATS.get(key, 0.0)) + delta
 
 def _env_flag_1(name: str) -> bool:
     return str(os.environ.get(name, "")).strip() == "1"
@@ -732,59 +743,70 @@ def _fallback_bbox_norm(sample_id: str) -> List[float]:
     return [float(x1), float(y1), float(x2), float(y2)]
 
 
-def _parse_agent_json(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    # Use strict SSOT parsing
-    parsed = PaperContract.parse_model_output(text)
-    
-    out: Dict[str, Any] = {}
-    meta = {"parse_ok": False, "contract": "strict"}
-    
-    if parsed["valid_syntax"]:
-        data = parsed["data"]
-        # Validate schema but don't fail hard, just log/meta
-        is_valid, errors = PaperContract.validate_schema(data)
-        meta["schema_valid"] = is_valid
-        meta["schema_errors"] = errors
-        meta["parse_ok"] = True
-        
-        # Map to internal keys for downstream logic
-        ap = data.get("anomaly_present")
-        if ap is None:
-            out["anomaly"] = "unknown"
-        elif isinstance(ap, bool):
-            out["anomaly"] = "yes" if ap else "no"
-        else:
-            s = str(ap).strip().lower()
-            if s in {"yes", "true", "1"}:
-                out["anomaly"] = "yes"
-            elif s in {"no", "false", "0"}:
-                out["anomaly"] = "no"
-            else:
-                out["anomaly"] = "unknown"
+def _extract_answer_payload_robust(text: str) -> Tuple[Optional[str], Optional[str]]:
+    s = _safe_str(text)
+    start_tag = PaperContract.TAG_ANSWER_START
+    end_tag = PaperContract.TAG_ANSWER_END
+    start = s.find(start_tag)
+    if start < 0:
+        return None, "Missing <answer> tags"
+    end = s.find(end_tag, start + len(start_tag))
+    if end < 0:
+        return None, "Missing <answer> tags"
+    payload = s[start + len(start_tag) : end].strip()
+    if not payload:
+        return None, "Empty JSON inside <answer>"
+    return payload, None
 
-        out["defect_type"] = str(data.get("top_anomaly", "none"))
-        # confidence is FORBIDDEN by contract, so it is None
-        
-        # Tool Calls?
-        # If the model output contained tool calls, we might want to expose them
-        # But this function returns a single dict.
-        # We'll attach them to meta if needed, or rely on trace handling.
-        
-        # BBox?
-        # The contract output doesn't strictly have bbox in <answer>.
-        # BBox comes from crop_image_normalized tool call arguments.
-        # If the model output <tool_call>...bbox_2d...</tool_call>, we need to extract it.
-        # Check tool calls
-        for tc in parsed["tool_calls"]:
-            if tc.get("name") == "crop_image_normalized":
-                args = tc.get("arguments", {})
-                if "bbox_2d" in args:
-                    out["bbox"] = args["bbox_2d"]
-        
-        return out, meta
-    else:
-        meta["error"] = parsed.get("error")
+
+def _parse_agent_json(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    out: Dict[str, Any] = {}
+    meta: Dict[str, Any] = {"parse_ok": False, "contract": "strict"}
+
+    tool_calls: List[Dict[str, Any]] = []
+    try:
+        tool_calls = PaperContract.extract_tool_calls_xml(text)
+    except Exception:
+        tool_calls = []
+
+    payload, payload_err = _extract_answer_payload_robust(text)
+    if payload is None:
+        meta["error"] = payload_err or "Missing <answer> tags"
         return {}, meta
+
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as e:
+        meta["error"] = f"Invalid JSON inside <answer>: {str(e)}"
+        return {}, meta
+
+    is_valid, errors = PaperContract.validate_schema(data)
+    meta["schema_valid"] = bool(is_valid)
+    meta["schema_errors"] = list(errors)
+    meta["parse_ok"] = True
+
+    ap = data.get("anomaly_present")
+    if ap is None:
+        out["anomaly"] = "unknown"
+    elif isinstance(ap, bool):
+        out["anomaly"] = "yes" if ap else "no"
+    else:
+        s = str(ap).strip().lower()
+        if s in {"yes", "true", "1"}:
+            out["anomaly"] = "yes"
+        elif s in {"no", "false", "0"}:
+            out["anomaly"] = "no"
+        else:
+            out["anomaly"] = "unknown"
+
+    out["defect_type"] = str(data.get("top_anomaly", "none"))
+
+    for tc in tool_calls:
+        if tc.get("name") == "crop_image_normalized":
+            args = tc.get("arguments", {})
+            if "bbox_2d" in args:
+                out["bbox"] = args["bbox_2d"]
+    return out, meta
 
 
 def _summarize_raw_text(text: str, max_len: int = 240) -> str:
@@ -862,8 +884,10 @@ def _vlm_generate_with_schema_repair(
                 max_retries=max_retries,
                 answer_stop_criteria=answer_stop_criteria,
             )
+        parse_t0 = time.perf_counter()
         raw_local = _extract_first_answer_block(raw_local)
         parsed_local, meta_local = _parse_agent_json(raw_local)
+        _perf_accum_seconds("postproc_parse_seconds", time.perf_counter() - parse_t0)
         if not isinstance(meta_local, dict):
             meta_local = {}
         errs_local = _drain_vlm_errors(round_idx)
@@ -879,11 +903,29 @@ def _vlm_generate_with_schema_repair(
     if _schema_valid(meta, parsed):
         meta.pop("error", None)
         meta["repair_attempted"] = False
+        meta["repair_failed"] = False
         meta["repair_n"] = int(max(0, repair_n))
         return raw, parsed, meta
 
     repair_prompt = _build_repair_prompt(prompt)
     total_repairs = max(0, int(repair_n))
+    answer_has_start = PaperContract.TAG_ANSWER_START in _safe_str(raw)
+    answer_has_end = PaperContract.TAG_ANSWER_END in _safe_str(raw)
+    # Skip futile retries when there is no answer envelope at all.
+    if (not bool(meta.get("parse_ok"))) and _meta_has_missing_answer_tags(meta) and (not answer_has_start or not answer_has_end):
+        forced_raw = _make_forced_valid_answer()
+        forced_parsed, forced_meta = _parse_agent_json(forced_raw)
+        if not isinstance(forced_meta, dict):
+            forced_meta = {}
+        forced_meta["repair_attempted"] = False
+        forced_meta["repair_failed"] = False
+        forced_meta["repair_n"] = int(total_repairs)
+        forced_meta["repair_skipped"] = True
+        forced_meta["repair_skip_reason"] = "missing_answer_tags_no_envelope"
+        forced_meta.pop("error", None)
+        return forced_raw, forced_parsed, forced_meta
+
+    repair_t0 = time.perf_counter()
     for ridx in range(1, total_repairs + 1):
         repair_summaries.append(
             {
@@ -910,11 +952,11 @@ def _vlm_generate_with_schema_repair(
         if _schema_valid(meta, parsed):
             meta.pop("error", None)
             meta["repair_attempted"] = True
+            meta["repair_failed"] = False
             meta["repair_n"] = int(total_repairs)
             meta["repair_attempt_used"] = int(ridx)
             meta["repair_history"] = repair_summaries
-            if repair_summaries:
-                meta["repair_failed"] = True
+            _perf_accum_seconds("postproc_repair_seconds", time.perf_counter() - repair_t0)
             return raw, parsed, meta
 
     repair_summaries.append(
@@ -947,6 +989,7 @@ def _vlm_generate_with_schema_repair(
     forced_meta["raw_text_summary"] = _summarize_raw_text(raw)
     forced_meta["repair_history"] = repair_summaries
     forced_meta["forced_valid_answer"] = True
+    _perf_accum_seconds("postproc_repair_seconds", time.perf_counter() - repair_t0)
     return forced_raw, forced_parsed, forced_meta
 
 
@@ -2168,7 +2211,16 @@ def main() -> int:
     _VLM_RUNTIME_STATS.update({"generate_calls": 0, "generated_tokens_total": 0, "retry_exceptions": 0})
     _CUDA_CLEANUP_STATS.update({"calls_total": 0, "calls_error": 0, "calls_success": 0})
     _MICRO_BATCH_RUNTIME_STATS.update({"calls": 0, "samples": 0, "batch_sizes_hist": []})
-    _PERF_TIMING_STATS.update({"gen_wall_seconds_total": 0.0, "batch_wall_seconds_hist": []})
+    _PERF_TIMING_STATS.update(
+        {
+            "gen_wall_seconds_total": 0.0,
+            "batch_wall_seconds_hist": [],
+            "postproc_parse_seconds": 0.0,
+            "postproc_repair_seconds": 0.0,
+            "postproc_trace_io_seconds": 0.0,
+            "postproc_table_io_seconds": 0.0,
+        }
+    )
     _timing_cuda_sync()
     run_wall_t0 = time.perf_counter()
     pbar = None
@@ -2222,6 +2274,11 @@ def main() -> int:
             meter = f"{done_i}/{total_i} [{elapsed:.1f}s]"
         print(f"{progress_script_prefix} {meter}", file=sys.stderr, flush=True)
         progress_last_printed = done_i
+
+    def _write_json_timed(path: Path, obj: Any, perf_key: str) -> None:
+        t0 = time.perf_counter()
+        write_json(path, obj)
+        _perf_accum_seconds(perf_key, time.perf_counter() - t0)
 
     def _update_schema_stats(sample_id: str, round_idx: int, meta: Mapping[str, Any]) -> None:
         nonlocal schema_repair_turn_count, schema_repair_failed_turn_count, missing_answer_round_count
@@ -2580,7 +2637,7 @@ def main() -> int:
                     trace_fingerprint.pop("trace_fingerprint_hash", None)
                 trace["trace_fingerprint_hash"] = _sha256_upper_json(trace_fingerprint)
                 trace_path = str(sample_dir / "trace.json")
-                write_json(Path(trace_path), trace)
+                _write_json_timed(Path(trace_path), trace, "postproc_trace_io_seconds")
                 
                 raw_output_obj: Dict[str, Any] = {
                     "round0": raw0,
@@ -2607,7 +2664,7 @@ def main() -> int:
                     final_obj = dict(raw_output_norm.get("final"))  # keep CSV final and final.json aligned
                     pred_label = str(final_obj.get("anomaly", "no"))
                 write_json(Path(final_path), final_obj)
-                write_json(Path(trace_path), trace)
+                _write_json_timed(Path(trace_path), trace, "postproc_trace_io_seconds")
 
                 rows.append(
                     {
@@ -2821,7 +2878,7 @@ def main() -> int:
                 trace_fingerprint.pop("trace_fingerprint_hash", None)
             trace["trace_fingerprint_hash"] = _sha256_upper_json(trace_fingerprint)
             trace_path = str(sample_dir / "trace.json")
-            write_json(Path(trace_path), trace)
+            _write_json_timed(Path(trace_path), trace, "postproc_trace_io_seconds")
 
             raw_output_obj = {
                 "round0": raw0,
@@ -2848,7 +2905,7 @@ def main() -> int:
                 final_obj = dict(raw_output_norm.get("final"))
                 pred_label = str(final_obj.get("anomaly", "no"))
             write_json(Path(final_path), final_obj)
-            write_json(Path(trace_path), trace)
+            _write_json_timed(Path(trace_path), trace, "postproc_trace_io_seconds")
 
             rows.append(
                 {
@@ -2894,6 +2951,7 @@ def main() -> int:
             "bbox_norm",
             "ref_sample_id",
         ]
+        table_io_t0 = time.perf_counter()
         with open(out_csv, "w", encoding="utf-8", newline="") as f_csv:
             writer = csv.DictWriter(f_csv, fieldnames=csv_columns, extrasaction="ignore", quoting=csv.QUOTE_MINIMAL)
             writer.writeheader()
@@ -2912,6 +2970,7 @@ def main() -> int:
                         writer.writerow(fallback_row)
                     except Exception:
                         pass
+        _perf_accum_seconds("postproc_table_io_seconds", time.perf_counter() - table_io_t0)
 
         required_final_keys = ["anomaly", "defect_type", "reason", "confidence", "bbox"]
         unknown_count = 0
@@ -3001,6 +3060,7 @@ def main() -> int:
             "cleanup_every_n": int(cleanup_every_n),
         }
         trace_main_jsonl = trace_root / "main.jsonl"
+        trace_io_t0 = time.perf_counter()
         with open(trace_main_jsonl, "w", encoding="utf-8") as f_main:
             for row in rows:
                 sid = str(row.get("sample_id") or "")
@@ -3012,6 +3072,7 @@ def main() -> int:
                     "missing_answer_tags": bool(st.get("missing_answer_tags", False)),
                 }
                 f_main.write(json.dumps(line_obj, ensure_ascii=False, sort_keys=True) + "\n")
+        _perf_accum_seconds("postproc_trace_io_seconds", time.perf_counter() - trace_io_t0)
         missing_answer_rate = (float(len(missing_answer_sample_ids)) / float(len(rows))) if rows else 0.0
         summary["schema_stats"] = {
             "main_jsonl": str(trace_main_jsonl),
@@ -3026,9 +3087,11 @@ def main() -> int:
         trace_files = list(trace_root.rglob("trace.json")) if trace_root.exists() else []
         summary["trace_count"] = int(len(trace_files))
         summary["trace_emitted"] = bool(len(trace_files) > 0)
+        table_hash_t0 = time.perf_counter()
         csv_sha = hashlib.sha256(out_csv.read_bytes()).hexdigest().upper() if out_csv.exists() else None
+        _perf_accum_seconds("postproc_table_io_seconds", time.perf_counter() - table_hash_t0)
         summary["csv_sha256"] = csv_sha
-        write_json(out_summary, summary)
+        _write_json_timed(out_summary, summary, "postproc_table_io_seconds")
         if rows:
             first_sample_id = str(rows[0].get("sample_id") or "")
             first_trace_path = trace_root / first_sample_id / "trace.json"
@@ -3054,6 +3117,10 @@ def main() -> int:
     batch_wall_hist_obj = _PERF_TIMING_STATS.get("batch_wall_seconds_hist", [])
     batch_wall_seconds_hist = [float(x) for x in batch_wall_hist_obj] if isinstance(batch_wall_hist_obj, list) else []
     gen_wall_seconds_total = float(_PERF_TIMING_STATS.get("gen_wall_seconds_total", 0.0))
+    postproc_parse_seconds = float(_PERF_TIMING_STATS.get("postproc_parse_seconds", 0.0))
+    postproc_repair_seconds = float(_PERF_TIMING_STATS.get("postproc_repair_seconds", 0.0))
+    postproc_trace_io_seconds = float(_PERF_TIMING_STATS.get("postproc_trace_io_seconds", 0.0))
+    postproc_table_io_seconds = float(_PERF_TIMING_STATS.get("postproc_table_io_seconds", 0.0))
     micro_batch_calls_expected = (int(n_success) + max(1, int(micro_batch_size)) - 1) // max(1, int(micro_batch_size))
     _timing_cuda_sync()
 
@@ -3093,6 +3160,10 @@ def main() -> int:
         "batch_wall_seconds_hist": list(batch_wall_seconds_hist),
         "gen_wall_seconds_total": float(gen_wall_seconds_total),
         "postproc_wall_seconds_total": float(postproc_wall_seconds_total),
+        "postproc_parse_seconds": float(postproc_parse_seconds),
+        "postproc_repair_seconds": float(postproc_repair_seconds),
+        "postproc_trace_io_seconds": float(postproc_trace_io_seconds),
+        "postproc_table_io_seconds": float(postproc_table_io_seconds),
         "micro_batch_calls_expected": int(micro_batch_calls_expected),
         "cleanup_every_n": int(cleanup_every_n),
         "missing_dataset_prefixes": missing_dataset_prefixes,
@@ -3115,10 +3186,16 @@ def main() -> int:
         summary["postproc_wall_seconds_total"] = float(postproc_wall_seconds_total)
         summary["batch_wall_seconds_hist"] = list(batch_wall_seconds_hist)
         summary["batch_sizes_hist"] = list(batch_sizes_hist)
+        summary["postproc_parse_seconds"] = float(postproc_parse_seconds)
+        summary["postproc_repair_seconds"] = float(postproc_repair_seconds)
+        summary["postproc_trace_io_seconds"] = float(postproc_trace_io_seconds)
+        summary["postproc_table_io_seconds"] = float(postproc_table_io_seconds)
         try:
-            write_json(out_summary, summary)
+            _write_json_timed(out_summary, summary, "postproc_table_io_seconds")
         except Exception:
             pass
+    postproc_table_io_seconds = float(_PERF_TIMING_STATS.get("postproc_table_io_seconds", postproc_table_io_seconds))
+    result_summary["postproc_table_io_seconds"] = float(postproc_table_io_seconds)
     avg_sec_per_sample = (total_wall_seconds / float(processed_count)) if processed_count else 0.0
     generated_tokens_total = int(_VLM_RUNTIME_STATS.get("generated_tokens_total", 0))
     avg_gen_tokens_per_sample = (float(generated_tokens_total) / float(processed_count)) if processed_count else 0.0
@@ -3191,6 +3268,10 @@ def main() -> int:
             f"[06_run_agentiad_infer.py][perf] total_wall_seconds={total_wall_seconds:.4f} "
             f"gen_wall_seconds_total={float(gen_wall_seconds_total):.4f} "
             f"postproc_wall_seconds_total={float(postproc_wall_seconds_total):.4f} "
+            f"postproc_parse_seconds={float(postproc_parse_seconds):.4f} "
+            f"postproc_repair_seconds={float(postproc_repair_seconds):.4f} "
+            f"postproc_trace_io_seconds={float(postproc_trace_io_seconds):.4f} "
+            f"postproc_table_io_seconds={float(postproc_table_io_seconds):.4f} "
             f"avg_sec_per_sample={avg_sec_per_sample:.4f} "
             f"avg_gen_tokens_per_sample={avg_gen_tokens_per_sample:.2f} "
             f"max_new_tokens={int(max_new_tokens)} "
