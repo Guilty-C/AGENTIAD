@@ -75,6 +75,11 @@ _CUDA_CLEANUP_STATS: Dict[str, int] = {
     "calls_error": 0,
     "calls_success": 0,
 }
+_MICRO_BATCH_RUNTIME_STATS: Dict[str, Any] = {
+    "calls": 0,
+    "samples": 0,
+    "batch_sizes_hist": [],
+}
 _ANSWER_END_TAG = "</answer>"
 _STRICT_ANSWER_RULE = (
     "\n\nOutput format (MUST, no extra text):\n"
@@ -860,6 +865,7 @@ def _vlm_generate_with_schema_repair(
         raw, parsed, meta, _ = _run(prompt)
     repair_summaries: List[Dict[str, Any]] = []
     if _schema_valid(meta, parsed):
+        meta.pop("error", None)
         meta["repair_attempted"] = False
         meta["repair_n"] = int(max(0, repair_n))
         return raw, parsed, meta
@@ -890,6 +896,7 @@ def _vlm_generate_with_schema_repair(
             )
         raw, parsed, meta, _ = _run(repair_prompt)
         if _schema_valid(meta, parsed):
+            meta.pop("error", None)
             meta["repair_attempted"] = True
             meta["repair_n"] = int(total_repairs)
             meta["repair_attempt_used"] = int(ridx)
@@ -924,6 +931,7 @@ def _vlm_generate_with_schema_repair(
     forced_meta["repair_attempted"] = True
     forced_meta["repair_n"] = int(total_repairs)
     forced_meta["repair_failed"] = True
+    forced_meta.pop("error", None)
     forced_meta["raw_text_summary"] = _summarize_raw_text(raw)
     forced_meta["repair_history"] = repair_summaries
     forced_meta["forced_valid_answer"] = True
@@ -1399,6 +1407,13 @@ def _vlm_generate_batch(
                         pass
                 if answer_stop_criteria is not None:
                     gen_kwargs["stopping_criteria"] = answer_stop_criteria
+                _MICRO_BATCH_RUNTIME_STATS["calls"] = int(_MICRO_BATCH_RUNTIME_STATS.get("calls", 0)) + 1
+                _MICRO_BATCH_RUNTIME_STATS["samples"] = int(_MICRO_BATCH_RUNTIME_STATS.get("samples", 0)) + int(batch_size)
+                hist = _MICRO_BATCH_RUNTIME_STATS.get("batch_sizes_hist")
+                if not isinstance(hist, list):
+                    hist = []
+                    _MICRO_BATCH_RUNTIME_STATS["batch_sizes_hist"] = hist
+                hist.append(int(batch_size))
                 try:
                     gen_ids = model.generate(**inputs, **gen_kwargs)
                 except TypeError:
@@ -2127,8 +2142,10 @@ def main() -> int:
     micro_batch_calls = 0
     micro_batch_samples = 0
     micro_batch_fallback_single = 0
+    batch_sizes_hist: List[int] = []
     _VLM_RUNTIME_STATS.update({"generate_calls": 0, "generated_tokens_total": 0, "retry_exceptions": 0})
     _CUDA_CLEANUP_STATS.update({"calls_total": 0, "calls_error": 0, "calls_success": 0})
+    _MICRO_BATCH_RUNTIME_STATS.update({"calls": 0, "samples": 0, "batch_sizes_hist": []})
     run_wall_t0 = time.perf_counter()
     pbar = None
     progress_fallback = False
@@ -2291,9 +2308,10 @@ def main() -> int:
     skip_reasons: Dict[str, int] = {}
     skip_reason_examples: Dict[str, List[Dict[str, Any]]] = {}
     image_env = _image_loader_env_snapshot()
+    round0_prefetch_raw_by_idx: Dict[int, str] = {}
 
     try:
-        for idx in candidates:
+        for cand_pos, idx in enumerate(candidates):
             if len(rows) >= max_samples:
                 break
             attempts += 1
@@ -2422,33 +2440,64 @@ def main() -> int:
                 "turns": [],
             }
 
-            prefetched_raw0: Optional[str] = None
-            if int(micro_batch_size) > 1 and (not bool(args.dry_run)):
-                round0_images: List[Any] = [img]
-                if len(round0_images) != 1:
-                    print(f"[micro_batch] fallback_to_single sample_id={sample_id} reason=multi_image_sample", file=sys.stderr)
-                    micro_batch_fallback_single += 1
-                else:
-                    micro_batch_calls += 1
-                    micro_batch_samples += 1
+            prefetched_raw0: Optional[str] = round0_prefetch_raw_by_idx.pop(int(idx), None)
+            if prefetched_raw0 is None and int(micro_batch_size) > 1 and (not bool(args.dry_run)):
+                batch_entries: List[Tuple[int, str, List[Any]]] = [(int(idx), str(sample_id), [img])]
+                look_pos = int(cand_pos) + 1
+                while len(batch_entries) < int(micro_batch_size) and look_pos < len(candidates):
+                    idx2 = int(candidates[look_pos])
+                    look_pos += 1
+                    if idx2 in round0_prefetch_raw_by_idx:
+                        continue
+                    row2 = d0[int(idx2)]
+                    if not isinstance(row2, dict):
+                        continue
+                    sid2 = _sample_id(split, int(idx2), row2)
+                    if id_list_set is not None and sid2 not in id_list_set:
+                        continue
+                    image_candidates2 = _extract_image_candidates(row2)
+                    if not image_candidates2:
+                        continue
+                    img2 = None
+                    for _, field_value2 in image_candidates2:
+                        try:
+                            img2 = _decode_hf_image(dataset_id, field_value2).convert("RGB")
+                            img2 = _resize_image_max_side(img2, vlm_max_side)
+                            break
+                        except Exception:
+                            img2 = None
+                    if img2 is None:
+                        continue
+                    batch_entries.append((int(idx2), str(sid2), [img2]))
+                eligible_batch_entries: List[Tuple[int, str, List[Any]]] = []
+                for entry in batch_entries:
+                    if len(entry[2]) != 1:
+                        print(f"[micro_batch] fallback_to_single sample_id={entry[1]} reason=multi_image_sample", file=sys.stderr)
+                        micro_batch_fallback_single += 1
+                        continue
+                    eligible_batch_entries.append(entry)
+                if len(eligible_batch_entries) > 1:
                     try:
                         batched_raw = _vlm_generate_batch(
                             processor=processor,
                             model=model,
-                            images_batch=[round0_images for _ in range(int(micro_batch_size))],
+                            images_batch=[entry[2] for entry in eligible_batch_entries],
                             prompt=prompt_global,
                             generation_config=generation_config,
                             use_cache=bool(use_cache),
                             sdp_backend=sdp_backend,
                             answer_stop_criteria=answer_stop_criteria,
                         )
-                        if not isinstance(batched_raw, list) or not batched_raw:
+                        if not isinstance(batched_raw, list) or len(batched_raw) != len(eligible_batch_entries):
                             raise RuntimeError("incompatible_tensor_shape")
-                        prefetched_raw0 = _safe_str(batched_raw[0])
+                        for entry, raw_text in zip(eligible_batch_entries, batched_raw):
+                            round0_prefetch_raw_by_idx[int(entry[0])] = _safe_str(raw_text)
+                        prefetched_raw0 = round0_prefetch_raw_by_idx.pop(int(idx), None)
                     except Exception as e:
                         reason = _classify_micro_batch_reason(e)
-                        print(f"[micro_batch] fallback_to_single sample_id={sample_id} reason={reason}", file=sys.stderr)
-                        micro_batch_fallback_single += 1
+                        for _, sid, _ in eligible_batch_entries:
+                            print(f"[micro_batch] fallback_to_single sample_id={sid} reason={reason}", file=sys.stderr)
+                            micro_batch_fallback_single += 1
 
             try:
                 raw0, parsed0, meta0 = _vlm_generate_with_schema_repair(
@@ -2873,6 +2922,12 @@ def main() -> int:
         }
         print("SELF_CHECK_JSON=" + json.dumps(self_check, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
+        micro_batch_calls = int(_MICRO_BATCH_RUNTIME_STATS.get("calls", 0))
+        micro_batch_samples = int(_MICRO_BATCH_RUNTIME_STATS.get("samples", 0))
+        hist_obj = _MICRO_BATCH_RUNTIME_STATS.get("batch_sizes_hist", [])
+        batch_sizes_hist = [int(x) for x in hist_obj] if isinstance(hist_obj, list) else []
+        micro_batch_calls_expected = (int(n_success) + max(1, int(micro_batch_size)) - 1) // max(1, int(micro_batch_size))
+
         summary = {
             "timestamp_utc": utc_now_iso(),
             "run_name": run_name,
@@ -2910,6 +2965,8 @@ def main() -> int:
             "micro_batch_calls": int(micro_batch_calls),
             "micro_batch_samples": int(micro_batch_samples),
             "micro_batch_fallback_single": int(micro_batch_fallback_single),
+            "batch_sizes_hist": list(batch_sizes_hist),
+            "micro_batch_calls_expected": int(micro_batch_calls_expected),
             "out_csv": str(out_csv),
             "trace_dir": str(trace_root),
             "cleanup_every_n": int(cleanup_every_n),
@@ -2961,6 +3018,12 @@ def main() -> int:
                 except Exception:
                     pass
 
+    micro_batch_calls = int(_MICRO_BATCH_RUNTIME_STATS.get("calls", 0))
+    micro_batch_samples = int(_MICRO_BATCH_RUNTIME_STATS.get("samples", 0))
+    hist_obj = _MICRO_BATCH_RUNTIME_STATS.get("batch_sizes_hist", [])
+    batch_sizes_hist = [int(x) for x in hist_obj] if isinstance(hist_obj, list) else []
+    micro_batch_calls_expected = (int(n_success) + max(1, int(micro_batch_size)) - 1) // max(1, int(micro_batch_size))
+
     # Gather result summary
     result_summary = {
         "run_name": run_name,
@@ -2990,6 +3053,8 @@ def main() -> int:
         "micro_batch_calls": int(micro_batch_calls),
         "micro_batch_samples": int(micro_batch_samples),
         "micro_batch_fallback_single": int(micro_batch_fallback_single),
+        "batch_sizes_hist": list(batch_sizes_hist),
+        "micro_batch_calls_expected": int(micro_batch_calls_expected),
         "cleanup_every_n": int(cleanup_every_n),
         "missing_dataset_prefixes": missing_dataset_prefixes,
         "missing_example_files": missing_example_files,
@@ -3046,7 +3111,9 @@ def main() -> int:
             f"[06_run_agentiad_infer.py][perf] micro_batch_size={int(micro_batch_size)} "
             f"micro_batch_calls={int(micro_batch_calls)} "
             f"micro_batch_samples={int(micro_batch_samples)} "
-            f"micro_batch_fallback_single={int(micro_batch_fallback_single)}",
+            f"micro_batch_fallback_single={int(micro_batch_fallback_single)} "
+            f"micro_batch_calls_expected={int(micro_batch_calls_expected)} "
+            f"batch_sizes_hist={list(batch_sizes_hist)}",
             file=sys.stderr,
         )
         print(
