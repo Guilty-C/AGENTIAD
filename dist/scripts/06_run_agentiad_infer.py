@@ -65,6 +65,16 @@ MMAD_ASSET_MODE: str = "unknown"
 _LOCAL_DIR_ENTRY_CACHE: Dict[str, Dict[str, Path]] = {}
 _CHAT_TEXT_CACHE: Dict[Tuple[str, int, str], str] = {}
 _LAST_VLM_EXCEPTIONS: List[Dict[str, Any]] = []
+_VLM_RUNTIME_STATS: Dict[str, int] = {
+    "generate_calls": 0,
+    "generated_tokens_total": 0,
+    "retry_exceptions": 0,
+}
+_CUDA_CLEANUP_STATS: Dict[str, int] = {
+    "calls_total": 0,
+    "calls_error": 0,
+    "calls_success": 0,
+}
 _ANSWER_END_TAG = "</answer>"
 _STRICT_ANSWER_RULE = (
     "\n\nOutput format (MUST, no extra text):\n"
@@ -805,6 +815,7 @@ def _vlm_generate_with_schema_repair(
     images: Sequence["PIL.Image.Image"],
     prompt: str,
     generation_config: Any,
+    use_cache: bool,
     sdp_backend: str,
     max_retries: int,
     repair_n: int,
@@ -826,6 +837,7 @@ def _vlm_generate_with_schema_repair(
                 images,
                 prompt_text,
                 generation_config,
+                use_cache=use_cache,
                 sdp_backend=sdp_backend,
                 max_retries=max_retries,
                 answer_stop_criteria=answer_stop_criteria,
@@ -1065,7 +1077,13 @@ def _resize_image_max_side(img: "PIL.Image.Image", max_side: int) -> "PIL.Image.
     return img.resize((new_w, new_h))
 
 
-def _cleanup_cuda_memory() -> None:
+def _cleanup_cuda_memory(*, reason: str = "error") -> None:
+    global _CUDA_CLEANUP_STATS
+    _CUDA_CLEANUP_STATS["calls_total"] = int(_CUDA_CLEANUP_STATS.get("calls_total", 0)) + 1
+    if str(reason).strip().lower().startswith("success"):
+        _CUDA_CLEANUP_STATS["calls_success"] = int(_CUDA_CLEANUP_STATS.get("calls_success", 0)) + 1
+    else:
+        _CUDA_CLEANUP_STATS["calls_error"] = int(_CUDA_CLEANUP_STATS.get("calls_error", 0)) + 1
     try:
         import torch
 
@@ -1144,6 +1162,7 @@ def _vlm_generate(
     images: Sequence["PIL.Image.Image"],
     prompt: str,
     generation_config: Any,
+    use_cache: bool = True,
     sdp_backend: str = "auto",
     max_retries: int = 2,
     answer_stop_criteria: Any = None,
@@ -1216,20 +1235,30 @@ def _vlm_generate(
             with torch.inference_mode():
                 with sdp_ctx:
                     gen_kwargs: Dict[str, Any] = {"generation_config": generation_config}
+                    if generation_config is not None:
+                        try:
+                            generation_config.use_cache = bool(use_cache)
+                        except Exception:
+                            pass
                     if answer_stop_criteria is not None:
                         gen_kwargs["stopping_criteria"] = answer_stop_criteria
                     try:
-                        gen_ids = model.generate(**inputs, **gen_kwargs, use_cache=False)
+                        gen_ids = model.generate(**inputs, **gen_kwargs)
                     except TypeError:
-                        try:
-                            gen_ids = model.generate(**inputs, **gen_kwargs)
-                        except TypeError:
-                            gen_kwargs.pop("stopping_criteria", None)
-                            gen_ids = model.generate(**inputs, **gen_kwargs)
+                        gen_kwargs.pop("stopping_criteria", None)
+                        gen_ids = model.generate(**inputs, **gen_kwargs)
             input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else None
             decode_ids = gen_ids
             if input_ids is not None and hasattr(input_ids, "shape") and hasattr(gen_ids, "shape"):
                 decode_ids = gen_ids[:, input_ids.shape[1] :]
+            token_count = 0
+            try:
+                if decode_ids is not None and hasattr(decode_ids, "shape") and len(decode_ids.shape) >= 2:
+                    token_count = int(decode_ids.shape[1])
+            except Exception:
+                token_count = 0
+            _VLM_RUNTIME_STATS["generate_calls"] = int(_VLM_RUNTIME_STATS.get("generate_calls", 0)) + 1
+            _VLM_RUNTIME_STATS["generated_tokens_total"] = int(_VLM_RUNTIME_STATS.get("generated_tokens_total", 0)) + max(0, int(token_count))
             if hasattr(processor, "batch_decode"):
                 decoded = processor.batch_decode(decode_ids, skip_special_tokens=True)
                 return _safe_str(decoded[0]).strip() if decoded else ""
@@ -1261,7 +1290,6 @@ def _vlm_generate(
                 del gen_ids
             except Exception:
                 pass
-            _cleanup_cuda_memory()
 
     retries = max(0, int(max_retries))
     for attempt in range(retries + 1):
@@ -1272,7 +1300,8 @@ def _vlm_generate(
         except Exception as e:
             print(f"DEBUG: _vlm_generate attempt{attempt} exception: {e}", file=sys.stderr)
             _record_exc(attempt, e)
-            _cleanup_cuda_memory()
+            _VLM_RUNTIME_STATS["retry_exceptions"] = int(_VLM_RUNTIME_STATS.get("retry_exceptions", 0)) + 1
+            _cleanup_cuda_memory(reason="error_retry")
     # Fallback output is always schema-valid and non-execution_error.
     return '<answer>{"anomaly_present": false, "top_anomaly": "none", "visual_descriptions": []}</answer>'
 
@@ -1365,6 +1394,8 @@ def main() -> int:
     parser.add_argument("--local_files_only", type=str, default=None, help="Force local files only (true/false/1/0)")
     parser.add_argument("--allow_full_dataset", action="store_true", help="Allow full dataset traversal")
     parser.add_argument("--perf", default=None, type=str, help="Enable lightweight perf summary (true/false/1/0/yes/no/on/off).")
+    parser.add_argument("--use_cache", default="true", type=str, help="Enable KV-cache during generation (true/false/1/0/yes/no/on/off).")
+    parser.add_argument("--cleanup_every_n", type=int, default=0, help="Run aggressive CUDA cleanup every N successful samples (0 disables success-path cleanup).")
     parser.add_argument("--vlm-max-side", type=int, default=None, dest="vlm_max_side", help="Resize input image so long side <= this value before VLM inference.")
     parser.add_argument("--sdp-backend", type=str, default="auto", dest="sdp_backend", help="SDP backend policy: auto, math, flash, mem_efficient")
     parser.add_argument("--vlm-retry-n", type=int, default=2, dest="vlm_retry_n", help="VLM retries after first attempt (0 means no retry)")
@@ -1492,6 +1523,8 @@ def main() -> int:
     env_perf = None if env_perf_val is None else (str(env_perf_val).strip().lower() not in false_set)
     cli_perf = None if args.perf is None else (str(args.perf).strip().lower() not in false_set)
     perf_enabled = cli_perf if cli_perf is not None else (env_perf if env_perf is not None else False)
+    use_cache = str(args.use_cache).strip().lower() not in false_set
+    cleanup_every_n = max(0, int(args.cleanup_every_n))
 
     model_short = re.sub(r"[^a-zA-Z0-9]+", "_", vlm_model_id.strip())[-40:].strip("_") or "model"
     run_name = str(args.run_name) if args.run_name is not None else str(cfg.get("run_name", "")).strip()
@@ -1737,7 +1770,7 @@ def main() -> int:
         if model is not None:
             try:
                 if hasattr(model, "config") and model.config is not None:
-                    model.config.use_cache = False
+                    model.config.use_cache = bool(use_cache)
             except Exception:
                 pass
             if not use_cuda:
@@ -1755,12 +1788,12 @@ def main() -> int:
                 model = model.to(device)
             try:
                 if hasattr(model, "generation_config") and model.generation_config is not None:
-                    model.generation_config.use_cache = False
+                    model.generation_config.use_cache = bool(use_cache)
             except Exception:
                 pass
             try:
                 if hasattr(model, "config") and model.config is not None:
-                    model.config.use_cache = False
+                    model.config.use_cache = bool(use_cache)
             except Exception:
                 pass
             model.eval()
@@ -1771,7 +1804,7 @@ def main() -> int:
             do_sample=False,
             temperature=0.0,
             top_p=1.0,
-            use_cache=False,
+            use_cache=bool(use_cache),
         )
         _ensure_pad_token_id_explicit(processor, model, generation_config)
         answer_stop_criteria = _build_answer_stop_criteria(processor)
@@ -1939,6 +1972,9 @@ def main() -> int:
     perf_crop_events = 0
     perf_ref_events = 0
     perf_io_decode_seconds = 0.0
+    _VLM_RUNTIME_STATS.update({"generate_calls": 0, "generated_tokens_total": 0, "retry_exceptions": 0})
+    _CUDA_CLEANUP_STATS.update({"calls_total": 0, "calls_error": 0, "calls_success": 0})
+    run_wall_t0 = time.perf_counter()
     pbar = None
     progress_fallback = False
     progress_start_ts = 0.0
@@ -2041,6 +2077,15 @@ def main() -> int:
             f"missing_answer_rate={missing_rate:.4f}",
             file=sys.stderr,
         )
+
+    def _cleanup_success_path_if_needed(processed: int) -> None:
+        if cleanup_every_n <= 0:
+            return
+        if processed <= 0:
+            return
+        if (processed % cleanup_every_n) != 0:
+            return
+        _cleanup_cuda_memory(reason="success_periodic")
 
     def _trace_has_tool_call(trace_path: Path, fallback_trace: Mapping[str, Any]) -> bool:
         tr: Any = None
@@ -2197,8 +2242,10 @@ def main() -> int:
                     "uncertainty_rule": cr_rule,
                     "vlm_max_side": int(vlm_max_side),
                     "sdp_backend": str(sdp_backend),
+                    "use_cache": bool(use_cache),
                     "max_retries": int(max_retries),
                     "repair_n": int(repair_n),
+                    "cleanup_every_n": int(cleanup_every_n),
                 },
                 "input": {
                     "query_image": qv if isinstance(qv, str) else "<in_memory_image>",
@@ -2218,6 +2265,7 @@ def main() -> int:
                     images=[img],
                     prompt=prompt_global,
                     generation_config=generation_config,
+                    use_cache=bool(use_cache),
                     sdp_backend=sdp_backend,
                     max_retries=max_retries,
                     repair_n=repair_n,
@@ -2230,7 +2278,7 @@ def main() -> int:
             except Exception as e:
                 n_skipped += 1
                 skip_reasons["inference_exception"] = skip_reasons.get("inference_exception", 0) + 1
-                _cleanup_cuda_memory()
+                _cleanup_cuda_memory(reason="error_inference_exception")
                 continue
             trace["turns"].append(
                 {
@@ -2320,7 +2368,7 @@ def main() -> int:
                      elif progress_fallback:
                          _stderr_progress(len(rows), progress_total)
                 _log_schema_stats_progress(len(rows))
-                _cleanup_cuda_memory()
+                _cleanup_success_path_if_needed(len(rows))
                 continue
 
             # Tool Execution Logic (PZ -> CR)
@@ -2365,6 +2413,7 @@ def main() -> int:
                 images=[crop_img],
                 prompt=prompt_crop,
                 generation_config=generation_config,
+                use_cache=bool(use_cache),
                 sdp_backend=sdp_backend,
                 max_retries=max_retries,
                 repair_n=repair_n,
@@ -2465,6 +2514,7 @@ def main() -> int:
                     images=cr_images,
                     prompt=prompt_cr,
                     generation_config=generation_config,
+                    use_cache=bool(use_cache),
                     sdp_backend=sdp_backend,
                     max_retries=max_retries,
                     repair_n=repair_n,
@@ -2560,7 +2610,7 @@ def main() -> int:
                 elif progress_fallback:
                     _stderr_progress(len(rows), progress_total)
             _log_schema_stats_progress(len(rows))
-            _cleanup_cuda_memory()
+            _cleanup_success_path_if_needed(len(rows))
 
         csv_columns = [
             "sample_id",
@@ -2662,8 +2712,10 @@ def main() -> int:
             "tool_calls_total": int(tool_calls_total),
             "csv_write_fail_count": int(csv_write_fail_count),
             "uncertainty_rule": cr_rule,
+            "use_cache": bool(use_cache),
             "out_csv": str(out_csv),
             "trace_dir": str(trace_root),
+            "cleanup_every_n": int(cleanup_every_n),
         }
         trace_main_jsonl = trace_root / "main.jsonl"
         with open(trace_main_jsonl, "w", encoding="utf-8") as f_main:
@@ -2736,6 +2788,8 @@ def main() -> int:
         "allow_full_dataset": bool(args.allow_full_dataset),
         "max_samples_effective": max_samples_effective,
         "dataset_split": split,
+        "use_cache": bool(use_cache),
+        "cleanup_every_n": int(cleanup_every_n),
         "missing_dataset_prefixes": missing_dataset_prefixes,
         "missing_example_files": missing_example_files,
     }
@@ -2751,6 +2805,14 @@ def main() -> int:
         "schema_stats_every": int(schema_stats_every),
         "main_jsonl": str(trace_root / "main.jsonl"),
     }
+    total_wall_seconds = max(0.0, time.perf_counter() - run_wall_t0)
+    avg_sec_per_sample = (total_wall_seconds / float(processed_count)) if processed_count else 0.0
+    generated_tokens_total = int(_VLM_RUNTIME_STATS.get("generated_tokens_total", 0))
+    avg_gen_tokens_per_sample = (float(generated_tokens_total) / float(processed_count)) if processed_count else 0.0
+    retry_exceptions = int(_VLM_RUNTIME_STATS.get("retry_exceptions", 0))
+    cleanup_calls_total = int(_CUDA_CLEANUP_STATS.get("calls_total", 0))
+    cleanup_calls_success = int(_CUDA_CLEANUP_STATS.get("calls_success", 0))
+    cleanup_calls_error = int(_CUDA_CLEANUP_STATS.get("calls_error", 0))
 
     # Log readable summary to stderr (Audit/Debug)
     # Ensure all logs go to stderr to keep stdout clean for harness
@@ -2779,6 +2841,24 @@ def main() -> int:
     # Contract: Single line JSON to stderr (to keep stdout clean for harness)
     print(f"L2_RESULT_JSON={json.dumps(result_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
     if perf_enabled:
+        print(
+            f"[06_run_agentiad_infer.py][perf] total_wall_seconds={total_wall_seconds:.4f} "
+            f"avg_sec_per_sample={avg_sec_per_sample:.4f} "
+            f"avg_gen_tokens_per_sample={avg_gen_tokens_per_sample:.2f} "
+            f"max_new_tokens={int(max_new_tokens)}",
+            file=sys.stderr,
+        )
+        print(
+            f"[06_run_agentiad_infer.py][perf] retry_exceptions={retry_exceptions} "
+            f"schema_repair_count={int(schema_repair_turn_count)} "
+            f"schema_repair_failed_count={int(schema_repair_failed_turn_count)}",
+            file=sys.stderr,
+        )
+        print(
+            f"[06_run_agentiad_infer.py][perf] cuda_cleanup_calls_total={cleanup_calls_total} "
+            f"(success={cleanup_calls_success}, error={cleanup_calls_error}, cleanup_every_n={int(cleanup_every_n)})",
+            file=sys.stderr,
+        )
         print(
             f"[06_run_agentiad_infer.py][perf] saved_second_reads={int(perf_saved_second_reads)} "
             f"(crop_events={int(perf_crop_events)}, ref_events={int(perf_ref_events)})",
