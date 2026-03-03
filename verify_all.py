@@ -1078,6 +1078,102 @@ def _phase2_sanity_check_evidence_zip(
     return out
 
 
+def _count_missing_answer_tags_in_terminal_log(terminal_log_path: Path) -> int:
+    p = Path(terminal_log_path)
+    if not p.exists() or not p.is_file():
+        return 0
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return 0
+    # Count both plain parser errors and schema_repair-prefixed variants.
+    return int(
+        len(
+            re.findall(
+                r"Missing <answer> tags|\[schema_repair\].*Missing <answer> tags",
+                text,
+            )
+        )
+    )
+
+
+def _stats_evidence_zip(zip_path: Path, terminal_log_path: Path) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "zip_path": str(zip_path),
+        "main_jsonl_lines": 0,
+        "trace_json_count": 0,
+        "missing_answer_tags_count": 0,
+        "missing_answer_rate": 0.0,
+        "denominator": "trace_json_count",
+        "error": "",
+    }
+    zp = Path(zip_path)
+    if not zp.exists() or not zp.is_file():
+        out["error"] = f"zip_missing:{zp}"
+        return out
+
+    missing_count = _count_missing_answer_tags_in_terminal_log(Path(terminal_log_path))
+    out["missing_answer_tags_count"] = int(missing_count)
+    try:
+        with zipfile.ZipFile(zp, "r") as zf:
+            members = zf.namelist()
+            main_members = [m for m in members if (m == "main.jsonl" or m.endswith("/main.jsonl"))]
+            main_lines = 0
+            for member in main_members:
+                with zf.open(member, "r") as fh:
+                    main_lines += sum(1 for _ in fh)
+            trace_count = len(
+                [
+                    m
+                    for m in members
+                    if (m == "trace.json" or m.endswith("/trace.json") or m.endswith(".trace.json"))
+                ]
+            )
+            out["main_jsonl_lines"] = int(main_lines)
+            out["trace_json_count"] = int(trace_count)
+            denom = int(main_lines) if int(main_lines) > 0 else int(trace_count)
+            out["denominator"] = "main_jsonl_lines" if int(main_lines) > 0 else "trace_json_count"
+            out["missing_answer_rate"] = (float(missing_count) / float(denom)) if denom > 0 else 0.0
+            return out
+    except Exception as e:
+        out["error"] = f"zip_stats_error:{type(e).__name__}:{e}"
+        return out
+
+
+def _emit_phase2_zip_stats_line(output_dir: Path, seeds: Sequence[int], terminal_log_path: Path) -> Dict[str, Any]:
+    # Ensure tee buffer is visible before reading terminal log for counting.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+    zip_paths: List[Path] = []
+    for seed in seeds:
+        p = Path(output_dir) / f"seed_{int(seed)}" / "ev_06" / "evidence_package.zip"
+        if p.exists() and p.is_file():
+            zip_paths.append(p)
+
+    per_zip: List[Dict[str, Any]] = [_stats_evidence_zip(zp, terminal_log_path) for zp in zip_paths]
+    main_total = int(sum(int(x.get("main_jsonl_lines", 0) or 0) for x in per_zip))
+    trace_total = int(sum(int(x.get("trace_json_count", 0) or 0) for x in per_zip))
+    missing_count = _count_missing_answer_tags_in_terminal_log(Path(terminal_log_path))
+    denom = main_total if main_total > 0 else trace_total
+    rate = (float(missing_count) / float(denom)) if denom > 0 else 0.0
+    out = {
+        "zip_count": int(len(zip_paths)),
+        "main_jsonl_lines": int(main_total),
+        "trace_json_count": int(trace_total),
+        "missing_answer_tags_count": int(missing_count),
+        "missing_answer_rate": float(rate),
+        "denominator": "main_jsonl_lines" if main_total > 0 else "trace_json_count",
+        "zip_paths": [str(p) for p in zip_paths],
+        "per_zip": per_zip,
+    }
+    print("[zip_stats] " + json.dumps(out, ensure_ascii=False, sort_keys=True))
+    return out
+
+
 def _phase2_fail_fast_abort(res: "StageResult", reason: str) -> None:
     res.gates["J2"] = False
     res.success = False
@@ -1404,6 +1500,19 @@ def _expected_count_from_ids(ids_path: Path, eff_max: Optional[int]) -> Optional
         return min(n_ids, eff_max)
     except:
         return None
+
+
+def _resolve_expected_max_samples(ctx: StageContext) -> Optional[int]:
+    eff_max = ctx.get_effective_max_samples()
+    if eff_max is not None:
+        return int(eff_max)
+    env = _effective_env(ctx.env_overrides)
+    dev_raw = str(env.get("DEV_MAX_SAMPLES", "") or "").strip()
+    if not dev_raw:
+        return None
+    if not re.fullmatch(r"[1-9]\d*", dev_raw):
+        return None
+    return int(dev_raw)
 
 def _generate_ids_from_dataset(requested_split: str) -> tuple[List[str], str]:
     from datasets import load_dataset
@@ -1860,8 +1969,10 @@ class AgentInfer06(Stage):
                             res.remediations.append(remediation)
                         return
 
-                eff_max = ctx.get_effective_max_samples()
+                eff_max = _resolve_expected_max_samples(ctx)
                 subset_size = _expected_count_from_ids(ctx.work_dir / "ids.txt", eff_max)
+                if ctx.phase2_full_infer:
+                    res.artifacts[f"seed_{seed}_audit_expected_max_samples"] = "NONE" if eff_max is None else int(eff_max)
                 
                 # If Phase 1 and we have effective_n, use it for strict J3
                 if ctx.phase1_baseline and l2_effective_n is not None:
@@ -3149,7 +3260,11 @@ def run_workload(args):
     res = StageResult()
     res.artifacts["audit_allow_full_dataset"] = bool(ctx.allow_full_dataset)
     res.artifacts["audit_dataset_split"] = str(ctx.dataset_split)
-    res.artifacts["audit_effective_max_samples"] = "NONE" if ctx.allow_full_dataset else int(ctx.get_effective_max_samples())
+    if is_phase2_full:
+        _phase2_audit_eff = _resolve_expected_max_samples(ctx)
+        res.artifacts["audit_effective_max_samples"] = "NONE" if _phase2_audit_eff is None else int(_phase2_audit_eff)
+    else:
+        res.artifacts["audit_effective_max_samples"] = "NONE" if ctx.allow_full_dataset else int(ctx.get_effective_max_samples())
     res.artifacts["audit_ids_total"] = 0
     res.artifacts["audit_ids_source"] = "NOT_SET"
     res.artifacts["ids_source_note"] = "NOT_SET"
@@ -3376,6 +3491,12 @@ def main():
         if not isinstance(payload.get("artifacts"), dict):
             payload["artifacts"] = {}
         payload["artifacts"]["terminal_log_path"] = str(terminal_log_path)
+        if args.mode == "phase2_full_infer":
+            try:
+                zip_stats = _emit_phase2_zip_stats_line(output_dir, args.seeds, terminal_log_path)
+                payload["artifacts"]["zip_stats"] = zip_stats
+            except Exception as e:
+                print(f"[zip_stats] " + json.dumps({"error": f"zip_stats_emit_failed:{type(e).__name__}:{e}"}, ensure_ascii=False, sort_keys=True))
 
         print("WORKLOAD_RESULT=" + json.dumps(payload, ensure_ascii=False, sort_keys=True))
         if args.mode in {"phase1_baseline", "phase1_acceptance_only", "phase2_full_infer"}:
