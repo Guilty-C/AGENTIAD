@@ -1268,15 +1268,11 @@ def _vlm_generate(
                         pass
                 if answer_stop_criteria is not None:
                     gen_kwargs["stopping_criteria"] = answer_stop_criteria
-                _timing_cuda_sync()
-                gen_t0 = time.perf_counter()
                 try:
                     gen_ids = model.generate(**inputs, **gen_kwargs)
                 except TypeError:
                     gen_kwargs.pop("stopping_criteria", None)
                     gen_ids = model.generate(**inputs, **gen_kwargs)
-                _timing_cuda_sync()
-                _PERF_TIMING_STATS["gen_wall_seconds_total"] = float(_PERF_TIMING_STATS.get("gen_wall_seconds_total", 0.0)) + max(0.0, time.perf_counter() - gen_t0)
             input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else None
             decode_ids = gen_ids
             if input_ids is not None and hasattr(input_ids, "shape") and hasattr(gen_ids, "shape"):
@@ -2469,7 +2465,7 @@ def main() -> int:
             }
 
             prefetched_raw0: Optional[str] = round0_prefetch_raw_by_idx.pop(int(idx), None)
-            if prefetched_raw0 is None and int(micro_batch_size) > 1 and (not bool(args.dry_run)):
+            if prefetched_raw0 is None and (not bool(args.dry_run)):
                 batch_entries: List[Tuple[int, str, List[Any]]] = [(int(idx), str(sample_id), [img])]
                 look_pos = int(cand_pos) + 1
                 while len(batch_entries) < int(micro_batch_size) and look_pos < len(candidates):
@@ -2504,7 +2500,7 @@ def main() -> int:
                         micro_batch_fallback_single += 1
                         continue
                     eligible_batch_entries.append(entry)
-                if len(eligible_batch_entries) > 1:
+                if len(eligible_batch_entries) >= 1:
                     try:
                         batched_raw = _vlm_generate_batch(
                             processor=processor,
@@ -3158,6 +3154,29 @@ def main() -> int:
     # Contract: Single line JSON to stderr (to keep stdout clean for harness)
     print(f"L2_RESULT_JSON={json.dumps(result_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
     if perf_enabled:
+        sum_batch_wall = float(sum(batch_wall_seconds_hist))
+        if float(gen_wall_seconds_total) > 0.0:
+            rel_err = abs(float(gen_wall_seconds_total) - sum_batch_wall) / float(gen_wall_seconds_total)
+        else:
+            rel_err = 0.0 if abs(sum_batch_wall) <= 1e-12 else float("inf")
+        print(
+            f"[06_run_agentiad_infer.py][perf] perf_check gen_total={float(gen_wall_seconds_total):.6f} "
+            f"sum_batch={sum_batch_wall:.6f} rel_err={rel_err:.6f}",
+            file=sys.stderr,
+        )
+        if len(batch_wall_seconds_hist) != len(batch_sizes_hist):
+            print("FAIL_PERF_ACCOUNTING reason=batch_hist_length_mismatch", file=sys.stderr)
+            raise SystemExit(3)
+        if int(micro_batch_size) == 1 and processed_count > 0:
+            if int(micro_batch_calls) != int(processed_count):
+                print("FAIL_PERF_ACCOUNTING reason=b1_calls_not_equal_effective_n", file=sys.stderr)
+                raise SystemExit(3)
+            if any(int(x) != 1 for x in batch_sizes_hist):
+                print("FAIL_PERF_ACCOUNTING reason=b1_batch_sizes_not_all_ones", file=sys.stderr)
+                raise SystemExit(3)
+        if rel_err > 0.02:
+            print("FAIL_PERF_ACCOUNTING", file=sys.stderr)
+            raise SystemExit(3)
         print(
             f"[06_run_agentiad_infer.py][perf] micro_batch_size={int(micro_batch_size)} "
             f"micro_batch_calls={int(micro_batch_calls)} "
