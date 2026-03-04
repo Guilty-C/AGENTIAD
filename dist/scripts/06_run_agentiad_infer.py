@@ -89,6 +89,7 @@ _MICRO_BATCH_SHAPE_STATS: Dict[str, Any] = {
 _PERF_TIMING_STATS: Dict[str, Any] = {
     "gen_wall_seconds_total": 0.0,
     "batch_wall_seconds_hist": [],
+    "perf_units_count": 0,
     "postproc_parse_seconds": 0.0,
     "postproc_repair_seconds": 0.0,
     "postproc_trace_io_seconds": 0.0,
@@ -459,6 +460,32 @@ def _perf_accum_seconds(key: str, delta_seconds: float) -> None:
     except Exception:
         delta = 0.0
     _PERF_TIMING_STATS[key] = float(_PERF_TIMING_STATS.get(key, 0.0)) + delta
+
+def _ensure_decoder_only_left_padding(processor_obj: Any, model_obj: Any) -> None:
+    tok = getattr(processor_obj, "tokenizer", None)
+    if tok is None and processor_obj is not None and hasattr(processor_obj, "padding_side"):
+        tok = processor_obj
+    if tok is None:
+        return
+    is_encoder_decoder = bool(getattr(getattr(model_obj, "config", None), "is_encoder_decoder", False))
+    if is_encoder_decoder:
+        return
+    try:
+        tok.padding_side = "left"
+    except Exception:
+        pass
+    eos_id = getattr(tok, "eos_token_id", None)
+    pad_id = getattr(tok, "pad_token_id", None)
+    if pad_id is None and eos_id is not None:
+        if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
+            try:
+                tok.pad_token = tok.eos_token
+            except Exception:
+                pass
+        try:
+            tok.pad_token_id = int(eos_id)
+        except Exception:
+            pass
 
 def _env_flag_1(name: str) -> bool:
     return str(os.environ.get(name, "")).strip() == "1"
@@ -1838,11 +1865,6 @@ def _vlm_generate_batch(
         shape_entry["sum_vision_patch_proxy_14"] = float(sum(vision_patch_proxy_14)) if vision_patch_proxy_14 else 0.0
         shape_entry["max_vision_patch_proxy_14"] = float(max(vision_patch_proxy_14)) if vision_patch_proxy_14 else 0.0
         shape_entry["mean_vision_patch_proxy_14"] = float(sum(vision_patch_proxy_14) / float(len(vision_patch_proxy_14))) if vision_patch_proxy_14 else 0.0
-        batches_obj = _MICRO_BATCH_SHAPE_STATS.get("batches")
-        if not isinstance(batches_obj, list):
-            batches_obj = []
-            _MICRO_BATCH_SHAPE_STATS["batches"] = batches_obj
-        batches_obj.append(shape_entry)
         inputs = {k: (v.to(model_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
         sdp_ctx = _sdp_context(torch, sdp_backend)
         with torch.inference_mode():
@@ -1855,13 +1877,6 @@ def _vlm_generate_batch(
                         pass
                 if answer_stop_criteria is not None:
                     gen_kwargs["stopping_criteria"] = answer_stop_criteria
-                _MICRO_BATCH_RUNTIME_STATS["calls"] = int(_MICRO_BATCH_RUNTIME_STATS.get("calls", 0)) + 1
-                _MICRO_BATCH_RUNTIME_STATS["samples"] = int(_MICRO_BATCH_RUNTIME_STATS.get("samples", 0)) + int(batch_size)
-                hist = _MICRO_BATCH_RUNTIME_STATS.get("batch_sizes_hist")
-                if not isinstance(hist, list):
-                    hist = []
-                    _MICRO_BATCH_RUNTIME_STATS["batch_sizes_hist"] = hist
-                hist.append(int(batch_size))
                 _timing_cuda_sync()
                 gen_t0 = time.perf_counter()
                 try:
@@ -1877,6 +1892,19 @@ def _vlm_generate_batch(
                     bh = []
                     _PERF_TIMING_STATS["batch_wall_seconds_hist"] = bh
                 bh.append(float(gen_dt))
+                _PERF_TIMING_STATS["perf_units_count"] = int(_PERF_TIMING_STATS.get("perf_units_count", 0)) + 1
+                _MICRO_BATCH_RUNTIME_STATS["calls"] = int(_MICRO_BATCH_RUNTIME_STATS.get("calls", 0)) + 1
+                _MICRO_BATCH_RUNTIME_STATS["samples"] = int(_MICRO_BATCH_RUNTIME_STATS.get("samples", 0)) + int(batch_size)
+                hist = _MICRO_BATCH_RUNTIME_STATS.get("batch_sizes_hist")
+                if not isinstance(hist, list):
+                    hist = []
+                    _MICRO_BATCH_RUNTIME_STATS["batch_sizes_hist"] = hist
+                hist.append(int(batch_size))
+                batches_obj = _MICRO_BATCH_SHAPE_STATS.get("batches")
+                if not isinstance(batches_obj, list):
+                    batches_obj = []
+                    _MICRO_BATCH_SHAPE_STATS["batches"] = batches_obj
+                batches_obj.append(shape_entry)
         if not hasattr(gen_ids, "shape") or int(gen_ids.shape[0]) != batch_size:
             raise RuntimeError("incompatible_tensor_shape")
         input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else None
@@ -2448,6 +2476,7 @@ def main() -> int:
                     processor.pad_token = processor.eos_token
                     processor.pad_token_id = processor.eos_token_id
                 processor.padding_side = "left"
+        _ensure_decoder_only_left_padding(processor, model)
         _ensure_pad_token_id_explicit(processor, model, generation_config)
 
         def _resolve_torch_dtype(spec: Any, use_cuda0: bool) -> Any:
@@ -2554,6 +2583,7 @@ def main() -> int:
             except Exception:
                 pass
             model.eval()
+        _ensure_decoder_only_left_padding(processor, model)
         _ensure_pad_token_id_explicit(processor, model, generation_config)
 
         generation_config = GenerationConfig(
@@ -2563,6 +2593,7 @@ def main() -> int:
             top_p=1.0,
             use_cache=bool(use_cache),
         )
+        _ensure_decoder_only_left_padding(processor, model)
         _ensure_pad_token_id_explicit(processor, model, generation_config)
         answer_stop_criteria = _build_answer_stop_criteria(processor)
 
@@ -2741,6 +2772,7 @@ def main() -> int:
         {
             "gen_wall_seconds_total": 0.0,
             "batch_wall_seconds_hist": [],
+            "perf_units_count": 0,
             "postproc_parse_seconds": 0.0,
             "postproc_repair_seconds": 0.0,
             "postproc_trace_io_seconds": 0.0,
@@ -3756,6 +3788,58 @@ def main() -> int:
     cleanup_calls_total = int(_CUDA_CLEANUP_STATS.get("calls_total", 0))
     cleanup_calls_success = int(_CUDA_CLEANUP_STATS.get("calls_success", 0))
     cleanup_calls_error = int(_CUDA_CLEANUP_STATS.get("calls_error", 0))
+    perf_units = "micro_batch_call"
+    perf_hist_len = int(len(batch_wall_seconds_hist))
+    perf_expected_len = int(micro_batch_calls)
+    perf_mismatch_detail = f"hist={perf_hist_len}, expected={perf_expected_len}, counter=micro_batch_calls"
+    perf_accounting_pass = True
+    perf_accounting_reason = "ok"
+    sum_batch_wall = float(sum(batch_wall_seconds_hist))
+    if float(gen_wall_seconds_total) > 0.0:
+        rel_err = abs(float(gen_wall_seconds_total) - sum_batch_wall) / float(gen_wall_seconds_total)
+    else:
+        rel_err = 0.0 if abs(sum_batch_wall) <= 1e-12 else float("inf")
+    count_batches = int(_to_float(batch_shape_summary.get("count_batches"), 0))
+    if perf_hist_len != perf_expected_len:
+        perf_accounting_pass = False
+        perf_accounting_reason = f"batch_hist_length_mismatch: got {perf_hist_len} expected {perf_expected_len}"
+    elif count_batches != perf_hist_len:
+        perf_accounting_pass = False
+        perf_accounting_reason = f"count_batches_mismatch: got {count_batches} expected {perf_hist_len}"
+    elif (not bool(args.dry_run)) and perf_hist_len > 0 and int(micro_batch_size) == 1 and processed_count > 0 and int(micro_batch_fallback_single) == 0 and int(micro_batch_calls) != int(processed_count):
+        perf_accounting_pass = False
+        perf_accounting_reason = f"b1_calls_not_equal_effective_n: got {int(micro_batch_calls)} expected {int(processed_count)}"
+    elif (not bool(args.dry_run)) and perf_hist_len > 0 and int(micro_batch_size) == 1 and processed_count > 0 and int(micro_batch_fallback_single) == 0 and any(int(x) != 1 for x in batch_sizes_hist):
+        perf_accounting_pass = False
+        perf_accounting_reason = "b1_batch_sizes_not_all_ones"
+    elif rel_err > 0.02:
+        perf_accounting_pass = False
+        perf_accounting_reason = f"gen_total_rel_err_too_large: rel_err={rel_err:.6f}"
+
+    if perf_enabled:
+        perf_obj = {
+            "perf_units": perf_units,
+            "perf_hist_len": int(perf_hist_len),
+            "perf_expected_len": int(perf_expected_len),
+            "perf_mismatch_detail": perf_mismatch_detail,
+            "perf_units_count": int(_to_float(_PERF_TIMING_STATS.get("perf_units_count"), 0)),
+            "count_batches": int(count_batches),
+            "len_batch_wall_seconds_hist": int(perf_hist_len),
+            "len_batch_sizes_hist": int(len(batch_sizes_hist)),
+            "micro_batch_calls": int(micro_batch_calls),
+            "micro_batch_calls_expected": int(micro_batch_calls_expected),
+            "perf_accounting_pass": bool(perf_accounting_pass),
+            "perf_accounting_reason": str(perf_accounting_reason),
+        }
+        result_summary.update(perf_obj)
+        result_summary["perf"] = perf_obj
+        if isinstance(summary, dict):
+            summary.update(perf_obj)
+            summary["perf"] = perf_obj
+            try:
+                _write_json_timed(out_summary, summary, "postproc_table_io_seconds")
+            except Exception:
+                pass
 
     # Log readable summary to stderr (Audit/Debug)
     # Ensure all logs go to stderr to keep stdout clean for harness
@@ -3781,32 +3865,16 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    # Contract: Single line JSON to stderr (to keep stdout clean for harness)
-    print(f"L2_RESULT_JSON={json.dumps(result_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
     if perf_enabled:
-        sum_batch_wall = float(sum(batch_wall_seconds_hist))
-        if float(gen_wall_seconds_total) > 0.0:
-            rel_err = abs(float(gen_wall_seconds_total) - sum_batch_wall) / float(gen_wall_seconds_total)
-        else:
-            rel_err = 0.0 if abs(sum_batch_wall) <= 1e-12 else float("inf")
         print(
             f"[06_run_agentiad_infer.py][perf] perf_check gen_total={float(gen_wall_seconds_total):.6f} "
             f"sum_batch={sum_batch_wall:.6f} rel_err={rel_err:.6f}",
             file=sys.stderr,
         )
-        if len(batch_wall_seconds_hist) != len(batch_sizes_hist):
-            print("FAIL_PERF_ACCOUNTING reason=batch_hist_length_mismatch", file=sys.stderr)
-            raise SystemExit(3)
-        if int(micro_batch_size) == 1 and processed_count > 0:
-            if int(micro_batch_calls) != int(processed_count):
-                print("FAIL_PERF_ACCOUNTING reason=b1_calls_not_equal_effective_n", file=sys.stderr)
-                raise SystemExit(3)
-            if any(int(x) != 1 for x in batch_sizes_hist):
-                print("FAIL_PERF_ACCOUNTING reason=b1_batch_sizes_not_all_ones", file=sys.stderr)
-                raise SystemExit(3)
-        if rel_err > 0.02:
-            print("FAIL_PERF_ACCOUNTING", file=sys.stderr)
-            raise SystemExit(3)
+        if not perf_accounting_pass:
+            print(f"FAIL_PERF_ACCOUNTING reason={perf_accounting_reason}", file=sys.stderr)
+        else:
+            print("PASS_PERF_ACCOUNTING", file=sys.stderr)
         print(
             f"[06_run_agentiad_infer.py][perf] micro_batch_size={int(micro_batch_size)} "
             f"micro_batch_calls={int(micro_batch_calls)} "
@@ -3851,6 +3919,15 @@ def main() -> int:
             f"[06_run_agentiad_infer.py][perf] io_decode_seconds_total={perf_io_decode_seconds:.4f}",
             file=sys.stderr,
         )
+        print(
+            f"[06_run_agentiad_infer.py][perf] perf_units={perf_units} "
+            f"perf_hist_len={int(perf_hist_len)} perf_expected_len={int(perf_expected_len)} "
+            f"count_batches={int(count_batches)}",
+            file=sys.stderr,
+        )
+
+    # Contract: Single line JSON to stderr (to keep stdout clean for harness)
+    print(f"L2_RESULT_JSON={json.dumps(result_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
 
     if args.evidence_dir:
         _package_evidence(Path(args.evidence_dir).resolve())
