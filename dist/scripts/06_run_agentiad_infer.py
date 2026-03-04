@@ -7,9 +7,11 @@ import gc
 from contextlib import nullcontext
 import hashlib
 import json
+import math
 import os
 import random
 import re
+import subprocess
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -80,6 +82,9 @@ _MICRO_BATCH_RUNTIME_STATS: Dict[str, Any] = {
     "samples": 0,
     "batch_sizes_hist": [],
 }
+_MICRO_BATCH_SHAPE_STATS: Dict[str, Any] = {
+    "batches": [],
+}
 _PERF_TIMING_STATS: Dict[str, Any] = {
     "gen_wall_seconds_total": 0.0,
     "batch_wall_seconds_hist": [],
@@ -129,6 +134,167 @@ def _merge_cfg(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
 
 def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
+
+def _to_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+def _percentile(values: Sequence[float], q: float) -> float:
+    vals = sorted(float(v) for v in values)
+    if not vals:
+        return 0.0
+    if len(vals) == 1:
+        return float(vals[0])
+    qn = max(0.0, min(100.0, float(q)))
+    pos = (qn / 100.0) * float(len(vals) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(vals[lo])
+    frac = pos - float(lo)
+    return float(vals[lo] * (1.0 - frac) + vals[hi] * frac)
+
+def _series_stats(values: Sequence[float]) -> Dict[str, float]:
+    vals = [float(v) for v in values]
+    if not vals:
+        return {"count": 0.0, "mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
+    return {
+        "count": float(len(vals)),
+        "mean": float(sum(vals) / float(len(vals))),
+        "p50": float(_percentile(vals, 50.0)),
+        "p95": float(_percentile(vals, 95.0)),
+        "max": float(max(vals)),
+    }
+
+def _extract_final_raw_output_len(trace_obj: Mapping[str, Any]) -> int:
+    turns = trace_obj.get("turns")
+    if not isinstance(turns, list) or not turns:
+        return 0
+    for turn in reversed(turns):
+        if isinstance(turn, Mapping):
+            raw = turn.get("raw_output")
+            if raw is not None:
+                return len(_safe_str(raw))
+    return 0
+
+def _trace_raw_output_len_stats(trace_root: Path) -> Dict[str, Any]:
+    lengths: List[float] = []
+    trace_files = sorted(trace_root.glob("train_*/trace.json"))
+    for p in trace_files:
+        try:
+            tr = json.loads(_read_text(p))
+        except Exception:
+            continue
+        if isinstance(tr, Mapping):
+            lengths.append(float(_extract_final_raw_output_len(tr)))
+    stats = _series_stats(lengths)
+    return {
+        "trace_root": str(trace_root),
+        "trace_count": int(len(lengths)),
+        "raw_output_len": stats,
+    }
+
+def _print_trace_compare_stdout(a_label: str, a_stats: Mapping[str, Any], b_label: str, b_stats: Mapping[str, Any]) -> None:
+    a = a_stats.get("raw_output_len", {}) if isinstance(a_stats, Mapping) else {}
+    b = b_stats.get("raw_output_len", {}) if isinstance(b_stats, Mapping) else {}
+    print("[trace_compare] final raw_output length")
+    print(f"{a_label}: mean={_to_float(a.get('mean')):.2f} p50={_to_float(a.get('p50')):.2f} p95={_to_float(a.get('p95')):.2f} max={_to_float(a.get('max')):.2f}")
+    print(f"{b_label}: mean={_to_float(b.get('mean')):.2f} p50={_to_float(b.get('p50')):.2f} p95={_to_float(b.get('p95')):.2f} max={_to_float(b.get('max')):.2f}")
+    mean_delta = _to_float(b.get("mean")) - _to_float(a.get("mean"))
+    p50_delta = _to_float(b.get("p50")) - _to_float(a.get("p50"))
+    print(f"delta({b_label}-{a_label}): mean={mean_delta:.2f} p50={p50_delta:.2f}")
+
+def _micro_batch_shape_summary(shape_batches: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not shape_batches:
+        return {
+            "count_batches": 0,
+            "avg_padding_ratio": 1.0,
+            "max_padding_ratio": 1.0,
+            "min_padding_ratio": 1.0,
+            "avg_batch_size": 0.0,
+            "max_input_len_seen": 0.0,
+            "mean_input_len_seen": 0.0,
+            "avg_vision_patch_proxy": 0.0,
+            "avg_vision_pixels": 0.0,
+            "extreme_single_sample_drag": False,
+            "extreme_drag_examples": [],
+        }
+    padding_ratios = [_to_float(b.get("padding_ratio"), 1.0) for b in shape_batches]
+    batch_sizes = [_to_float(b.get("batch_size")) for b in shape_batches]
+    max_input_lens = [_to_float(b.get("max_input_len")) for b in shape_batches]
+    mean_input_lens = [_to_float(b.get("mean_input_len")) for b in shape_batches]
+    mean_vision_patch = [_to_float(b.get("mean_vision_patch_proxy_14")) for b in shape_batches]
+    mean_vision_pixels = [_to_float(b.get("mean_vision_pixels")) for b in shape_batches]
+    drag_examples: List[Dict[str, Any]] = []
+    for i, b in enumerate(shape_batches):
+        max_len = _to_float(b.get("max_input_len"))
+        mean_len = _to_float(b.get("mean_input_len"))
+        max_patch = _to_float(b.get("max_vision_patch_proxy_14"))
+        mean_patch = _to_float(b.get("mean_vision_patch_proxy_14"))
+        pad_ratio = _to_float(b.get("padding_ratio"), 1.0)
+        len_ratio = (max_len / mean_len) if mean_len > 0 else 1.0
+        patch_ratio = (max_patch / mean_patch) if mean_patch > 0 else 1.0
+        if (len_ratio >= 1.3 or patch_ratio >= 1.3) and pad_ratio <= 0.85:
+            drag_examples.append(
+                {
+                    "batch_index": int(i),
+                    "batch_size": int(_to_float(b.get("batch_size"), 0.0)),
+                    "padding_ratio": float(pad_ratio),
+                    "max_input_len": float(max_len),
+                    "mean_input_len": float(mean_len),
+                    "max_vision_patch_proxy_14": float(max_patch),
+                    "mean_vision_patch_proxy_14": float(mean_patch),
+                    "length_ratio_max_over_mean": float(len_ratio),
+                    "vision_patch_ratio_max_over_mean": float(patch_ratio),
+                }
+            )
+    return {
+        "count_batches": int(len(shape_batches)),
+        "avg_padding_ratio": float(sum(padding_ratios) / float(len(padding_ratios))),
+        "max_padding_ratio": float(max(padding_ratios)),
+        "min_padding_ratio": float(min(padding_ratios)),
+        "avg_batch_size": float(sum(batch_sizes) / float(len(batch_sizes))),
+        "max_input_len_seen": float(max(max_input_lens)),
+        "mean_input_len_seen": float(sum(mean_input_lens) / float(len(mean_input_lens))),
+        "avg_vision_patch_proxy": float(sum(mean_vision_patch) / float(len(mean_vision_patch))),
+        "avg_vision_pixels": float(sum(mean_vision_pixels) / float(len(mean_vision_pixels))),
+        "extreme_single_sample_drag": bool(len(drag_examples) > 0),
+        "extreme_drag_examples": drag_examples[:10],
+    }
+
+def _print_padding_shape_summary_stdout(summary: Mapping[str, Any]) -> None:
+    print(
+        "[batch_shape] "
+        f"batches={int(_to_float(summary.get('count_batches'), 0))} "
+        f"avg_padding_ratio={_to_float(summary.get('avg_padding_ratio')):.4f} "
+        f"max_padding_ratio={_to_float(summary.get('max_padding_ratio')):.4f} "
+        f"max_input_len={_to_float(summary.get('max_input_len_seen')):.1f} "
+        f"mean_input_len={_to_float(summary.get('mean_input_len_seen')):.1f} "
+        f"avg_vision_patch_proxy={_to_float(summary.get('avg_vision_patch_proxy')):.1f} "
+        f"extreme_single_sample_drag={str(bool(summary.get('extreme_single_sample_drag', False))).lower()}"
+    )
+
+def _print_microbench_table_stdout(rows: Sequence[Mapping[str, Any]]) -> None:
+    if not rows:
+        return
+    baseline = None
+    for r in rows:
+        if int(_to_float(r.get("micro_batch_size"), 0)) == 1:
+            baseline = r
+            break
+    base_avg = _to_float((baseline or {}).get("avg_sec_per_sample"), 0.0)
+    print("B\tavg_sec_per_sample\tgen_wall_seconds_total\ttotal_wall_seconds\tavg_padding_ratio\tspeedup_vs_B1\tslowdown_vs_B1")
+    for r in rows:
+        b = int(_to_float(r.get("micro_batch_size"), 0))
+        avg = _to_float(r.get("avg_sec_per_sample"), 0.0)
+        gen = _to_float(r.get("gen_wall_seconds_total"), 0.0)
+        total = _to_float(r.get("total_wall_seconds"), 0.0)
+        pad = _to_float(r.get("avg_padding_ratio"), 1.0)
+        speedup = (base_avg / avg) if base_avg > 0 and avg > 0 else 0.0
+        slowdown = (avg / base_avg) if base_avg > 0 and avg > 0 else 0.0
+        print(f"{b}\t{avg:.6f}\t{gen:.6f}\t{total:.6f}\t{pad:.4f}\t{speedup:.4f}\t{slowdown:.4f}")
 
 def _timing_cuda_sync() -> None:
     try:
@@ -1386,6 +1552,7 @@ def _vlm_generate_batch(
     answer_stop_criteria: Any = None,
 ) -> List[str]:
     global _LAST_VLM_EXCEPTIONS
+    global _MICRO_BATCH_SHAPE_STATS
     _LAST_VLM_EXCEPTIONS = []
     if model is None:
         fallback = '<answer>{"anomaly_present": false, "top_anomaly": "none", "visual_descriptions": []}</answer>'
@@ -1415,9 +1582,9 @@ def _vlm_generate_batch(
     gen_ids = None
     decode_ids = None
     input_ids = None
+    text_batch: List[str] = []
     try:
         if hasattr(processor, "apply_chat_template") and getattr(processor, "chat_template", None):
-            text_batch: List[str] = []
             for local_imgs in local_batch:
                 cache_key = _chat_template_key(processor, len(local_imgs), prompt)
                 text = _CHAT_TEXT_CACHE.get(cache_key, "")
@@ -1442,14 +1609,91 @@ def _vlm_generate_batch(
                 raise RuntimeError(f"processor_stacking_failure: {type(e).__name__}: {e}") from e
         else:
             try:
+                text_batch = [prompt for _ in range(batch_size)]
                 inputs = processor(
                     images=[imgs[0] for imgs in local_batch],
-                    text=[prompt for _ in range(batch_size)],
+                    text=text_batch,
                     padding=True,
                     return_tensors="pt",
                 )
             except Exception as e:
                 raise RuntimeError(f"processor_stacking_failure: {type(e).__name__}: {e}") from e
+        shape_entry: Dict[str, Any] = {"batch_size": int(batch_size)}
+        text_lens_tokens: List[float] = []
+        try:
+            tok = getattr(processor, "tokenizer", None)
+            if tok is None and hasattr(processor, "encode"):
+                tok = processor
+            if text_batch and tok is not None and hasattr(tok, "__call__"):
+                tok_out = tok(text_batch, add_special_tokens=False, padding=False, truncation=False)
+                ids_obj = tok_out.get("input_ids") if isinstance(tok_out, dict) else None
+                if isinstance(ids_obj, list):
+                    for ids in ids_obj:
+                        if isinstance(ids, list):
+                            text_lens_tokens.append(float(len(ids)))
+            elif prompt:
+                tok = getattr(processor, "tokenizer", None)
+                if tok is None and hasattr(processor, "__call__"):
+                    tok = processor
+                if tok is not None and hasattr(tok, "__call__"):
+                    one = tok([prompt], add_special_tokens=False, padding=False, truncation=False)
+                    one_ids = one.get("input_ids") if isinstance(one, dict) else None
+                    if isinstance(one_ids, list) and one_ids and isinstance(one_ids[0], list):
+                        plen = float(len(one_ids[0]))
+                        text_lens_tokens = [plen for _ in range(batch_size)]
+        except Exception:
+            text_lens_tokens = []
+        if (not text_lens_tokens) and text_batch:
+            text_lens_tokens = [float(max(1, len(_safe_str(t).split()))) for t in text_batch]
+        shape_entry["max_text_len"] = float(max(text_lens_tokens)) if text_lens_tokens else 0.0
+        shape_entry["mean_text_len"] = float(sum(text_lens_tokens) / float(len(text_lens_tokens))) if text_lens_tokens else 0.0
+        shape_entry["sum_text_len"] = float(sum(text_lens_tokens)) if text_lens_tokens else 0.0
+        input_lens: List[float] = []
+        try:
+            attention_mask = inputs.get("attention_mask") if isinstance(inputs, dict) else None
+            if attention_mask is not None and hasattr(attention_mask, "sum") and hasattr(attention_mask, "shape"):
+                lens = attention_mask.sum(dim=1).detach().cpu().tolist()
+                input_lens = [float(x) for x in lens]
+            else:
+                input_ids_obj = inputs.get("input_ids") if isinstance(inputs, dict) else None
+                if input_ids_obj is not None and hasattr(input_ids_obj, "shape") and len(input_ids_obj.shape) >= 2:
+                    seq_len = float(int(input_ids_obj.shape[1]))
+                    input_lens = [seq_len for _ in range(batch_size)]
+        except Exception:
+            input_lens = []
+        if (not input_lens) and text_lens_tokens:
+            input_lens = list(text_lens_tokens)
+        max_input_len = float(max(input_lens)) if input_lens else 0.0
+        sum_input_len = float(sum(input_lens)) if input_lens else 0.0
+        mean_input_len = (sum_input_len / float(len(input_lens))) if input_lens else 0.0
+        denom = float(batch_size) * max_input_len
+        shape_entry["max_input_len"] = float(max_input_len)
+        shape_entry["mean_input_len"] = float(mean_input_len)
+        shape_entry["sum_input_len"] = float(sum_input_len)
+        shape_entry["padding_ratio"] = float(sum_input_len / denom) if denom > 0 else 1.0
+        vision_pixels: List[float] = []
+        vision_patch_proxy_14: List[float] = []
+        for local_imgs in local_batch:
+            if not local_imgs:
+                continue
+            im0 = local_imgs[0]
+            sz = getattr(im0, "size", None)
+            if isinstance(sz, tuple) and len(sz) == 2:
+                w = max(1, int(sz[0]))
+                h = max(1, int(sz[1]))
+                vision_pixels.append(float(w * h))
+                vision_patch_proxy_14.append(float(math.ceil(float(w) / 14.0) * math.ceil(float(h) / 14.0)))
+        shape_entry["sum_vision_pixels"] = float(sum(vision_pixels)) if vision_pixels else 0.0
+        shape_entry["max_vision_pixels"] = float(max(vision_pixels)) if vision_pixels else 0.0
+        shape_entry["mean_vision_pixels"] = float(sum(vision_pixels) / float(len(vision_pixels))) if vision_pixels else 0.0
+        shape_entry["sum_vision_patch_proxy_14"] = float(sum(vision_patch_proxy_14)) if vision_patch_proxy_14 else 0.0
+        shape_entry["max_vision_patch_proxy_14"] = float(max(vision_patch_proxy_14)) if vision_patch_proxy_14 else 0.0
+        shape_entry["mean_vision_patch_proxy_14"] = float(sum(vision_patch_proxy_14) / float(len(vision_patch_proxy_14))) if vision_patch_proxy_14 else 0.0
+        batches_obj = _MICRO_BATCH_SHAPE_STATS.get("batches")
+        if not isinstance(batches_obj, list):
+            batches_obj = []
+            _MICRO_BATCH_SHAPE_STATS["batches"] = batches_obj
+        batches_obj.append(shape_entry)
         inputs = {k: (v.to(model_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
         sdp_ctx = _sdp_context(torch, sdp_backend)
         with torch.inference_mode():
@@ -1620,6 +1864,7 @@ def main() -> int:
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--evidence_dir", type=str, default=None)
     parser.add_argument("--id_list", type=str, default=None, help="Path to a text file with allowed sample_ids (one per line)")
+    parser.add_argument("--id_list_inline", type=str, default=None, help="Comma-separated sample_ids; alternative to --id_list")
     parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter to load")
     parser.add_argument("--local_files_only", type=str, default=None, help="Force local files only (true/false/1/0)")
     parser.add_argument("--allow_full_dataset", action="store_true", help="Allow full dataset traversal")
@@ -1631,7 +1876,122 @@ def main() -> int:
     parser.add_argument("--sdp-backend", type=str, default="auto", dest="sdp_backend", help="SDP backend policy: auto, math, flash, mem_efficient")
     parser.add_argument("--vlm-retry-n", type=int, default=2, dest="vlm_retry_n", help="VLM retries after first attempt (0 means no retry)")
     parser.add_argument("--vlm-repair-n", type=int, default=None, dest="vlm_repair_n", help="Schema-repair retries after invalid VLM output (default: --vlm-retry-n)")
+    parser.add_argument("--trace_compare_a", type=str, default=None, help="Trace run name A under outputs/traces/<RUN>")
+    parser.add_argument("--trace_compare_b", type=str, default=None, help="Trace run name B under outputs/traces/<RUN>")
+    parser.add_argument("--trace_compare_root", type=str, default=None, help="Trace root dir (default: outputs/traces)")
+    parser.add_argument("--microbench_b_sizes", type=str, default=None, help="Comma-separated micro batch sizes, e.g. 1,2,4")
+    parser.add_argument("--microbench_run_prefix", type=str, default=None, help="Run name prefix for microbench child runs")
+    parser.add_argument("--microbench_id_source_run", type=str, default=None, help="Build inline id list from outputs/traces/<RUN>")
     args = parser.parse_args()
+
+    if args.trace_compare_a and args.trace_compare_b:
+        trace_root = Path(args.trace_compare_root).resolve() if args.trace_compare_root else (project_root / "outputs" / "traces")
+        a_root = trace_root / str(args.trace_compare_a)
+        b_root = trace_root / str(args.trace_compare_b)
+        a_stats = _trace_raw_output_len_stats(a_root)
+        b_stats = _trace_raw_output_len_stats(b_root)
+        _print_trace_compare_stdout(str(args.trace_compare_a), a_stats, str(args.trace_compare_b), b_stats)
+        compare_obj = {
+            "trace_compare": {
+                "a": str(args.trace_compare_a),
+                "b": str(args.trace_compare_b),
+                "a_stats": a_stats,
+                "b_stats": b_stats,
+            }
+        }
+        print(json.dumps(compare_obj, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.microbench_b_sizes:
+        raw_sizes = [x.strip() for x in str(args.microbench_b_sizes).split(",") if x.strip()]
+        b_sizes = sorted({max(1, int(x)) for x in raw_sizes})
+        if not b_sizes:
+            print("Invalid --microbench_b_sizes", file=sys.stderr)
+            return 2
+        id_list_inline = str(args.id_list_inline).strip() if args.id_list_inline else ""
+        if not id_list_inline and not args.id_list and args.microbench_id_source_run:
+            src_root = project_root / "outputs" / "traces" / str(args.microbench_id_source_run)
+            if src_root.exists():
+                ids = sorted(p.name for p in src_root.iterdir() if p.is_dir() and p.name.startswith("train_"))
+                id_list_inline = ",".join(ids)
+        run_prefix = str(args.microbench_run_prefix).strip() if args.microbench_run_prefix else "MICROBENCH"
+        rows: List[Dict[str, Any]] = []
+        for b in b_sizes:
+            run_name = f"{run_prefix}_B{int(b)}"
+            cmd = [sys.executable, str(Path(__file__).resolve()), "--config", str(args.config), "--micro_batch_size", str(int(b)), "--run_name", run_name, "--perf", "true", "--progress", "false"]
+            if args.seed is not None:
+                cmd += ["--seed", str(int(args.seed))]
+            if args.split is not None:
+                cmd += ["--split", str(args.split)]
+            if args.max_samples is not None:
+                cmd += ["--max_samples", str(int(args.max_samples))]
+            if args.max_new_tokens is not None:
+                cmd += ["--max_new_tokens", str(int(args.max_new_tokens))]
+            if args.enable_tools is not None:
+                cmd += ["--enable_tools", str(args.enable_tools)]
+            if args.local_files_only is not None:
+                cmd += ["--local_files_only", str(args.local_files_only)]
+            if args.use_cache is not None:
+                cmd += ["--use_cache", str(args.use_cache)]
+            if args.cleanup_every_n is not None:
+                cmd += ["--cleanup_every_n", str(int(args.cleanup_every_n))]
+            if args.vlm_max_side is not None:
+                cmd += ["--vlm-max-side", str(int(args.vlm_max_side))]
+            if args.sdp_backend is not None:
+                cmd += ["--sdp-backend", str(args.sdp_backend)]
+            if args.vlm_retry_n is not None:
+                cmd += ["--vlm-retry-n", str(int(args.vlm_retry_n))]
+            if args.vlm_repair_n is not None:
+                cmd += ["--vlm-repair-n", str(int(args.vlm_repair_n))]
+            if args.adapter_path:
+                cmd += ["--adapter_path", str(args.adapter_path)]
+            if args.allow_full_dataset:
+                cmd += ["--allow_full_dataset"]
+            if id_list_inline:
+                cmd += ["--id_list_inline", id_list_inline]
+            elif args.id_list:
+                cmd += ["--id_list", str(args.id_list)]
+            if args.dry_run:
+                cmd += ["--dry_run"]
+            child = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            if child.returncode != 0:
+                if child.stdout:
+                    print(child.stdout, file=sys.stdout)
+                if child.stderr:
+                    print(child.stderr, file=sys.stderr)
+                return int(child.returncode)
+            parsed_result = None
+            for line in reversed(child.stderr.splitlines()):
+                if line.startswith("L2_RESULT_JSON="):
+                    payload = line.split("=", 1)[1]
+                    try:
+                        parsed_result = json.loads(payload)
+                    except Exception:
+                        parsed_result = None
+                    break
+            if not isinstance(parsed_result, dict):
+                print("Failed to parse child L2_RESULT_JSON", file=sys.stderr)
+                return 3
+            processed_n = int(parsed_result.get("n_success", parsed_result.get("effective_n", 0)) or 0)
+            total_wall_seconds = _to_float(parsed_result.get("total_wall_seconds"), 0.0)
+            avg_sec_per_sample = (total_wall_seconds / float(processed_n)) if processed_n > 0 else 0.0
+            avg_padding_ratio = 1.0
+            shape_summary = parsed_result.get("batch_shape_summary")
+            if isinstance(shape_summary, Mapping):
+                avg_padding_ratio = _to_float(shape_summary.get("avg_padding_ratio"), 1.0)
+            row = {
+                "micro_batch_size": int(b),
+                "run_name": run_name,
+                "n_success": int(processed_n),
+                "avg_sec_per_sample": float(avg_sec_per_sample),
+                "gen_wall_seconds_total": _to_float(parsed_result.get("gen_wall_seconds_total"), 0.0),
+                "total_wall_seconds": float(total_wall_seconds),
+                "avg_padding_ratio": float(avg_padding_ratio),
+            }
+            rows.append(row)
+        _print_microbench_table_stdout(rows)
+        print(json.dumps({"microbench_rows": rows}, ensure_ascii=False, sort_keys=True))
+        return 0
 
     from agentiad_repro.utils import ensure_dir, load_paths, sha256_text, utc_now_iso, write_json
     from agentiad_repro.tools.cr import query_image
@@ -2180,7 +2540,7 @@ def main() -> int:
     rows: List[Dict[str, Any]] = []
     attempts = 0
     max_attempts = max_samples * 80
-    if args.id_list:
+    if args.id_list or (args.id_list_inline and str(args.id_list_inline).strip()):
         max_attempts = n_total + 1000
 
     cr_rule = "strict_contract_uncertainty"
@@ -2211,6 +2571,7 @@ def main() -> int:
     _VLM_RUNTIME_STATS.update({"generate_calls": 0, "generated_tokens_total": 0, "retry_exceptions": 0})
     _CUDA_CLEANUP_STATS.update({"calls_total": 0, "calls_error": 0, "calls_success": 0})
     _MICRO_BATCH_RUNTIME_STATS.update({"calls": 0, "samples": 0, "batch_sizes_hist": []})
+    _MICRO_BATCH_SHAPE_STATS.update({"batches": []})
     _PERF_TIMING_STATS.update(
         {
             "gen_wall_seconds_total": 0.0,
@@ -2380,6 +2741,14 @@ def main() -> int:
                 print(f"Loaded {len(id_list_set)} allowed sample_ids from {args.id_list}", file=sys.stderr)
         except Exception as e:
             print(f"Error loading id_list: {e}", file=sys.stderr)
+    if args.id_list_inline and str(args.id_list_inline).strip():
+        inline_items = [x.strip() for x in str(args.id_list_inline).split(",") if x.strip()]
+        inline_set = set(inline_items)
+        if id_list_set is None:
+            id_list_set = inline_set
+        else:
+            id_list_set = id_list_set.intersection(inline_set)
+        print(f"Loaded {len(inline_set)} allowed sample_ids from --id_list_inline", file=sys.stderr)
 
     # Audit Counters
     n_requested_ids = len(id_list_set) if id_list_set is not None else n_total
@@ -3013,6 +3382,10 @@ def main() -> int:
         batch_wall_hist_obj = _PERF_TIMING_STATS.get("batch_wall_seconds_hist", [])
         batch_wall_seconds_hist = [float(x) for x in batch_wall_hist_obj] if isinstance(batch_wall_hist_obj, list) else []
         gen_wall_seconds_total = float(_PERF_TIMING_STATS.get("gen_wall_seconds_total", 0.0))
+        shape_batches_obj = _MICRO_BATCH_SHAPE_STATS.get("batches", [])
+        shape_batches = [x for x in shape_batches_obj if isinstance(x, Mapping)] if isinstance(shape_batches_obj, list) else []
+        batch_shape_summary = _micro_batch_shape_summary(shape_batches)
+        _print_padding_shape_summary_stdout(batch_shape_summary)
 
         summary = {
             "timestamp_utc": utc_now_iso(),
@@ -3054,6 +3427,8 @@ def main() -> int:
             "batch_sizes_hist": list(batch_sizes_hist),
             "batch_wall_seconds_hist": list(batch_wall_seconds_hist),
             "gen_wall_seconds_total": float(gen_wall_seconds_total),
+            "batch_shape_stats": shape_batches,
+            "batch_shape_summary": batch_shape_summary,
             "micro_batch_calls_expected": int(micro_batch_calls_expected),
             "out_csv": str(out_csv),
             "trace_dir": str(trace_root),
@@ -3087,6 +3462,7 @@ def main() -> int:
         trace_files = list(trace_root.rglob("trace.json")) if trace_root.exists() else []
         summary["trace_count"] = int(len(trace_files))
         summary["trace_emitted"] = bool(len(trace_files) > 0)
+        summary["trace_raw_output_len_stats"] = _trace_raw_output_len_stats(trace_root)
         table_hash_t0 = time.perf_counter()
         csv_sha = hashlib.sha256(out_csv.read_bytes()).hexdigest().upper() if out_csv.exists() else None
         _perf_accum_seconds("postproc_table_io_seconds", time.perf_counter() - table_hash_t0)
@@ -3116,6 +3492,9 @@ def main() -> int:
     batch_sizes_hist = [int(x) for x in hist_obj] if isinstance(hist_obj, list) else []
     batch_wall_hist_obj = _PERF_TIMING_STATS.get("batch_wall_seconds_hist", [])
     batch_wall_seconds_hist = [float(x) for x in batch_wall_hist_obj] if isinstance(batch_wall_hist_obj, list) else []
+    shape_batches_obj = _MICRO_BATCH_SHAPE_STATS.get("batches", [])
+    shape_batches = [x for x in shape_batches_obj if isinstance(x, Mapping)] if isinstance(shape_batches_obj, list) else []
+    batch_shape_summary = _micro_batch_shape_summary(shape_batches)
     gen_wall_seconds_total = float(_PERF_TIMING_STATS.get("gen_wall_seconds_total", 0.0))
     postproc_parse_seconds = float(_PERF_TIMING_STATS.get("postproc_parse_seconds", 0.0))
     postproc_repair_seconds = float(_PERF_TIMING_STATS.get("postproc_repair_seconds", 0.0))
@@ -3135,6 +3514,7 @@ def main() -> int:
         "out_csv": str(out_csv),
         "out_summary": str(out_summary),
         "trace_root": str(trace_root),
+        "trace_raw_output_len_stats": _trace_raw_output_len_stats(trace_root),
         "csv_sha256": csv_sha,
         "first_sample_id": first_sample_id if rows else None,
         "first_trace_fingerprint_hash": first_hash if rows else None,
@@ -3158,7 +3538,10 @@ def main() -> int:
         "micro_batch_fallback_single": int(micro_batch_fallback_single),
         "batch_sizes_hist": list(batch_sizes_hist),
         "batch_wall_seconds_hist": list(batch_wall_seconds_hist),
+        "batch_shape_stats": shape_batches,
+        "batch_shape_summary": batch_shape_summary,
         "gen_wall_seconds_total": float(gen_wall_seconds_total),
+        "total_wall_seconds": float(total_wall_seconds),
         "postproc_wall_seconds_total": float(postproc_wall_seconds_total),
         "postproc_parse_seconds": float(postproc_parse_seconds),
         "postproc_repair_seconds": float(postproc_repair_seconds),
@@ -3183,9 +3566,13 @@ def main() -> int:
     }
     if isinstance(summary, dict):
         summary["gen_wall_seconds_total"] = float(gen_wall_seconds_total)
+        summary["total_wall_seconds"] = float(total_wall_seconds)
+        summary["avg_sec_per_sample"] = (float(total_wall_seconds) / float(processed_count)) if processed_count else 0.0
         summary["postproc_wall_seconds_total"] = float(postproc_wall_seconds_total)
         summary["batch_wall_seconds_hist"] = list(batch_wall_seconds_hist)
         summary["batch_sizes_hist"] = list(batch_sizes_hist)
+        summary["batch_shape_stats"] = shape_batches
+        summary["batch_shape_summary"] = batch_shape_summary
         summary["postproc_parse_seconds"] = float(postproc_parse_seconds)
         summary["postproc_repair_seconds"] = float(postproc_repair_seconds)
         summary["postproc_trace_io_seconds"] = float(postproc_trace_io_seconds)
@@ -3197,6 +3584,7 @@ def main() -> int:
     postproc_table_io_seconds = float(_PERF_TIMING_STATS.get("postproc_table_io_seconds", postproc_table_io_seconds))
     result_summary["postproc_table_io_seconds"] = float(postproc_table_io_seconds)
     avg_sec_per_sample = (total_wall_seconds / float(processed_count)) if processed_count else 0.0
+    result_summary["avg_sec_per_sample"] = float(avg_sec_per_sample)
     generated_tokens_total = int(_VLM_RUNTIME_STATS.get("generated_tokens_total", 0))
     avg_gen_tokens_per_sample = (float(generated_tokens_total) / float(processed_count)) if processed_count else 0.0
     retry_exceptions = int(_VLM_RUNTIME_STATS.get("retry_exceptions", 0))
