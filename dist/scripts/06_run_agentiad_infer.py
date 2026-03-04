@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import hashlib
 import json
 import math
+import glob
 import os
 import random
 import re
@@ -295,6 +296,154 @@ def _print_microbench_table_stdout(rows: Sequence[Mapping[str, Any]]) -> None:
         speedup = (base_avg / avg) if base_avg > 0 and avg > 0 else 0.0
         slowdown = (avg / base_avg) if base_avg > 0 and avg > 0 else 0.0
         print(f"{b}\t{avg:.6f}\t{gen:.6f}\t{total:.6f}\t{pad:.4f}\t{speedup:.4f}\t{slowdown:.4f}")
+
+def _perf_emit_table_line(line: str) -> None:
+    print(line)
+    print(line, file=sys.stderr)
+
+def _infer_batch_size_from_name(path: Path) -> int:
+    m = re.search(r"(?:^|[^A-Z0-9])B(\d+)(?:[^0-9]|$)", path.name.upper())
+    if not m:
+        return 0
+    try:
+        return max(0, int(m.group(1)))
+    except Exception:
+        return 0
+
+def _discover_perf_summary_files(
+    summarize_glob: Optional[str],
+    summarize_dir: Optional[str],
+    summarize_prefix: Optional[str],
+) -> List[Path]:
+    if summarize_glob:
+        paths = [Path(p).resolve() for p in glob.glob(str(summarize_glob))]
+        return sorted([p for p in paths if p.is_file()])
+    if summarize_dir and summarize_prefix:
+        root = Path(summarize_dir).resolve()
+        if not root.exists():
+            return []
+        cands = list(root.glob(f"{summarize_prefix}*.json"))
+        return sorted([p for p in cands if p.is_file()])
+    return []
+
+def _perf_summarize_json_files(
+    summarize_glob: Optional[str],
+    summarize_dir: Optional[str],
+    summarize_prefix: Optional[str],
+) -> int:
+    files = _discover_perf_summary_files(summarize_glob, summarize_dir, summarize_prefix)
+    if not files:
+        print("[perf_summarize] no summary json files matched", file=sys.stderr)
+        return 2
+    rows: List[Dict[str, Any]] = []
+    for p in files:
+        try:
+            obj = json.loads(_read_text(p))
+        except Exception as e:
+            print(f"[perf_summarize] skip invalid json: {p} ({type(e).__name__})", file=sys.stderr)
+            continue
+        if not isinstance(obj, Mapping):
+            print(f"[perf_summarize] skip non-object json: {p}", file=sys.stderr)
+            continue
+        b = int(_to_float(obj.get("micro_batch_size"), 0))
+        if b <= 0:
+            b = _infer_batch_size_from_name(p)
+        rows.append(
+            {
+                "path": str(p),
+                "micro_batch_size": int(b),
+                "avg_sec_per_sample": float(_to_float(obj.get("avg_sec_per_sample"), 0.0)),
+                "total_wall_seconds": float(_to_float(obj.get("total_wall_seconds"), 0.0)),
+                "gen_wall_seconds_total": float(_to_float(obj.get("gen_wall_seconds_total"), 0.0)),
+                "postproc_wall_seconds_total": float(_to_float(obj.get("postproc_wall_seconds_total"), 0.0)),
+                "micro_batch_fallback_single": int(_to_float(obj.get("micro_batch_fallback_single"), 0.0)),
+                "csv_sha256": _safe_str(obj.get("csv_sha256")).strip(),
+                "config_hash": _safe_str(obj.get("config_hash")).strip(),
+                "prompt_hash": _safe_str(obj.get("prompt_hash")).strip(),
+            }
+        )
+    if not rows:
+        print("[perf_summarize] no valid summary rows extracted", file=sys.stderr)
+        return 2
+
+    rows = sorted(rows, key=lambda r: (float(_to_float(r.get("avg_sec_per_sample"), 0.0)), int(_to_float(r.get("micro_batch_size"), 0))))
+    b1_rows = [r for r in rows if int(_to_float(r.get("micro_batch_size"), 0)) == 1 and _to_float(r.get("avg_sec_per_sample"), 0.0) > 0.0]
+    b1_row = min(b1_rows, key=lambda r: float(_to_float(r.get("avg_sec_per_sample"), 0.0))) if b1_rows else None
+    b1_avg = _to_float((b1_row or {}).get("avg_sec_per_sample"), 0.0)
+
+    distinct_sha = sorted({str(r.get("csv_sha256", "")).strip() for r in rows if str(r.get("csv_sha256", "")).strip()})
+    sha_consistent = len(distinct_sha) <= 1
+    warning_line = ""
+    if not sha_consistent:
+        warning_line = (
+            "WARNING: csv_sha256 mismatch across batch runs; 输出不等价，不可直接用吞吐对比下结论"
+        )
+
+    header = (
+        "B\tavg_sec_per_sample\tspeedup_vs_B1\ttotal_wall_seconds\tgen_wall_seconds_total\t"
+        "postproc_wall_seconds_total\tmicro_batch_fallback_single\tcsv_sha256\tconfig_hash\tprompt_hash\tfile"
+    )
+    _perf_emit_table_line(header)
+    for r in rows:
+        b = int(_to_float(r.get("micro_batch_size"), 0))
+        avg = _to_float(r.get("avg_sec_per_sample"), 0.0)
+        speedup_s = "-"
+        if b1_avg > 0.0 and avg > 0.0:
+            speedup_s = f"{(b1_avg / avg):.4f}"
+            r["speedup_vs_B1"] = float(b1_avg / avg)
+        else:
+            r["speedup_vs_B1"] = None
+        _perf_emit_table_line(
+            f"{b}\t{avg:.6f}\t{speedup_s}\t"
+            f"{_to_float(r.get('total_wall_seconds')):.6f}\t{_to_float(r.get('gen_wall_seconds_total')):.6f}\t"
+            f"{_to_float(r.get('postproc_wall_seconds_total')):.6f}\t{int(_to_float(r.get('micro_batch_fallback_single'), 0))}\t"
+            f"{_safe_str(r.get('csv_sha256'))}\t{_safe_str(r.get('config_hash'))}\t{_safe_str(r.get('prompt_hash'))}\t"
+            f"{Path(str(r.get('path'))).name}"
+        )
+
+    if warning_line:
+        _perf_emit_table_line(warning_line)
+
+    candidates = [r for r in rows if int(_to_float(r.get("micro_batch_fallback_single"), 0)) == 0]
+    recommended = None
+    if candidates:
+        recommended = min(
+            candidates,
+            key=lambda r: (
+                float(_to_float(r.get("avg_sec_per_sample"), 0.0)),
+                int(_to_float(r.get("micro_batch_size"), 0)),
+            ),
+        )
+    _perf_emit_table_line(
+        "recommendation_rule: choose min avg_sec_per_sample among rows with micro_batch_fallback_single==0; "
+        "if tie, choose smaller micro_batch_size"
+    )
+    if recommended is not None:
+        _perf_emit_table_line(
+            "recommended_micro_batch_size="
+            f"{int(_to_float(recommended.get('micro_batch_size'), 0))} "
+            f"(avg_sec_per_sample={_to_float(recommended.get('avg_sec_per_sample')):.6f}, "
+            f"micro_batch_fallback_single={int(_to_float(recommended.get('micro_batch_fallback_single'), 0))})"
+        )
+    else:
+        _perf_emit_table_line("recommended_micro_batch_size=none (no candidate with micro_batch_fallback_single==0)")
+
+    result = {
+        "perf_summarize_rows": rows,
+        "matched_files_count": int(len(files)),
+        "valid_rows_count": int(len(rows)),
+        "b1_avg_sec_per_sample": float(b1_avg) if b1_avg > 0.0 else None,
+        "csv_sha256_consistent": bool(sha_consistent),
+        "csv_sha256_values": distinct_sha,
+        "recommendation_rule": (
+            "choose min avg_sec_per_sample among rows with micro_batch_fallback_single==0; "
+            "if tie, choose smaller micro_batch_size"
+        ),
+        "recommended_micro_batch_size": (int(_to_float(recommended.get("micro_batch_size"), 0)) if recommended is not None else None),
+    }
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    print(f"L2_RESULT_JSON={json.dumps(result, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
+    return 0
 
 def _timing_cuda_sync() -> None:
     try:
@@ -1848,7 +1997,7 @@ def main() -> int:
     project_root = REPO_ROOT
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Config path")
+    parser.add_argument("--config", type=str, required=False, help="Config path")
     parser.add_argument("--split", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -1882,7 +2031,17 @@ def main() -> int:
     parser.add_argument("--microbench_b_sizes", type=str, default=None, help="Comma-separated micro batch sizes, e.g. 1,2,4")
     parser.add_argument("--microbench_run_prefix", type=str, default=None, help="Run name prefix for microbench child runs")
     parser.add_argument("--microbench_id_source_run", type=str, default=None, help="Build inline id list from outputs/traces/<RUN>")
+    parser.add_argument("--perf_summarize_glob", type=str, default=None, help="Glob for benchmark summary json files, e.g. outputs/logs/agentiad_infer_summary_BATCH_B*_*.json")
+    parser.add_argument("--perf_summarize_dir", type=str, default=None, help="Directory for benchmark summary json files")
+    parser.add_argument("--perf_summarize_prefix", type=str, default=None, help="Filename prefix with --perf_summarize_dir, e.g. agentiad_infer_summary_BATCH_")
     args = parser.parse_args()
+
+    if args.perf_summarize_glob or (args.perf_summarize_dir and args.perf_summarize_prefix):
+        return _perf_summarize_json_files(
+            summarize_glob=(str(args.perf_summarize_glob).strip() if args.perf_summarize_glob else None),
+            summarize_dir=(str(args.perf_summarize_dir).strip() if args.perf_summarize_dir else None),
+            summarize_prefix=(str(args.perf_summarize_prefix).strip() if args.perf_summarize_prefix else None),
+        )
 
     if args.trace_compare_a and args.trace_compare_b:
         trace_root = Path(args.trace_compare_root).resolve() if args.trace_compare_root else (project_root / "outputs" / "traces")
@@ -1903,6 +2062,9 @@ def main() -> int:
         return 0
 
     if args.microbench_b_sizes:
+        if not args.config:
+            print("Missing --config for --microbench_b_sizes mode", file=sys.stderr)
+            return 2
         raw_sizes = [x.strip() for x in str(args.microbench_b_sizes).split(",") if x.strip()]
         b_sizes = sorted({max(1, int(x)) for x in raw_sizes})
         if not b_sizes:
@@ -1997,6 +2159,9 @@ def main() -> int:
     from agentiad_repro.tools.cr import query_image
     from agentiad_repro.tools.pz import crop_image_normalized
 
+    if not args.config:
+        print("Missing --config", file=sys.stderr)
+        return 2
     cfg_path = Path(args.config).resolve()
     cfg_text = _read_text(cfg_path)
     cfg = _load_yaml(cfg_path)
