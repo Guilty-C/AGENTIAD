@@ -287,6 +287,87 @@ def _normalize_assistant_content(content: str) -> str:
     return f"{PaperContract.TAG_ANSWER_START}\n{canonical_json}\n{PaperContract.TAG_ANSWER_END}"
 
 
+def _extract_think_from_text(text: str) -> str:
+    try:
+        m = re.search(r"<think>(.*?)</think>", str(text), re.DOTALL)
+        if not m:
+            return ""
+        return str(m.group(1) or "").strip()
+    except Exception:
+        return ""
+
+
+def _extract_answer_obj_from_text(text: str) -> Optional[Dict[str, Any]]:
+    try:
+        answer_json = PaperContract.extract_answer_xml(str(text))
+        if answer_json is None:
+            return None
+        obj = json.loads(answer_json)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def _canonical_final_reasoning(trace: Mapping[str, Any], final_obj: Mapping[str, Any]) -> str:
+    turns_any = trace.get("turns") if isinstance(trace, Mapping) else None
+    turns = turns_any if isinstance(turns_any, list) else []
+
+    latest_turn_name = "final"
+    latest_raw = ""
+    tool_chain: List[str] = []
+    for t in turns:
+        if not isinstance(t, Mapping):
+            continue
+        tc = t.get("tool_call")
+        if isinstance(tc, Mapping):
+            nm = str(tc.get("name") or "").strip()
+            if nm:
+                tool_chain.append(nm)
+    for t in reversed(turns):
+        if not isinstance(t, Mapping):
+            continue
+        raw = t.get("raw_output")
+        if isinstance(raw, str) and raw.strip():
+            latest_raw = raw
+            latest_turn_name = str(t.get("name") or "final")
+            break
+
+    think = _extract_think_from_text(latest_raw)
+    if think:
+        return think
+
+    latest_answer = _extract_answer_obj_from_text(latest_raw) or {}
+    anomaly = final_obj.get("anomaly_present")
+    if not isinstance(anomaly, bool):
+        anomaly = bool(latest_answer.get("anomaly_present", False))
+    top_anomaly = str(final_obj.get("top_anomaly") or latest_answer.get("top_anomaly") or "none").strip() or "none"
+    visuals_any = final_obj.get("visual_descriptions")
+    visuals = visuals_any if isinstance(visuals_any, list) else (latest_answer.get("visual_descriptions") if isinstance(latest_answer.get("visual_descriptions"), list) else [])
+    visual_hint = ""
+    for v in visuals:
+        if isinstance(v, str) and v.strip():
+            visual_hint = v.strip()
+            break
+    tools_txt = ", ".join(tool_chain) if tool_chain else "none"
+
+    if anomaly:
+        if visual_hint:
+            return (
+                f"Based on {latest_turn_name} turn and tool evidence ({tools_txt}), "
+                f"anomaly_present=true with top_anomaly={top_anomaly}; key evidence: {visual_hint}."
+            )
+        return (
+            f"Based on {latest_turn_name} turn and tool evidence ({tools_txt}), "
+            f"anomaly_present=true with top_anomaly={top_anomaly}."
+        )
+    return (
+        f"Based on {latest_turn_name} turn and tool evidence ({tools_txt}), "
+        "anomaly_present=false and top_anomaly=none."
+    )
+
+
 def _collect_traces_for_zip(trace_root: Path, items: List[Dict[str, Any]]) -> List[Tuple[Path, str]]:
     collected: List[Tuple[Path, str]] = []
     run_name = trace_root.name
@@ -492,7 +573,12 @@ def _run_sft_build(args) -> int:
         }
 
         final_obj2, final_text = _canon_final_json(contract_obj)
-        final_content = f"{PaperContract.TAG_ANSWER_START}\n{final_text}\n{PaperContract.TAG_ANSWER_END}"
+        final_reasoning = _canonical_final_reasoning(trace, final_obj2)
+        final_cot_marker = f"<think>\n{final_reasoning}\n</think>"
+        final_content = (
+            f"{final_cot_marker}\n"
+            f"{PaperContract.TAG_ANSWER_START}\n{final_text}\n{PaperContract.TAG_ANSWER_END}"
+        )
         
         turns_any = trace.get("turns") if isinstance(trace, dict) else None
         turns = turns_any if isinstance(turns_any, list) else []
