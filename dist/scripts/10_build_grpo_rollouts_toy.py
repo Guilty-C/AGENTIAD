@@ -264,6 +264,142 @@ def _synthesize_final_json_text(rng: random.Random) -> str:
     return "FINAL_JSON:" + json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _bool_cfg(x: Any, default: bool) -> bool:
+    if x is None:
+        return bool(default)
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _normalize_model_ref(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return s
+    p = Path(s).expanduser()
+    if p.is_absolute() and p.exists() and p.is_dir():
+        return str(p.resolve())
+    if p.exists() and p.is_dir():
+        return str(p.resolve())
+    return s
+
+
+def _load_l2_module(project_root: Path) -> Optional[Any]:
+    try:
+        import importlib.util
+
+        p = project_root / "scripts" / "06_run_agentiad_infer.py"
+        if not p.exists():
+            p = project_root / "dist" / "scripts" / "06_run_agentiad_infer.py"
+        if not p.exists():
+            return None
+        spec = importlib.util.spec_from_file_location("agentiad_l2_infer_mod_for_grpo", str(p))
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        return mod
+    except Exception:
+        return None
+
+
+def _resolve_image_candidate(raw: str, sample_dir: Optional[Path], mmad_root: Optional[Path], project_root: Path) -> Optional[Path]:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    p = Path(s).expanduser()
+    if p.exists():
+        return p.resolve()
+    if sample_dir is not None and not p.is_absolute():
+        p2 = (sample_dir / p).resolve()
+        if p2.exists():
+            return p2
+    if mmad_root is not None and not p.is_absolute():
+        p3 = (mmad_root / p).resolve()
+        if p3.exists():
+            return p3
+    if not p.is_absolute():
+        p4 = (project_root / p).resolve()
+        if p4.exists():
+            return p4
+    return None
+
+
+def _extract_rollout_sources(items: Sequence[Mapping[str, Any]], project_root: Path, mmad_root: Optional[Path]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        msgs_any = it.get("messages")
+        if not isinstance(msgs_any, list):
+            continue
+        msgs = [m for m in msgs_any if isinstance(m, dict)]
+        final_idx = None
+        for i, m in enumerate(msgs):
+            if m.get("role") == "assistant" and m.get("name") == "final":
+                final_idx = i
+                break
+        if final_idx is None:
+            continue
+        prompt_text = _render_prefix(msgs, final_idx) + "ASSISTANT(final): "
+        teacher_final_text = _as_json_text(msgs[final_idx].get("content"))
+
+        sample_dir: Optional[Path] = None
+        paths_obj = it.get("paths")
+        if isinstance(paths_obj, Mapping):
+            sample_dir_raw = str(paths_obj.get("sample_dir") or "").strip()
+            if sample_dir_raw:
+                sample_dir = Path(sample_dir_raw)
+                if not sample_dir.is_absolute():
+                    sample_dir = (project_root / sample_dir).resolve()
+
+        image_candidates: List[str] = []
+        for m in msgs:
+            if m.get("role") != "user":
+                continue
+            content = m.get("content")
+            if isinstance(content, Mapping):
+                imgs = content.get("images")
+                if isinstance(imgs, list):
+                    for im in imgs:
+                        if isinstance(im, Mapping):
+                            p = str(im.get("path") or im.get("source") or "").strip()
+                            if p:
+                                image_candidates.append(p)
+            elif isinstance(content, str):
+                s = content.strip()
+                if s:
+                    image_candidates.append(s)
+
+        resolved_image: Optional[Path] = None
+        for raw in image_candidates:
+            resolved_image = _resolve_image_candidate(raw, sample_dir, mmad_root, project_root)
+            if resolved_image is not None:
+                break
+
+        if resolved_image is None and sample_dir is not None:
+            for fallback_name in ["crop.png", "ref.png", "query.png"]:
+                p = (sample_dir / fallback_name).resolve()
+                if p.exists():
+                    resolved_image = p
+                    break
+
+        out.append(
+            {
+                "sample_id": str(it.get("sample_id") or ""),
+                "prompt_text": str(prompt_text),
+                "teacher_final_text": str(teacher_final_text or ""),
+                "image_path": str(resolved_image) if resolved_image is not None else "",
+                "trace_fingerprint_hash": str(it.get("trace_fingerprint_hash") or ""),
+                "trajectory_fingerprint_hash": str(it.get("trajectory_fingerprint_hash") or ""),
+            }
+        )
+    return out
+
+
 def _build_rollouts_core(
     project_root: Path,
     base_model: str,
@@ -283,8 +419,13 @@ def _build_rollouts_core(
     allow_synth_final_json_fallback: bool,
     config_hash: str,
     data_hash: str,
+    rollout_mode: str,
+    local_files_only: bool,
+    mmad_root: Optional[Path],
     adapter_init: Optional[str] = None,
 ) -> Dict[str, Any]:
+    use_real_vlm = str(rollout_mode or "").strip().lower() in {"real", "real_vlm", "vlm", "non_toy", "non-toy"}
+
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -300,38 +441,18 @@ def _build_rollouts_core(
         )
         return {"exit_code": 2, "error": "missing_dependencies"}
 
-    print("DEBUG: Imports loaded", file=sys.stderr)
-    sys.stderr.flush()
-
     random.seed(int(seed_val))
     torch.manual_seed(int(seed_val))
     synth_rng = random.Random(int(seed_val) + 1337)
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
-    if getattr(tokenizer, "pad_token_id", None) is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    tokenizer.truncation_side = "left"
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model = AutoModelForCausalLM.from_pretrained(base_model).to(device)
-    
-    if adapter_init:
-        print(f"DEBUG: Loading adapter from {adapter_init}", file=sys.stderr)
-        try:
-            model = PeftModel.from_pretrained(model, adapter_init)
-        except Exception as e:
-            print(f"Error loading adapter: {e}", file=sys.stderr)
-            return {"exit_code": 2, "error": "adapter_load_failed"}
-            
-    model.eval()
-    print("DEBUG: Model loaded", file=sys.stderr)
-    sys.stderr.flush()
-
-    max_ctx = int(getattr(getattr(model, "config", None), "n_positions", 1024) or 1024)
+    resolved_base_model = _normalize_model_ref(base_model)
+    if use_real_vlm and (not resolved_base_model or "tiny-gpt2" in resolved_base_model.lower()):
+        return {"exit_code": 2, "error": "missing_real_vlm_base_model"}
 
     items = _read_jsonl(train_jsonl_path)
+    sources = _extract_rollout_sources(items, project_root, mmad_root)
+    if not sources:
+        return {"exit_code": 1, "error": "no_valid_trajectory_sources"}
     target_count = max(1, int(max_samples_val))
 
     written = 0
@@ -342,103 +463,267 @@ def _build_rollouts_core(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with out_path.open("w", encoding="utf-8") as f:
-        while written < target_count:
-            print(f"DEBUG: written={written}/{target_count}", file=sys.stderr)
-            sys.stderr.flush()
-            for it in items:
-                if written >= target_count:
-                    break
-                msgs_any = it.get("messages")
-                if not isinstance(msgs_any, list):
-                    continue
-                msgs = [m for m in msgs_any if isinstance(m, dict)]
-                final_idx = None
-                for i, m in enumerate(msgs):
-                    if m.get("role") == "assistant" and m.get("name") == "final":
-                        final_idx = i
-                        break
-                if final_idx is None:
-                    continue
-                prompt_text = _render_prefix(msgs, final_idx) + "ASSISTANT(final): "
-                teacher_final_text = _as_json_text(msgs[final_idx].get("content"))
+    if use_real_vlm:
+        from PIL import Image
+        from transformers import AutoProcessor
 
-                prompt_group_id = _sha256_upper_text(prompt_text)[:16]
-                unique_groups.add(str(prompt_group_id))
+        try:
+            from transformers import AutoModelForImageTextToText
+        except Exception:
+            AutoModelForImageTextToText = None
 
-                remaining = int(target_count) - int(written)
-                k_this = int(min(int(rollouts_per_prompt), remaining))
-                for gi in range(int(k_this)):
+        l2_mod = _load_l2_module(project_root)
+        if local_files_only and l2_mod is not None and hasattr(l2_mod, "_ensure_local_only_model_ready_or_raise"):
+            l2_mod._ensure_local_only_model_ready_or_raise(resolved_base_model, local_only=True)
+
+        try:
+            processor = AutoProcessor.from_pretrained(resolved_base_model, local_files_only=bool(local_files_only))
+        except Exception:
+            processor = AutoTokenizer.from_pretrained(resolved_base_model, use_fast=True, local_files_only=bool(local_files_only))
+
+        model_kwargs: Dict[str, Any] = {}
+        if torch.cuda.is_available():
+            model_kwargs["torch_dtype"] = torch.float16
+
+        def _load_model(model_cls: Any) -> Any:
+            try:
+                return model_cls.from_pretrained(resolved_base_model, local_files_only=bool(local_files_only), **model_kwargs)
+            except Exception:
+                return model_cls.from_pretrained(resolved_base_model, local_files_only=bool(local_files_only))
+
+        if AutoModelForImageTextToText is not None:
+            try:
+                model = _load_model(AutoModelForImageTextToText)
+            except Exception:
+                model = _load_model(AutoModelForCausalLM)
+        else:
+            model = _load_model(AutoModelForCausalLM)
+
+        if adapter_init:
+            try:
+                model = PeftModel.from_pretrained(model, str(adapter_init))
+            except Exception as e:
+                print(f"Error loading adapter: {e}", file=sys.stderr)
+                return {"exit_code": 2, "error": "adapter_load_failed"}
+
+        if l2_mod is not None and hasattr(l2_mod, "_ensure_decoder_only_left_padding"):
+            try:
+                l2_mod._ensure_decoder_only_left_padding(processor, model)
+            except Exception:
+                pass
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+        model.eval()
+
+        tokenizer_any = getattr(processor, "tokenizer", processor)
+        pad_token_id = int(getattr(tokenizer_any, "pad_token_id", 0) or 0)
+        eos_token_id = getattr(tokenizer_any, "eos_token_id", None)
+        if pad_token_id <= 0 and isinstance(eos_token_id, int):
+            pad_token_id = int(eos_token_id)
+
+        placeholder_path = out_path.parent / "placeholder_missing_image.png"
+        if not placeholder_path.exists():
+            placeholder_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (448, 448), color=(127, 127, 127)).save(placeholder_path)
+
+        with out_path.open("w", encoding="utf-8") as f:
+            while written < target_count:
+                for src in sources:
                     if written >= target_count:
                         break
-                    max_prompt_len = max(8, max_ctx - int(max_new_tokens) - 1)
-                    enc = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_prompt_len).to(device)
-                    gen = model.generate(
-                        **enc,
-                        do_sample=bool(gen_do_sample),
-                        top_p=float(gen_top_p),
-                        temperature=float(gen_temperature),
-                        max_new_tokens=int(max_new_tokens),
-                        pad_token_id=int(tokenizer.eos_token_id),
-                    )
-                    output_text = tokenizer.decode(gen[0][enc["input_ids"].shape[1] :], skip_special_tokens=True)
-                    bd = _compute_reward_breakdown(output_text, reward_weights, len_penalty_per_char, len_penalty_threshold)
-                    synthetic_final_json = False
-                    if (
-                        allow_synth_final_json_fallback
-                        and (not allow_teacher_injection)
-                        and ("tiny-gpt2" in base_model.lower())
-                        and ((not bool(bd.get("json_parse_ok"))) and (not bool(bd.get("has_lbrace"))))
-                    ):
-                        output_text2 = _synthesize_final_json_text(synth_rng)
-                        bd2 = _compute_reward_breakdown(
-                            output_text2, reward_weights, len_penalty_per_char, len_penalty_threshold
-                        )
-                        output_text = output_text2
-                        bd = bd2
-                        synthetic_final_json = True
-                        synthetic_final_json_count += 1
-                    teacher_injected = False
-                    teacher_substituted = False
-                    if allow_teacher_injection and (gi > 0) and (not bool(bd.get("json_parse_ok"))) and teacher_final_text:
-                        bd2 = _compute_reward_breakdown(
-                            teacher_final_text, reward_weights, len_penalty_per_char, len_penalty_threshold
-                        )
-                        if bool(bd2.get("json_parse_ok")):
-                            output_text = teacher_final_text
-                            bd = bd2
-                            teacher_injected = True
-                            teacher_injection_count += 1
-                            teacher_substituted = True
-                            teacher_substitute_count += 1
+                    prompt_text = str(src.get("prompt_text") or "")
+                    teacher_final_text = str(src.get("teacher_final_text") or "")
+                    prompt_group_id = _sha256_upper_text(prompt_text)[:16]
+                    unique_groups.add(str(prompt_group_id))
 
-                    reward_breakdown = dict(bd)
-                    out_obj = {
-                        "schema_version": "grpo_rollout_v1",
-                        "prompt_group_id": str(prompt_group_id),
-                        "group_index": int(gi),
-                        "prompt_text": prompt_text,
-                        "model_output": output_text,
-                        "reward_breakdown": reward_breakdown,
-                        "reward": float(bd.get("reward", 0.0)),
-                        "parsed_json": bd.get("parsed_json"),
-                        "has_toolcall_generated_in_main": bool(bd.get("has_toolcall_generated_in_main")),
-                        "json_parse_ok": bool(bd.get("json_parse_ok")),
-                        "teacher_injected": bool(teacher_injected),
-                        "teacher_substituted": bool(teacher_substituted),
-                        "synthetic_final_json": bool(synthetic_final_json),
-                        "seed": int(seed_val),
-                        "data_hash": str(data_hash),
-                        "config_hash": str(config_hash),
-                        "script_sha256": _sha256_upper_bytes(Path(__file__).read_bytes()),
-                        "trace_fingerprint_hash": str(it.get("trace_fingerprint_hash") or ""),
-                        "trajectory_fingerprint_hash": str(it.get("trajectory_fingerprint_hash") or ""),
-                    }
-                    if os.environ.get("FORCE_CORRUPT_ROLLOUTS") == "1":
-                        f.write("BROKEN_JSON_LINE\n")
-                    else:
-                        f.write(_json_dumps_stable(out_obj) + "\n")
-                    written += 1
+                    image_path_raw = str(src.get("image_path") or "")
+                    image_path = Path(image_path_raw) if image_path_raw else placeholder_path
+                    if not image_path.exists():
+                        image_path = placeholder_path
+                    try:
+                        image_obj = Image.open(image_path).convert("RGB")
+                    except Exception:
+                        image_obj = Image.open(placeholder_path).convert("RGB")
+
+                    remaining = int(target_count) - int(written)
+                    k_this = int(min(int(rollouts_per_prompt), remaining))
+                    for gi in range(int(k_this)):
+                        if written >= target_count:
+                            break
+                        if hasattr(processor, "apply_chat_template") and getattr(processor, "chat_template", None):
+                            messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt_text}]}]
+                            prompt_rendered = str(processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+                        else:
+                            prompt_rendered = f"<image>\n{prompt_text}\nASSISTANT(final):"
+
+                        try:
+                            enc = processor(text=[prompt_rendered], images=[image_obj], return_tensors="pt")
+                        except Exception:
+                            enc = processor(text=[prompt_rendered], return_tensors="pt")
+                        enc = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in dict(enc).items()}
+                        prompt_len = int(enc["input_ids"].shape[1]) if "input_ids" in enc else 0
+                        gen = model.generate(
+                            **enc,
+                            do_sample=bool(gen_do_sample),
+                            top_p=float(gen_top_p),
+                            temperature=float(gen_temperature),
+                            max_new_tokens=int(max_new_tokens),
+                            pad_token_id=int(pad_token_id),
+                        )
+                        if hasattr(tokenizer_any, "decode"):
+                            output_text = tokenizer_any.decode(gen[0][prompt_len:], skip_special_tokens=True)
+                        else:
+                            output_text = str(gen)
+
+                        bd = _compute_reward_breakdown(output_text, reward_weights, len_penalty_per_char, len_penalty_threshold)
+                        teacher_injected = False
+                        teacher_substituted = False
+                        if allow_teacher_injection and (gi > 0) and (not bool(bd.get("json_parse_ok"))) and teacher_final_text:
+                            bd2 = _compute_reward_breakdown(
+                                teacher_final_text, reward_weights, len_penalty_per_char, len_penalty_threshold
+                            )
+                            if bool(bd2.get("json_parse_ok")):
+                                output_text = teacher_final_text
+                                bd = bd2
+                                teacher_injected = True
+                                teacher_injection_count += 1
+                                teacher_substituted = True
+                                teacher_substitute_count += 1
+
+                        out_obj = {
+                            "schema_version": "grpo_rollout_v1",
+                            "prompt_group_id": str(prompt_group_id),
+                            "group_index": int(gi),
+                            "prompt_text": prompt_text,
+                            "model_output": output_text,
+                            "reward_breakdown": dict(bd),
+                            "reward": float(bd.get("reward", 0.0)),
+                            "parsed_json": bd.get("parsed_json"),
+                            "has_toolcall_generated_in_main": bool(bd.get("has_toolcall_generated_in_main")),
+                            "json_parse_ok": bool(bd.get("json_parse_ok")),
+                            "teacher_injected": bool(teacher_injected),
+                            "teacher_substituted": bool(teacher_substituted),
+                            "synthetic_final_json": False,
+                            "seed": int(seed_val),
+                            "data_hash": str(data_hash),
+                            "config_hash": str(config_hash),
+                            "script_sha256": _sha256_upper_bytes(Path(__file__).read_bytes()),
+                            "trace_fingerprint_hash": str(src.get("trace_fingerprint_hash") or ""),
+                            "trajectory_fingerprint_hash": str(src.get("trajectory_fingerprint_hash") or ""),
+                            "sample_id": str(src.get("sample_id") or ""),
+                            "image_path": str(image_path),
+                            "rollout_mode": "real_vlm",
+                        }
+                        if os.environ.get("FORCE_CORRUPT_ROLLOUTS") == "1":
+                            f.write("BROKEN_JSON_LINE\n")
+                        else:
+                            f.write(_json_dumps_stable(out_obj) + "\n")
+                        written += 1
+        device_out = device
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(resolved_base_model, use_fast=True)
+        if getattr(tokenizer, "pad_token_id", None) is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+        tokenizer.truncation_side = "left"
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = AutoModelForCausalLM.from_pretrained(resolved_base_model).to(device)
+        if adapter_init:
+            try:
+                model = PeftModel.from_pretrained(model, adapter_init)
+            except Exception as e:
+                print(f"Error loading adapter: {e}", file=sys.stderr)
+                return {"exit_code": 2, "error": "adapter_load_failed"}
+        model.eval()
+        max_ctx = int(getattr(getattr(model, "config", None), "n_positions", 1024) or 1024)
+
+        with out_path.open("w", encoding="utf-8") as f:
+            while written < target_count:
+                for src in sources:
+                    if written >= target_count:
+                        break
+                    prompt_text = str(src.get("prompt_text") or "")
+                    teacher_final_text = str(src.get("teacher_final_text") or "")
+                    prompt_group_id = _sha256_upper_text(prompt_text)[:16]
+                    unique_groups.add(str(prompt_group_id))
+
+                    remaining = int(target_count) - int(written)
+                    k_this = int(min(int(rollouts_per_prompt), remaining))
+                    for gi in range(int(k_this)):
+                        if written >= target_count:
+                            break
+                        max_prompt_len = max(8, max_ctx - int(max_new_tokens) - 1)
+                        enc = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_prompt_len).to(device)
+                        gen = model.generate(
+                            **enc,
+                            do_sample=bool(gen_do_sample),
+                            top_p=float(gen_top_p),
+                            temperature=float(gen_temperature),
+                            max_new_tokens=int(max_new_tokens),
+                            pad_token_id=int(tokenizer.eos_token_id),
+                        )
+                        output_text = tokenizer.decode(gen[0][enc["input_ids"].shape[1] :], skip_special_tokens=True)
+                        bd = _compute_reward_breakdown(output_text, reward_weights, len_penalty_per_char, len_penalty_threshold)
+                        synthetic_final_json = False
+                        if (
+                            allow_synth_final_json_fallback
+                            and (not allow_teacher_injection)
+                            and ("tiny-gpt2" in resolved_base_model.lower())
+                            and ((not bool(bd.get("json_parse_ok"))) and (not bool(bd.get("has_lbrace"))))
+                        ):
+                            output_text2 = _synthesize_final_json_text(synth_rng)
+                            bd2 = _compute_reward_breakdown(
+                                output_text2, reward_weights, len_penalty_per_char, len_penalty_threshold
+                            )
+                            output_text = output_text2
+                            bd = bd2
+                            synthetic_final_json = True
+                            synthetic_final_json_count += 1
+                        teacher_injected = False
+                        teacher_substituted = False
+                        if allow_teacher_injection and (gi > 0) and (not bool(bd.get("json_parse_ok"))) and teacher_final_text:
+                            bd2 = _compute_reward_breakdown(
+                                teacher_final_text, reward_weights, len_penalty_per_char, len_penalty_threshold
+                            )
+                            if bool(bd2.get("json_parse_ok")):
+                                output_text = teacher_final_text
+                                bd = bd2
+                                teacher_injected = True
+                                teacher_injection_count += 1
+                                teacher_substituted = True
+                                teacher_substitute_count += 1
+                        out_obj = {
+                            "schema_version": "grpo_rollout_v1",
+                            "prompt_group_id": str(prompt_group_id),
+                            "group_index": int(gi),
+                            "prompt_text": prompt_text,
+                            "model_output": output_text,
+                            "reward_breakdown": dict(bd),
+                            "reward": float(bd.get("reward", 0.0)),
+                            "parsed_json": bd.get("parsed_json"),
+                            "has_toolcall_generated_in_main": bool(bd.get("has_toolcall_generated_in_main")),
+                            "json_parse_ok": bool(bd.get("json_parse_ok")),
+                            "teacher_injected": bool(teacher_injected),
+                            "teacher_substituted": bool(teacher_substituted),
+                            "synthetic_final_json": bool(synthetic_final_json),
+                            "seed": int(seed_val),
+                            "data_hash": str(data_hash),
+                            "config_hash": str(config_hash),
+                            "script_sha256": _sha256_upper_bytes(Path(__file__).read_bytes()),
+                            "trace_fingerprint_hash": str(src.get("trace_fingerprint_hash") or ""),
+                            "trajectory_fingerprint_hash": str(src.get("trajectory_fingerprint_hash") or ""),
+                            "sample_id": str(src.get("sample_id") or ""),
+                            "image_path": str(src.get("image_path") or ""),
+                            "rollout_mode": "toy_text",
+                        }
+                        if os.environ.get("FORCE_CORRUPT_ROLLOUTS") == "1":
+                            f.write("BROKEN_JSON_LINE\n")
+                        else:
+                            f.write(_json_dumps_stable(out_obj) + "\n")
+                        written += 1
+        device_out = device
 
     return {
         "exit_code": 0,
@@ -449,7 +734,8 @@ def _build_rollouts_core(
         "teacher_substitute_count": teacher_substitute_count,
         "synthetic_final_json_count": synthetic_final_json_count,
         "rollouts_per_prompt": rollouts_per_prompt,
-        "device": device,
+        "device": device_out,
+        "rollout_mode": "real_vlm" if use_real_vlm else "toy_text",
     }
 
 
@@ -704,6 +990,9 @@ def _run_acceptance_audit(args: argparse.Namespace) -> int:
         allow_synth_final_json_fallback=True,
         config_hash="AUDIT_CONFIG_HASH",
         data_hash="AUDIT_DATA_HASH",
+        rollout_mode="toy_text",
+        local_files_only=False,
+        mmad_root=None,
     )
 
     if stats["exit_code"] != 0:
@@ -1000,11 +1289,16 @@ def main() -> int:
 
     seed_val = _pick(args.seed, "seed", 0)
     max_samples_val = _pick(args.max_samples, "rollout_samples", 5)
-    base_model = str(args.base_model or cfg.get("base_model_id") or "sshleifer/tiny-gpt2")
+    base_model = str(args.base_model or cfg.get("base_model_id") or cfg.get("vlm_model_id") or "sshleifer/tiny-gpt2")
     max_new_tokens = int(_pick(args.max_new_tokens, "max_new_tokens", 128))
     rollouts_per_prompt = int(cfg.get("rollouts_per_prompt") or cfg.get("rollout_group_size") or 8)
     if rollouts_per_prompt <= 0:
         rollouts_per_prompt = 8
+    rollout_mode = str(cfg.get("phase4_mode") or cfg.get("rollout_mode") or "toy_text").strip().lower()
+    local_only_default = os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1"
+    local_files_only = _bool_cfg(cfg.get("local_files_only"), local_only_default)
+    mmad_root_raw = str(cfg.get("mmad_root") or os.environ.get("MMAD_ROOT") or "").strip()
+    mmad_root = Path(mmad_root_raw).resolve() if mmad_root_raw else None
 
     gen_cfg_any = cfg.get("gen") if isinstance(cfg, dict) else None
     gen_cfg = gen_cfg_any if isinstance(gen_cfg_any, dict) else {}
@@ -1025,6 +1319,8 @@ def main() -> int:
         "base_model": base_model,
         "max_new_tokens": int(max_new_tokens),
         "rollouts_per_prompt": int(rollouts_per_prompt),
+        "rollout_mode": str(rollout_mode),
+        "local_files_only": bool(local_files_only),
         "gen": {"do_sample": bool(gen_do_sample), "temperature": float(gen_temperature), "top_p": float(gen_top_p)},
         "raw_config": cfg,
     }
@@ -1058,6 +1354,9 @@ def main() -> int:
         allow_synth_final_json_fallback=bool(args.allow_synth_final_json_fallback),
         config_hash=config_hash,
         data_hash=data_hash,
+        rollout_mode=str(rollout_mode),
+        local_files_only=bool(local_files_only),
+        mmad_root=mmad_root,
         adapter_init=args.adapter_init,
     )
     
@@ -1081,6 +1380,7 @@ def main() -> int:
     print(f"synthetic_final_json_enabled={bool(args.allow_synth_final_json_fallback)}", file=sys.stderr)
     print(f"synthetic_final_json_count={int(stats['synthetic_final_json_count'])}", file=sys.stderr)
     print(f"rollouts_per_prompt={int(stats['rollouts_per_prompt'])}", file=sys.stderr)
+    print(f"rollout_mode={str(stats.get('rollout_mode') or rollout_mode)}", file=sys.stderr)
     print(f"unique_prompt_groups={int(stats['unique_groups'])}", file=sys.stderr)
     print(f"written_total_target={int(stats['target_count'])}", file=sys.stderr)
     print(f"written_total={int(stats['written'])}", file=sys.stderr)
@@ -1103,7 +1403,7 @@ def main() -> int:
                 "config_hash": str(config_hash),
                 "data_hash": str(data_hash),
                 "written": int(stats["written"]),
-                "run_mode": "toy"
+                "run_mode": str(stats.get("rollout_mode") or "toy_text")
             }
         }
         

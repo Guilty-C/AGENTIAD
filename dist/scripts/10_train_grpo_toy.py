@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -90,6 +92,63 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
             raise ValueError("Each JSONL line must be an object.")
         items.append(obj)
     return items
+
+
+def _append_jsonl(path: Path, obj: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(_json_dumps_stable(dict(obj)) + "\n")
+
+
+def _write_csv_rows(path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(fieldnames))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def _bool_cfg(x: Any, default: bool) -> bool:
+    if x is None:
+        return bool(default)
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _normalize_model_ref(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return s
+    p = Path(s).expanduser()
+    if p.is_absolute() and p.exists() and p.is_dir():
+        return str(p.resolve())
+    if p.exists() and p.is_dir():
+        return str(p.resolve())
+    return s
+
+
+def _load_l2_module(project_root: Path) -> Optional[Any]:
+    try:
+        p = project_root / "scripts" / "06_run_agentiad_infer.py"
+        if not p.exists():
+            p = project_root / "dist" / "scripts" / "06_run_agentiad_infer.py"
+        if not p.exists():
+            return None
+        spec = importlib.util.spec_from_file_location("agentiad_l2_infer_mod_for_grpo_train", str(p))
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        return mod
+    except Exception:
+        return None
 
 
 def _resolve_path(project_root: Path, raw: str) -> Path:
@@ -1042,7 +1101,14 @@ def main() -> int:
     lora_dropout_val = float(_pick(args.lora_dropout, "lora_dropout", 0.05))
     adapter_init = str(args.adapter_init or cfg.get("adapter_init") or "")
 
-    base_model = str(args.base_model or cfg.get("base_model_id") or "sshleifer/tiny-gpt2")
+    phase4_mode = str(cfg.get("phase4_mode") or cfg.get("rollout_mode") or "toy_text").strip().lower()
+    real_phase4 = phase4_mode in {"real", "real_vlm", "vlm", "non_toy", "non-toy"}
+    base_model = _normalize_model_ref(str(args.base_model or cfg.get("base_model_id") or cfg.get("vlm_model_id") or "sshleifer/tiny-gpt2"))
+    local_only_default = os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1"
+    local_files_only = _bool_cfg(cfg.get("local_files_only"), local_only_default)
+    if real_phase4 and ("tiny-gpt2" in base_model.lower()):
+        print("error=missing_real_phase4_base_model", file=sys.stderr)
+        return 2
     train_jsonl_path = _resolve_path(project_root, str(train_jsonl_val))
     out_dir = _resolve_path(project_root, str(output_dir_val))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1086,7 +1152,9 @@ def main() -> int:
         "info=run_overrides "
         + f"base_model={str(train_args.base_model)} "
         + f"max_new_tokens={int(train_args.max_new_tokens)} "
-        + f"cuda_available={bool(cuda_available)}"
+        + f"cuda_available={bool(cuda_available)} "
+        + f"phase4_mode={str(phase4_mode)} "
+        + f"local_files_only={bool(local_files_only)}"
     )
 
     print(f"max_steps={int(train_args.max_steps)}")
@@ -1104,11 +1172,19 @@ def main() -> int:
     config_hash = _sha256_upper_json(_canonicalize_paths_for_hash(project_root, json.loads(_json_dumps_stable(config_obj))))
     data_hash = _sha256_upper_bytes(train_jsonl_path.read_bytes())
 
+    l2_mod = _load_l2_module(project_root)
+    if local_files_only and l2_mod is not None and hasattr(l2_mod, "_ensure_local_only_model_ready_or_raise"):
+        l2_mod._ensure_local_only_model_ready_or_raise(train_args.base_model, local_only=True)
+
     try:
         import torch
         import torch.nn.functional as F
         from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+        try:
+            from transformers import AutoModelForImageTextToText
+        except Exception:
+            AutoModelForImageTextToText = None
     except Exception:
         print(
             "Missing dependencies for GRPO toy.\n"
@@ -1129,7 +1205,13 @@ def main() -> int:
     random.seed(int(train_args.seed))
     torch.manual_seed(int(train_args.seed))
 
-    tokenizer = AutoTokenizer.from_pretrained(train_args.base_model, use_fast=True)
+    try:
+        processor = AutoProcessor.from_pretrained(train_args.base_model, local_files_only=bool(local_files_only))
+    except Exception:
+        processor = AutoTokenizer.from_pretrained(train_args.base_model, use_fast=True, local_files_only=bool(local_files_only))
+    tokenizer = getattr(processor, "tokenizer", processor)
+    if not callable(getattr(tokenizer, "__call__", None)):
+        tokenizer = AutoTokenizer.from_pretrained(train_args.base_model, use_fast=True, local_files_only=bool(local_files_only))
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -1149,9 +1231,29 @@ def main() -> int:
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
-    base_ref = AutoModelForCausalLM.from_pretrained(train_args.base_model).to(device)
+    model_kwargs: Dict[str, Any] = {}
+    if bool(cuda_available):
+        model_kwargs["torch_dtype"] = torch.float16
+    def _load_model(model_cls: Any) -> Any:
+        try:
+            return model_cls.from_pretrained(train_args.base_model, local_files_only=bool(local_files_only), **model_kwargs)
+        except Exception:
+            return model_cls.from_pretrained(train_args.base_model, local_files_only=bool(local_files_only))
+    if real_phase4 and AutoModelForImageTextToText is not None:
+        try:
+            base_ref = _load_model(AutoModelForImageTextToText).to(device)
+        except Exception:
+            base_ref = _load_model(AutoModelForCausalLM).to(device)
+    else:
+        base_ref = _load_model(AutoModelForCausalLM).to(device)
     base_ref.eval()
-    base_for_adapter = AutoModelForCausalLM.from_pretrained(train_args.base_model).to(device)
+    if real_phase4 and AutoModelForImageTextToText is not None:
+        try:
+            base_for_adapter = _load_model(AutoModelForImageTextToText).to(device)
+        except Exception:
+            base_for_adapter = _load_model(AutoModelForCausalLM).to(device)
+    else:
+        base_for_adapter = _load_model(AutoModelForCausalLM).to(device)
     base_for_adapter.train()
     if target_modules is None:
         target_modules = _infer_target_modules(base_for_adapter)
@@ -1178,6 +1280,10 @@ def main() -> int:
     lora_target_modules = list(target_modules) if isinstance(target_modules, list) else []
     trainable_param_count, total_param_count, trainable_param_ratio = _trainable_param_stats(model)
     lora_param_abs_sum_before = _peft_trainable_abs_sum(model)
+    policy_abs_before: Dict[str, float] = {}
+    for name, p in model.named_parameters():
+        if bool(getattr(p, "requires_grad", False)):
+            policy_abs_before[str(name)] = float(p.detach().abs().sum().cpu().item())
     print(f"lora_target_modules={json.dumps(lora_target_modules, ensure_ascii=False)}")
     print(f"trainable_param_count={int(trainable_param_count)}")
     print(f"trainable_param_ratio={trainable_param_ratio:.6f}")
@@ -1248,6 +1354,14 @@ def main() -> int:
                 items = items2
                 first_schema = first_schema2
                 rollouts_mode = True
+
+    if real_phase4 and (not rollouts_mode):
+        print(
+            "error=real_phase4_requires_grpo_rollout_v1_input "
+            "(real_phase4 requires grpo_rollout_v1 rollout-mode training input)",
+            file=sys.stderr,
+        )
+        return 1
 
     schema_bad = 0
     if rollouts_mode:
@@ -1373,6 +1487,9 @@ def main() -> int:
     has_schema_keys_rate = 0.0
     teacher_injected_rate = 0.0
     teacher_injected_count = 0
+    teacher_substituted_rate = 0.0
+    synthetic_final_json_rate = 0.0
+    audit_ok = True
     if rollouts_mode and rollout_pool:
         groups: Dict[str, List[Dict[str, Any]]] = {}
         for x in rollout_pool:
@@ -1950,6 +2067,13 @@ def main() -> int:
     effective_train_steps = 0
     adapter_dir = out_dir / "adapter"
     adapter_dir.mkdir(parents=True, exist_ok=True)
+    grpo_metrics_csv = out_dir / str(cfg.get("grpo_metrics_csv", "grpo_metrics.csv"))
+    reward_curve_csv = out_dir / str(cfg.get("reward_curve_csv", "reward_curve.csv"))
+    reward_curve_png = out_dir / str(cfg.get("reward_curve_png", "reward_curve.png"))
+    policy_delta_csv = out_dir / str(cfg.get("policy_delta_csv", "policy_delta.csv"))
+    reward_audit_json = out_dir / str(cfg.get("reward_audit_json", "reward_audit.json"))
+    reward_events_jsonl = out_dir / str(cfg.get("reward_events_jsonl", "reward_events.jsonl"))
+    step_metric_rows: List[Dict[str, Any]] = []
     rollouts_path: Optional[Path] = None
     rollouts_f = None
     baseline_ema: Optional[float] = None
@@ -2142,6 +2266,23 @@ def main() -> int:
                     f"lr={lr_eff:.6g} grad_norm={grad_norm:.6f} loss={float(loss.detach().cpu().item()):.6f} "
                     f"mean_cont_tokens={_mean([float(x) for x in token_counts]):.2f}"
                 )
+            step_row = {
+                "step": int(step + 1),
+                "reward_mean": float(r_mean),
+                "reward_std": float(r_std),
+                "r_json_mean": float(r_json_mean),
+                "r_tool_mean": float(r_tool_mean),
+                "r_len_mean": float(r_len_mean),
+                "loss": float(loss.detach().cpu().item()),
+                "grad_norm": float(grad_norm),
+                "lr": float(lr_eff),
+                "mean_cont_tokens": float(_mean([float(x) for x in token_counts])),
+                "rollouts_mode": bool(rollouts_mode),
+                "phase4_mode": str(phase4_mode),
+                "comparison_group_count": int(rollouts_group_count if rollouts_mode else 0),
+            }
+            step_metric_rows.append(step_row)
+            _append_jsonl(reward_events_jsonl, {"event": "train_step", **step_row})
             step += 1
     finally:
         if rollouts_f is not None:
@@ -2164,6 +2305,91 @@ def main() -> int:
     base_ref.eval()
     probe_delta = _probe_adapter_logits_delta_mean_abs(base_ref, model, tokenizer, device)
     print(f"probe_adapter_logits_delta_mean_abs={probe_delta:.12f}")
+
+    policy_rows: List[Dict[str, Any]] = []
+    policy_abs_after: Dict[str, float] = {}
+    for name, p in model.named_parameters():
+        if bool(getattr(p, "requires_grad", False)):
+            policy_abs_after[str(name)] = float(p.detach().abs().sum().cpu().item())
+    for name in sorted(set(policy_abs_before.keys()) | set(policy_abs_after.keys())):
+        before_v = float(policy_abs_before.get(name, 0.0))
+        after_v = float(policy_abs_after.get(name, 0.0))
+        policy_rows.append(
+            {
+                "param_name": str(name),
+                "abs_sum_before": float(before_v),
+                "abs_sum_after": float(after_v),
+                "abs_delta": float(after_v - before_v),
+            }
+        )
+    _write_csv_rows(policy_delta_csv, ["param_name", "abs_sum_before", "abs_sum_after", "abs_delta"], policy_rows)
+
+    metric_fieldnames = [
+        "step",
+        "reward_mean",
+        "reward_std",
+        "r_json_mean",
+        "r_tool_mean",
+        "r_len_mean",
+        "loss",
+        "grad_norm",
+        "lr",
+        "mean_cont_tokens",
+        "rollouts_mode",
+        "phase4_mode",
+        "comparison_group_count",
+    ]
+    _write_csv_rows(grpo_metrics_csv, metric_fieldnames, step_metric_rows)
+    _write_csv_rows(reward_curve_csv, ["step", "reward_mean", "reward_std"], step_metric_rows)
+
+    reward_audit_obj = {
+        "phase4_mode": str(phase4_mode),
+        "real_phase4": bool(real_phase4),
+        "reward_audit_check": "PASS" if bool(audit_ok) else "FAIL",
+        "reward_stats": {k: float(v) for k, v in reward_stats.items()},
+        "json_parse_ok_rate": float(json_parse_ok_rate),
+        "has_toolcall_rate": float(has_toolcall_rate),
+        "reward_positive_rate": float(reward_positive_rate),
+        "rollouts_group_count": int(rollouts_group_count),
+        "rollouts_per_prompt_observed_min": int(rollouts_per_prompt_observed_min),
+        "rollouts_per_prompt_observed_max": int(rollouts_per_prompt_observed_max),
+        "rollouts_per_prompt_observed_mean": float(rollouts_per_prompt_observed_mean),
+        "teacher_injected_rate": float(teacher_injected_rate),
+        "teacher_substituted_rate": float(teacher_substituted_rate),
+        "synthetic_final_json_rate": float(synthetic_final_json_rate),
+        "event_rows": int(len(step_metric_rows)),
+        "events_jsonl": str(reward_events_jsonl),
+    }
+    reward_audit_json.write_text(_json_dumps_stable(reward_audit_obj) + "\n", encoding="utf-8")
+    _append_jsonl(
+        reward_events_jsonl,
+        {
+            "event": "reward_audit",
+            "reward_audit_check": str(reward_audit_obj.get("reward_audit_check")),
+            "event_rows": int(len(step_metric_rows)),
+            "real_phase4": bool(real_phase4),
+        },
+    )
+
+    try:
+        import matplotlib.pyplot as plt
+
+        xs = [int(r.get("step", 0) or 0) for r in step_metric_rows]
+        ys = [float(r.get("reward_mean", 0.0) or 0.0) for r in step_metric_rows]
+        if xs and ys:
+            fig = plt.figure(figsize=(6, 4), dpi=120)
+            ax = fig.add_subplot(1, 1, 1)
+            ax.plot(xs, ys, marker="o", linewidth=1.5)
+            ax.set_title("GRPO Reward Curve")
+            ax.set_xlabel("Step")
+            ax.set_ylabel("Reward Mean")
+            ax.grid(True, linestyle="--", alpha=0.4)
+            fig.tight_layout()
+            reward_curve_png.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(reward_curve_png)
+            plt.close(fig)
+    except Exception as _plot_e:
+        _append_jsonl(reward_events_jsonl, {"event": "plot_skipped", "reason": f"{type(_plot_e).__name__}:{_plot_e}"})
 
     if int(effective_train_steps) > 0 and abs(float(lora_param_abs_delta)) < 1e-9 and (not bool(args.allow_lora_no_change)):
         snapshot = {
@@ -2274,6 +2500,14 @@ def main() -> int:
         "lora_param_abs_sum_after": float(lora_param_abs_sum_after),
         "lora_param_abs_delta": float(lora_param_abs_delta),
         "probe_adapter_logits_delta_mean_abs": float(probe_delta),
+        "phase4_mode": str(phase4_mode),
+        "real_phase4": bool(real_phase4),
+        "grpo_metrics_csv": str(grpo_metrics_csv),
+        "reward_curve_csv": str(reward_curve_csv),
+        "reward_curve_png": str(reward_curve_png) if reward_curve_png.exists() else "",
+        "policy_delta_csv": str(policy_delta_csv),
+        "reward_audit_json": str(reward_audit_json),
+        "reward_events_jsonl": str(reward_events_jsonl),
     }
     snapshot.update(reward_stats)
     if rollouts_mode:
@@ -2293,6 +2527,8 @@ def main() -> int:
         snapshot["has_schema_keys_rate"] = float(has_schema_keys_rate)
         snapshot["teacher_injected_rate"] = float(teacher_injected_rate)
         snapshot["synthetic_final_json_rate"] = float(synthetic_final_json_rate)
+        snapshot["reward_audit_check"] = "PASS" if audit_ok else "FAIL"
+    else:
         snapshot["reward_audit_check"] = "PASS" if audit_ok else "FAIL"
     try:
         from agentiad_repro.utils import utc_now_iso
@@ -2329,7 +2565,7 @@ def main() -> int:
                 "config_hash": str(config_hash),
                 "data_hash": str(data_hash),
                 "adapter_hash": str(adapter_hash),
-                "run_mode": "toy"
+                "run_mode": "real_vlm" if bool(real_phase4) else "toy_text"
             }
         }
         
@@ -2343,6 +2579,16 @@ def main() -> int:
         extra = []
         if (out_dir / "train_snapshot.json").exists():
             extra.append((out_dir / "train_snapshot.json", "train_snapshot.json"))
+        for fp, arc in [
+            (grpo_metrics_csv, "grpo_metrics.csv"),
+            (reward_curve_csv, "reward_curve.csv"),
+            (reward_curve_png, "reward_curve.png"),
+            (policy_delta_csv, "policy_delta.csv"),
+            (reward_audit_json, "reward_audit.json"),
+            (reward_events_jsonl, "reward_events.jsonl"),
+        ]:
+            if fp.exists():
+                extra.append((fp, arc))
         if adapter_dir.exists():
             for f in sorted(adapter_dir.iterdir()):
                 if f.is_file():

@@ -1,7 +1,17 @@
-base_model_id: "distilgpt2"
-train_jsonl: "outputs/traces/trajectories_sft_toy.jsonl"
-output_dir: "outputs/ckpts/grpo_toy_run"
-rollout_output_jsonl: "outputs/rollouts/grpo_toy_rollouts.jsonl"
+base_model_id: ""
+phase4_mode: "real_vlm"
+rollout_mode: "real_vlm"
+local_files_only: false
+train_jsonl: "dist/outputs/phase3_2_clean_no_fake_cot_20260306_181439/train.jsonl"
+output_dir: "dist/outputs/phase4_2_grpo_run"
+rollout_output_jsonl: "dist/outputs/phase4_2_grpo_run/rollouts.jsonl"
+
+grpo_metrics_csv: "grpo_metrics.csv"
+reward_curve_csv: "reward_curve.csv"
+reward_curve_png: "reward_curve.png"
+policy_delta_csv: "policy_delta.csv"
+reward_audit_json: "reward_audit.json"
+reward_events_jsonl: "reward_events.jsonl"
 
 seed: 0
 max_steps: 50

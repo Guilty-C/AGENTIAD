@@ -2264,30 +2264,100 @@ class GRPOBuild(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
         if ctx.no_adapter or not res.success or ctx.phase1_baseline: return
         grpo_cfg = ctx.work_dir / "mr_grpo_config.yaml"
-        grpo_cfg.write_text("base_model_id: 'distilgpt2'\nrollouts_per_prompt: 2\nmax_new_tokens: 16\nreward_weights:\n  w_json: 1.0\n  w_tool: 1.0\n  w_len: 0.0\nlr: 1e-5\nbatch_size: 1\ngrad_accum: 1\nrollout_samples: 100\nreward_audit_min_span: 0.0\nreward_audit_min_json_ok_rate: 0.0\nreward_audit_min_toolcall_rate: 0.0\n", encoding="utf-8")
-        
+
+        import yaml
+
         first_seed = ctx.seeds[0] if ctx.seeds else 0
         l3_source = ctx.work_dir / f"seed_{first_seed}/l3.jsonl"
         rollouts_jsonl = ctx.work_dir / "rollouts.jsonl"
         ev_10_build = ctx.work_dir / "ev_10_build"
-        
+
         l3_lines = 0
         if l3_source.exists():
             with open(l3_source, "r", encoding="utf-8") as f: l3_lines = sum(1 for _ in f)
         rollouts_target = l3_lines * 2 if l3_lines > 0 else 10
-        
+
+        sft_adapter = ctx.work_dir / f"seed_{first_seed}/l4_out/adapter"
+        effective_model = str(ctx.vlm_model_id or "").strip()
+        mr_cfg = ctx.work_dir / "mr_config.yaml"
+        if (not effective_model) and mr_cfg.exists():
+            try:
+                loaded = yaml.safe_load(mr_cfg.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    effective_model = str(loaded.get("vlm_model_id") or loaded.get("model_id") or "").strip()
+            except Exception:
+                pass
+        if not effective_model:
+            res.success = False
+            res.errors.append("GRPOBuild missing effective VLM model id (ctx.vlm_model_id / mr_config model_id).")
+            return
+
+        cfg_obj: Dict[str, Any] = {}
+        base_cfg = PROJECT_ROOT / "dist" / "configs" / "grpo_toy.yaml"
+        if base_cfg.exists():
+            try:
+                loaded = yaml.safe_load(base_cfg.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cfg_obj = dict(loaded)
+            except Exception:
+                cfg_obj = {}
+        cfg_obj["phase4_mode"] = "real_vlm"
+        cfg_obj["rollout_mode"] = "real_vlm"
+        cfg_obj["base_model_id"] = str(effective_model)
+        cfg_obj["rollout_samples"] = int(rollouts_target)
+        cfg_obj["rollouts_per_prompt"] = int(cfg_obj.get("rollouts_per_prompt") or 2)
+        cfg_obj["local_files_only"] = bool(str(os.environ.get("TRANSFORMERS_OFFLINE", "0")).strip() == "1")
+        if sft_adapter.exists():
+            cfg_obj["adapter_init"] = str(sft_adapter)
+        grpo_cfg.write_text(yaml.safe_dump(cfg_obj, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
         cmd = CmdBuilder(ctx.get_script("10_build_grpo_rollouts_toy.py")).with_config(grpo_cfg).arg("--train_jsonl", l3_source).arg("--output_jsonl", rollouts_jsonl).with_evidence_dir(ev_10_build).arg("--seed", "42").arg("--max_samples", rollouts_target)
         sft_adapter = ctx.work_dir / f"seed_{first_seed}/l4_out/adapter"
         if sft_adapter.exists(): cmd.arg("--adapter_init", sft_adapter)
-        
+
         cmd_list = cmd.build()
         if J1.record_if_violation(cmd_list, res, "GRPO build cmd"): return
         cmd_res = CmdRunner.run(cmd_list, ctx.env_overrides, stream_output=True)
         if not _require_cmd_ok(res, cmd_res, "GRPOBuild", "GRPOBuild"):
              # CMD_FAILED already recorded by helper
              return
-             
-        if rollouts_jsonl.exists(): res.artifacts["rollouts_sha256"] = hashlib.sha256(rollouts_jsonl.read_bytes()).hexdigest()
+
+        if not rollouts_jsonl.exists():
+            res.success = False
+            res.errors.append(f"GRPOBuild missing rollouts output: {rollouts_jsonl}")
+            return
+        try:
+            with open(rollouts_jsonl, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            if not lines:
+                res.success = False
+                res.errors.append("GRPOBuild produced empty rollouts.jsonl")
+                return
+            first = json.loads(lines[0])
+            if str(first.get("schema_version") or "") != "grpo_rollout_v1":
+                res.success = False
+                res.errors.append("GRPOBuild first rollout schema_version != grpo_rollout_v1")
+                return
+            mode_vals = Counter()
+            for ln in lines[: min(256, len(lines))]:
+                try:
+                    obj = json.loads(ln)
+                except Exception:
+                    continue
+                mode_vals[str(obj.get("rollout_mode") or "unset")] += 1
+            if int(mode_vals.get("real_vlm", 0)) <= 0:
+                res.success = False
+                res.errors.append("GRPOBuild rollout_mode does not include real_vlm in inspected records.")
+                return
+            res.artifacts["rollouts_count"] = int(len(lines))
+            res.artifacts["rollouts_mode_counts_head"] = {k: int(v) for k, v in sorted(mode_vals.items(), key=lambda kv: kv[0])}
+        except Exception as e:
+            res.success = False
+            res.errors.append(f"GRPOBuild rollout inspection failed: {type(e).__name__}: {e}")
+            return
+
+        res.artifacts["rollouts_sha256"] = hashlib.sha256(rollouts_jsonl.read_bytes()).hexdigest()
+        res.artifacts["grpo_phase4_mode"] = "real_vlm"
 
         # Evidence Check
         # rollouts produces traces but count might vary or be large
@@ -2330,7 +2400,25 @@ class GRPOTrain(Stage):
         if not _require_cmd_ok(res, cmd_res, "GRPOTrain", "GRPOTrain"):
             # CMD_FAILED already recorded by helper
             return
-        
+
+        required_outputs = {
+            "train_snapshot": l6_out / "train_snapshot.json",
+            "grpo_metrics_csv": l6_out / "grpo_metrics.csv",
+            "reward_curve_csv": l6_out / "reward_curve.csv",
+            "policy_delta_csv": l6_out / "policy_delta.csv",
+            "reward_audit_json": l6_out / "reward_audit.json",
+            "reward_events_jsonl": l6_out / "reward_events.jsonl",
+        }
+        missing = [k for k, p in required_outputs.items() if (not p.exists())]
+        if missing:
+            res.success = False
+            res.errors.append(f"GRPOTrain missing required artifacts: {','.join(missing)}")
+            return
+        for k, p in required_outputs.items():
+            if p.exists() and p.is_file():
+                res.artifacts[f"{k}_sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
+                res.artifacts[f"{k}_bytes"] = int(p.stat().st_size)
+
         snap_path = l6_out / "train_snapshot.json"
         if snap_path.exists():
             snap = json.loads(snap_path.read_text(encoding="utf-8"))
@@ -2338,6 +2426,17 @@ class GRPOTrain(Stage):
             res.artifacts["snapshot_hash"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
             res.artifacts["reward_audit"] = snap.get("reward_audit_check", "FAIL")
             if "lora_param_abs_delta" in snap: res.artifacts["lora_delta"] = snap["lora_param_abs_delta"]
+        reward_audit_path = l6_out / "reward_audit.json"
+        if reward_audit_path.exists():
+            try:
+                ra = json.loads(reward_audit_path.read_text(encoding="utf-8"))
+                res.artifacts["reward_audit_check_file"] = str(ra.get("reward_audit_check") or "")
+                if not bool(ra.get("real_phase4", False)):
+                    res.success = False
+                    res.errors.append("GRPOTrain reward_audit.json indicates real_phase4=false.")
+                    return
+            except Exception:
+                res.artifacts["reward_audit_check_file"] = "PARSE_ERROR"
 
         # Evidence Check
         ev10t_zip, ev10t_note, ev10t_found = resolve_evidence_zip(ev_10_train)
