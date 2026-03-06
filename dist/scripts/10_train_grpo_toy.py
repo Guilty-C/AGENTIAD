@@ -1979,8 +1979,6 @@ def main() -> int:
                 out_nt.append(int(end_i - start_i))
         return out_lps, out_nt
 
-    import os
-
     if str(os.environ.get("GRPO_TOY_LOGPROB_SELFTEST", "")).strip() == "1":
         def _logprob_of_output_single_ref(prompt_text: str, output_text: str) -> Tuple["torch.Tensor", int]:
             full_text = str(prompt_text) + str(output_text)
