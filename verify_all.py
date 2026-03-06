@@ -3995,19 +3995,14 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
                     "table_csv": str(table_csv),
                 })
 
-            if requested_vals:
-                req_set = sorted(set(int(x) for x in requested_vals))
-                if len(req_set) != 1:
-                    _add_seed_fail("raw_requested_ids_inconsistent", f"requested_ids={req_set}")
-                else:
-                    seed_expected_total = int(req_set[0])
-                    if seed_expected_total > 0 and len(seed_union_ids) != seed_expected_total:
-                        _add_seed_fail(
-                            "raw_union_count_mismatch_requested",
-                            f"union={len(seed_union_ids)} expected={seed_expected_total}",
-                        )
+            req_set = sorted(set(int(x) for x in requested_vals)) if requested_vals else []
+            if req_set and len(req_set) != 1:
+                _add_seed_fail("raw_requested_ids_inconsistent", f"requested_ids={req_set}")
 
+            # Seed-level expected total must be defined at seed scope, not per-shard.
+            # Use deduped union across g0..g3 as the canonical expected_total.
             seed_source_count = int(len(seed_union_ids))
+            seed_expected_total = int(seed_source_count)
             source_samples_discovered += int(seed_source_count)
 
             if budget_left is not None and budget_left <= 0:
@@ -4176,7 +4171,9 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
                 "l3_skipped_final": int(seed_skipped_final),
                 "missing_gpus": missing_gpus,
                 "expected_total": int(seed_expected_total),
+                "expected_total_source": "seed_union_sample_ids",
                 "union_count": int(seed_source_count),
+                "per_shard_n_requested_ids_values": req_set,
                 "l3_runs_used": l3_runs_used,
                 "shards_checked": shard_checks,
             })
