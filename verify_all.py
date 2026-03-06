@@ -3482,12 +3482,12 @@ def _audit_exported_sample(item: Dict[str, Any], paper_contract: Any) -> Dict[st
                     except Exception:
                         final_contract_ok = False
 
-    loss_mask_ready = bool(has_final_answer and final_has_explicit_cot and bool(last_tool_call_name))
+    # CoT supervision is optional unless it is explicitly trace-derived.
+    # Primary readiness target for current export is final <answer> + last tool call.
+    loss_mask_ready = bool(has_final_answer and bool(last_tool_call_name))
     loss_mask_reasons: List[str] = []
     if not has_final_answer:
         loss_mask_reasons.append("missing_final_answer_message")
-    if not final_has_explicit_cot:
-        loss_mask_reasons.append("missing_explicit_final_cot_marker")
     if not last_tool_call_name:
         loss_mask_reasons.append("missing_tool_call_for_last_tool_supervision")
 
@@ -3502,8 +3502,10 @@ def _audit_exported_sample(item: Dict[str, Any], paper_contract: Any) -> Dict[st
         "has_tool_result": has_tool_result,
         "has_final_answer": has_final_answer,
         "final_answer_contract_ok": final_contract_ok,
+        "final_has_explicit_cot": final_has_explicit_cot,
         "last_tool_call_name": last_tool_call_name,
-        "loss_mask_ready_final_cot_plus_last_tool_call": loss_mask_ready,
+        "loss_mask_ready_answer_plus_last_tool_call": loss_mask_ready,
+        "loss_mask_ready_final_cot_plus_last_tool_call": bool(loss_mask_ready and final_has_explicit_cot),
         "loss_mask_not_ready_reasons": loss_mask_reasons,
     }
 
@@ -4257,7 +4259,8 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
         "final_answer_contract_ok": int(sum(1 for x in content_audits if x.get("final_answer_contract_ok"))),
     }
     pzcr_counter = Counter(str(x.get("trajectory_type") or "UNKNOWN") for x in content_audits)
-    loss_mask_ready_count = int(sum(1 for x in content_audits if x.get("loss_mask_ready_final_cot_plus_last_tool_call")))
+    loss_mask_ready_count = int(sum(1 for x in content_audits if x.get("loss_mask_ready_answer_plus_last_tool_call")))
+    loss_mask_ready_with_cot_count = int(sum(1 for x in content_audits if x.get("loss_mask_ready_final_cot_plus_last_tool_call")))
     loss_mask_reason_counter: Counter = Counter()
     for x in content_audits:
         for r in x.get("loss_mask_not_ready_reasons", []) or []:
@@ -4314,9 +4317,10 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
         "content_audit_inspected_samples": content_audits,
         "split_definition_audit": split_definition_audit,
         "loss_mask_readiness_audit": {
-            "target_policy": "only_final_cot_plus_last_tool_call",
+            "target_policy": "answer_plus_last_tool_call; explicit_final_cot_optional_and_trace_derived_only",
             "ready_count": int(loss_mask_ready_count),
             "inspected_sample_count": int(len(content_audits)),
+            "ready_with_explicit_final_cot_count": int(loss_mask_ready_with_cot_count),
             "not_ready_reason_counts": {k: int(v) for k, v in sorted(loss_mask_reason_counter.items(), key=lambda kv: kv[0])},
         },
     }
@@ -4361,10 +4365,11 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
         },
         "split_definition_audit": split_definition_audit,
         "loss_mask_readiness_audit": {
-            "target_policy": "only_final_cot_plus_last_tool_call",
+            "target_policy": "answer_plus_last_tool_call; explicit_final_cot_optional_and_trace_derived_only",
             "inspected_sample_count": int(len(content_audits)),
             "ready_count": int(loss_mask_ready_count),
             "ready_all_inspected": bool(loss_mask_ready_count == len(content_audits) if content_audits else False),
+            "ready_with_explicit_final_cot_count": int(loss_mask_ready_with_cot_count),
             "not_ready_reason_counts": {k: int(v) for k, v in sorted(loss_mask_reason_counter.items(), key=lambda kv: kv[0])},
         },
         "hash_summary": hash_summary,
