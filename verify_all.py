@@ -17,8 +17,9 @@ from pathlib import Path
 import pathlib
 import re
 import csv
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Sequence, Set
+from typing import List, Dict, Any, Mapping, Optional, Sequence, Set, Tuple
 from contextlib import contextmanager
 
 # --- Configuration & Paths ---
@@ -2984,8 +2985,910 @@ def _parse_seeds_value(raw_seeds: Any) -> List[int]:
     return parsed
 
 
+def _hash_file_upper(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest().upper()
+    except Exception:
+        return ""
+
+
+def _write_jsonl_stable(path: Path, items: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps(dict(it), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _read_jsonl_dicts(path: Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not path.exists():
+        return out
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                out.append(obj)
+    except Exception:
+        return []
+    return out
+
+
+def _count_trace_files_in_zip(zip_path: Path) -> int:
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            return int(sum(1 for n in zf.namelist() if n.endswith("trace.json")))
+    except Exception:
+        return 0
+
+
+def _discover_phase2_seed_zips(input_root: Path) -> List[Tuple[int, Path]]:
+    out: List[Tuple[int, Path]] = []
+    for d in sorted(input_root.glob("seed_*"), key=lambda p: p.name):
+        if not d.is_dir():
+            continue
+        m = re.fullmatch(r"seed_(\d+)", d.name)
+        if not m:
+            continue
+        seed = int(m.group(1))
+        ev06 = d / "ev_06"
+        zip_path, _, _ = resolve_evidence_zip(ev06)
+        if zip_path is not None and zip_path.exists():
+            out.append((seed, zip_path.resolve()))
+    out.sort(key=lambda x: int(x[0]))
+    return out
+
+
+def _pick_trace_root_from_unzip(tmp_unzip: Path, seed: int) -> Optional[Path]:
+    cands: List[Path] = []
+
+    def _has_direct_sample_dirs(root: Path) -> bool:
+        try:
+            for child in sorted(root.iterdir(), key=lambda p: p.name):
+                if child.is_dir() and (child / "trace.json").exists():
+                    return True
+        except Exception:
+            return False
+        return False
+
+    traces_dir = tmp_unzip / "traces"
+    if traces_dir.exists() and traces_dir.is_dir():
+        if _has_direct_sample_dirs(traces_dir):
+            cands.append(traces_dir)
+        for child in sorted(traces_dir.iterdir(), key=lambda p: p.name):
+            if child.is_dir() and _has_direct_sample_dirs(child):
+                cands.append(child)
+
+    if _has_direct_sample_dirs(tmp_unzip):
+        cands.append(tmp_unzip)
+
+    if not cands:
+        for tr in sorted(tmp_unzip.rglob("trace.json"), key=lambda p: str(p)):
+            sample_dir = tr.parent
+            parent = sample_dir.parent
+            if _has_direct_sample_dirs(parent):
+                cands.append(parent)
+
+    uniq: List[Path] = []
+    seen: Set[str] = set()
+    for p in cands:
+        k = str(p.resolve())
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p.resolve())
+    if not uniq:
+        return None
+
+    seed_tag = f"s{int(seed)}"
+    uniq.sort(key=lambda p: (0 if seed_tag in p.name else 1, str(p)))
+    return uniq[0]
+
+
+def _parse_l3_build_metrics(cmd_res: Optional[CmdResult]) -> Dict[str, int]:
+    out = {
+        "N_total_candidates": 0,
+        "N_written": 0,
+        "skipped_trace": 0,
+        "skipped_final": 0,
+    }
+    if not cmd_res:
+        return out
+    merged = cmd_res.stderr if cmd_res.stderr else cmd_res.stdout
+    if not merged:
+        return out
+    text = merged.decode("utf-8", errors="replace")
+    for key in list(out.keys()):
+        m = re.search(rf"\b{re.escape(key)}=(\d+)\b", text)
+        if m:
+            out[key] = int(m.group(1))
+    return out
+
+
+def _load_paper_contract_cls_for_phase31():
+    try:
+        from agentiad_repro.paper_contract import PaperContract  # type: ignore
+        return PaperContract
+    except Exception:
+        return None
+
+
+def _validate_phase31_item(
+    item: Dict[str, Any],
+    *,
+    paper_contract: Any,
+    strict_contract: bool,
+) -> Tuple[bool, str, bool]:
+    if not isinstance(item, dict):
+        return False, "item_not_dict", False
+
+    if str(item.get("schema_version") or "") != "sft_trajectory_v1":
+        return False, "schema_version_invalid", False
+
+    messages = item.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False, "messages_missing", False
+
+    final_obj = item.get("final")
+    if not isinstance(final_obj, dict):
+        return False, "final_not_dict", False
+
+    schema_ok = False
+    if paper_contract is not None:
+        try:
+            schema_ok, _ = paper_contract.validate_schema(final_obj)
+        except Exception:
+            schema_ok = False
+    else:
+        schema_ok = all(k in final_obj for k in ("anomaly_present", "top_anomaly", "visual_descriptions"))
+    if not schema_ok:
+        return False, "final_schema_invalid", False
+
+    last_msg = messages[-1] if messages else None
+    if not isinstance(last_msg, dict):
+        return False, "last_message_invalid", True
+    if str(last_msg.get("role") or "") != "assistant" or str(last_msg.get("name") or "") != "final":
+        return False, "last_message_not_final_assistant", True
+    last_content = last_msg.get("content")
+    if not isinstance(last_content, str):
+        return False, "final_message_content_not_str", True
+
+    if paper_contract is not None:
+        try:
+            answer_xml = paper_contract.extract_answer_xml(last_content)
+            if answer_xml is None:
+                return False, "final_message_missing_answer_xml", True
+            ans_obj = json.loads(answer_xml)
+            if not isinstance(ans_obj, dict):
+                return False, "final_message_answer_not_dict", True
+            ans_ok, _ = paper_contract.validate_schema(ans_obj)
+            if not ans_ok:
+                return False, "final_message_schema_invalid", True
+        except Exception:
+            return False, "final_message_parse_error", True
+
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role") or "") != "assistant":
+            continue
+        tc = msg.get("tool_call")
+        if tc is None:
+            continue
+        if not isinstance(tc, dict):
+            return False, "tool_call_not_dict", True
+        tc_name = str(tc.get("name") or "").strip()
+        if not tc_name:
+            return False, "tool_call_name_missing", True
+        if paper_contract is not None:
+            ok_tc, _ = paper_contract.validate_tool_call(tc)
+            if not ok_tc:
+                return False, "tool_call_schema_invalid", True
+        if strict_contract:
+            if idx + 1 >= len(messages):
+                return False, "tool_call_without_tool_result", True
+            nxt = messages[idx + 1]
+            if not isinstance(nxt, dict) or str(nxt.get("role") or "") != "tool":
+                return False, "tool_call_not_followed_by_tool_role", True
+
+    return True, "", True
+
+
+def _stable_split_bucket(sample_id: str, traj_hash: str) -> str:
+    key = f"{sample_id}|{traj_hash}"
+    hv = int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16)
+    return "val" if (hv % 10 == 0) else "train"
+
+
+def _tool_names_from_messages(messages: Sequence[Any]) -> List[str]:
+    names: List[str] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if str(m.get("role") or "") != "assistant":
+            continue
+        tc = m.get("tool_call")
+        if not isinstance(tc, dict):
+            continue
+        nm = str(tc.get("name") or "").strip()
+        if nm:
+            names.append(nm)
+    return names
+
+
+def _classify_pzcr(tool_names: Sequence[str]) -> str:
+    s = set(str(x) for x in tool_names)
+    has_pz = "crop_image_normalized" in s
+    has_cr = "query_image" in s
+    if has_pz and has_cr:
+        return "PZ+CR"
+    if has_pz and not has_cr:
+        return "PZ-only"
+    if (not has_pz) and has_cr:
+        return "CR-only"
+    return "NoTool"
+
+
+def _audit_exported_sample(item: Dict[str, Any], paper_contract: Any) -> Dict[str, Any]:
+    sample_id = str(item.get("sample_id") or "")
+    msgs_any = item.get("messages")
+    messages = msgs_any if isinstance(msgs_any, list) else []
+    tool_names = _tool_names_from_messages(messages)
+    pzcr_type = _classify_pzcr(tool_names)
+
+    has_system_prompt = any(isinstance(m, dict) and str(m.get("role") or "") == "system" for m in messages)
+    has_user_prompt = any(isinstance(m, dict) and str(m.get("role") or "") == "user" for m in messages)
+    has_assistant_tool_call = any(
+        isinstance(m, dict) and str(m.get("role") or "") == "assistant" and isinstance(m.get("tool_call"), dict)
+        for m in messages
+    )
+    has_tool_result = any(isinstance(m, dict) and str(m.get("role") or "") == "tool" for m in messages)
+
+    has_assistant_reasoning = False
+    has_final_answer = False
+    final_contract_ok = False
+    final_has_explicit_cot = False
+    last_tool_call_name = ""
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if str(m.get("role") or "") == "assistant":
+            tc = m.get("tool_call")
+            if isinstance(tc, dict):
+                nm = str(tc.get("name") or "").strip()
+                if nm:
+                    last_tool_call_name = nm
+            content = m.get("content")
+            if isinstance(content, str):
+                s = content.strip()
+                if "<think>" in s or ("<answer>" in s and "</answer>" in s and "<think>" in s):
+                    final_has_explicit_cot = True
+                if str(m.get("name") or "") != "final":
+                    if "<think>" in s or not (s.startswith("<answer>") and s.endswith("</answer>")):
+                        has_assistant_reasoning = True
+
+    if messages:
+        last = messages[-1]
+        if isinstance(last, dict) and str(last.get("role") or "") == "assistant" and str(last.get("name") or "") == "final":
+            content = last.get("content")
+            if isinstance(content, str):
+                has_final_answer = True
+                if paper_contract is not None:
+                    try:
+                        answer_xml = paper_contract.extract_answer_xml(content)
+                        if answer_xml is not None:
+                            ans_obj = json.loads(answer_xml)
+                            if isinstance(ans_obj, dict):
+                                ok, _ = paper_contract.validate_schema(ans_obj)
+                                final_contract_ok = bool(ok)
+                    except Exception:
+                        final_contract_ok = False
+
+    loss_mask_ready = bool(has_final_answer and final_has_explicit_cot and bool(last_tool_call_name))
+    loss_mask_reasons: List[str] = []
+    if not has_final_answer:
+        loss_mask_reasons.append("missing_final_answer_message")
+    if not final_has_explicit_cot:
+        loss_mask_reasons.append("missing_explicit_final_cot_marker")
+    if not last_tool_call_name:
+        loss_mask_reasons.append("missing_tool_call_for_last_tool_supervision")
+
+    return {
+        "sample_id": sample_id,
+        "tool_names": tool_names,
+        "trajectory_type": pzcr_type,
+        "has_system_prompt": has_system_prompt,
+        "has_user_prompt": has_user_prompt,
+        "has_assistant_reasoning": has_assistant_reasoning,
+        "has_assistant_tool_call": has_assistant_tool_call,
+        "has_tool_result": has_tool_result,
+        "has_final_answer": has_final_answer,
+        "final_answer_contract_ok": final_contract_ok,
+        "last_tool_call_name": last_tool_call_name,
+        "loss_mask_ready_final_cot_plus_last_tool_call": loss_mask_ready,
+        "loss_mask_not_ready_reasons": loss_mask_reasons,
+    }
+
+
+def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_overrides: Dict[str, str]) -> Dict[str, Any]:
+    artifacts: Dict[str, Any] = {
+        "allow_flags_used": False,
+        "allow_flags_violation": False,
+        "evidence_checks": [],
+        "gates_na": {},
+    }
+    errors: List[str] = []
+    remediations: List[str] = []
+    measurements: Dict[str, Any] = {"evidence_check_sec": 0.0}
+    gates: Dict[str, bool] = {"P3_1": True}
+
+    input_dir_raw = str(getattr(args, "input_dir", "") or "").strip()
+    if not input_dir_raw:
+        return {
+            "success": False,
+            "gates": {"P3_1": False},
+            "artifacts": artifacts,
+            "errors": ["build_sft_traj requires --input-dir pointing to a Phase2 output root."],
+            "measurements": measurements,
+            "remediations": ["Use --input-dir <phase2_output_root> and --output-dir <phase3_output_root>."],
+        }
+
+    input_root = Path(input_dir_raw).resolve()
+    if not input_root.exists() or not input_root.is_dir():
+        return {
+            "success": False,
+            "gates": {"P3_1": False},
+            "artifacts": artifacts,
+            "errors": [f"input_dir not found or not a directory: {input_root}"],
+            "measurements": measurements,
+            "remediations": ["Pass a valid Phase2 output directory containing seed_*/ev_06/evidence_package.zip."],
+        }
+
+    if input_root == work_dir.resolve():
+        return {
+            "success": False,
+            "gates": {"P3_1": False},
+            "artifacts": artifacts,
+            "errors": ["output_dir must differ from input_dir to avoid destructive cleanup."],
+            "measurements": measurements,
+            "remediations": ["Use distinct directories for --input-dir and --output-dir."],
+        }
+
+    if args.max_samples is not None and int(args.max_samples) <= 0:
+        return {
+            "success": False,
+            "gates": {"P3_1": False},
+            "artifacts": artifacts,
+            "errors": [f"invalid --max-samples={args.max_samples}; must be > 0"],
+            "measurements": measurements,
+            "remediations": ["Use --max-samples N where N>=1, or omit it."],
+        }
+
+    try:
+        _cleanup_work_dir_preserve_logs(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return {
+            "success": False,
+            "gates": {"P3_1": False},
+            "artifacts": artifacts,
+            "errors": [f"Workload cleanup failed for output_dir: {e}"],
+            "measurements": measurements,
+            "remediations": ["Choose a writable output_dir under dist/outputs or outputs."],
+        }
+
+    discovered = _discover_phase2_seed_zips(input_root)
+    if not discovered:
+        return {
+            "success": False,
+            "gates": {"P3_1": False},
+            "artifacts": artifacts,
+            "errors": [f"No Phase2 evidence zips discovered under {input_root}."],
+            "measurements": measurements,
+            "remediations": ["Expected layout: seed_<N>/ev_06/evidence_package.zip"],
+        }
+
+    seeds_provided = bool(getattr(args, "seeds_provided", False))
+    seed_filter: Set[int] = set(int(x) for x in (args.seeds or [])) if seeds_provided else set()
+    if seeds_provided:
+        selected = [(s, z) for (s, z) in discovered if s in seed_filter]
+    else:
+        selected = list(discovered)
+    selected.sort(key=lambda x: int(x[0]))
+    artifacts["phase2_input_dir"] = str(input_root)
+    artifacts["phase2_seeds_discovered"] = [int(s) for s, _ in discovered]
+    artifacts["phase2_seeds_selected"] = [int(s) for s, _ in selected]
+    artifacts["phase2_seed_filter_applied"] = bool(seeds_provided)
+    if not selected:
+        return {
+            "success": False,
+            "gates": {"P3_1": False},
+            "artifacts": artifacts,
+            "errors": [f"No selected seeds found in input_dir for filter={sorted(seed_filter)}"],
+            "measurements": measurements,
+            "remediations": [f"Available seeds: {[s for s, _ in discovered]}"],
+        }
+
+    cfg_path = input_root / "mr_config.yaml"
+    cfg_source = "phase2_input_root"
+    if not cfg_path.exists():
+        cfg_path = PROJECT_ROOT / "configs" / "agent_pzcr.yaml"
+        cfg_source = "repo_default_config"
+    if not cfg_path.exists():
+        return {
+            "success": False,
+            "gates": {"P3_1": False},
+            "artifacts": artifacts,
+            "errors": [f"Unable to resolve config file for L3 builder under {input_root} or {PROJECT_ROOT / 'configs' / 'agent_pzcr.yaml'}"],
+            "measurements": measurements,
+            "remediations": ["Ensure mr_config.yaml exists under the Phase2 output root."],
+        }
+    artifacts["phase3_config_path"] = str(cfg_path.resolve())
+    artifacts["phase3_config_source"] = cfg_source
+
+    paper_contract = _load_paper_contract_cls_for_phase31()
+    strict_contract = bool(getattr(args, "strict_contract", False))
+    if paper_contract is None:
+        errors.append("PaperContract import unavailable; fallback validation used.")
+
+    source_zip_hashes: Dict[str, str] = {}
+    per_seed_rows: List[Dict[str, Any]] = []
+    reject_reasons: Counter = Counter()
+    validation_examples: Dict[str, List[str]] = {}
+    all_valid_items: List[Dict[str, Any]] = []
+    schema_pass_count = 0
+    source_samples_discovered = 0
+    source_samples_selected_cap = 0
+    budget_left: Optional[int] = int(args.max_samples) if args.max_samples is not None else None
+    tmp_root = work_dir / "_tmp_phase3_unzip"
+    if tmp_root.exists():
+        shutil.rmtree(tmp_root, ignore_errors=True)
+    tmp_root.mkdir(parents=True, exist_ok=True)
+
+    for seed, ev06_zip in selected:
+        trace_count = _count_trace_files_in_zip(ev06_zip)
+        source_samples_discovered += int(trace_count)
+        source_zip_hashes[f"seed_{int(seed)}"] = _hash_file_upper(ev06_zip)
+
+        if budget_left is not None and budget_left <= 0:
+            reject_reasons["max_samples_cap"] += int(trace_count)
+            per_seed_rows.append({
+                "seed": int(seed),
+                "source_trace_count": int(trace_count),
+                "selected_for_conversion": 0,
+                "l3_written": 0,
+                "validated_ok": 0,
+                "validated_rejected": 0,
+                "note": "max_samples_cap",
+            })
+            continue
+
+        selected_for_seed = int(trace_count) if budget_left is None else min(int(trace_count), int(budget_left))
+        source_samples_selected_cap += selected_for_seed
+
+        code, msg, dur = Evidence.verify_zip(ev06_zip, "06_run_agentiad_infer.py", expected_trace_count=None)
+        measurements["evidence_check_sec"] = float(measurements.get("evidence_check_sec", 0.0)) + float(dur)
+        artifacts["evidence_checks"].append({
+            "stage": f"S{seed}-06-src",
+            "stable_stage": "Phase31SourceZip",
+            "label": f"S{seed}-06-src",
+            "code": code,
+            "msg": msg,
+        })
+        if code != "OK":
+            reject_reasons["source_zip_verify_failed"] += selected_for_seed
+            if strict_contract:
+                errors.append(f"S{seed} source zip verify failed: {msg}")
+            per_seed_rows.append({
+                "seed": int(seed),
+                "source_trace_count": int(trace_count),
+                "selected_for_conversion": selected_for_seed,
+                "l3_written": 0,
+                "validated_ok": 0,
+                "validated_rejected": selected_for_seed,
+                "note": f"source_zip_verify_failed:{code}",
+            })
+            if budget_left is not None:
+                budget_left = max(0, int(budget_left) - selected_for_seed)
+            continue
+
+        tmp_seed = tmp_root / f"seed_{int(seed)}"
+        if tmp_seed.exists():
+            shutil.rmtree(tmp_seed, ignore_errors=True)
+        tmp_seed.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(ev06_zip, "r") as zf:
+                zf.extractall(tmp_seed)
+        except Exception as e:
+            reject_reasons["source_unzip_failed"] += selected_for_seed
+            if strict_contract:
+                errors.append(f"S{seed} unzip failed: {e}")
+            per_seed_rows.append({
+                "seed": int(seed),
+                "source_trace_count": int(trace_count),
+                "selected_for_conversion": selected_for_seed,
+                "l3_written": 0,
+                "validated_ok": 0,
+                "validated_rejected": selected_for_seed,
+                "note": "source_unzip_failed",
+            })
+            if budget_left is not None:
+                budget_left = max(0, int(budget_left) - selected_for_seed)
+            continue
+
+        trace_root = _pick_trace_root_from_unzip(tmp_seed, int(seed))
+        if trace_root is None:
+            reject_reasons["trace_root_not_found"] += selected_for_seed
+            if strict_contract:
+                errors.append(f"S{seed} trace root not found after unzip.")
+            per_seed_rows.append({
+                "seed": int(seed),
+                "source_trace_count": int(trace_count),
+                "selected_for_conversion": selected_for_seed,
+                "l3_written": 0,
+                "validated_ok": 0,
+                "validated_rejected": selected_for_seed,
+                "note": "trace_root_not_found",
+            })
+            if budget_left is not None:
+                budget_left = max(0, int(budget_left) - selected_for_seed)
+            continue
+
+        seed_out = work_dir / f"seed_{int(seed)}"
+        seed_out.mkdir(parents=True, exist_ok=True)
+        l3_raw_jsonl = seed_out / "l3_raw.jsonl"
+        ev08 = seed_out / "ev_08"
+        run_name = trace_root.name
+        trace_dir_for_l3 = trace_root.parent if trace_root.parent != trace_root else trace_root
+        builder = (
+            CmdBuilder(L3_SCRIPT)
+            .with_config(cfg_path)
+            .with_run_name(run_name)
+            .with_trace_dir(trace_dir_for_l3)
+            .with_out_jsonl(l3_raw_jsonl)
+            .with_evidence_dir(ev08)
+            .flag("--allow_skip", True)
+        )
+        if budget_left is not None:
+            builder.arg("--max_samples", int(budget_left))
+        cmd = builder.build()
+        cmd_res = CmdRunner.run(cmd, env_overrides, stream_output=True)
+        if not _require_cmd_ok(
+            StageResult(success=True, artifacts={"evidence_checks": []}),
+            cmd_res,
+            f"S{seed}-08",
+            "BuildTraj08",
+            record_cmd_failed=False,
+        ):
+            reject_reasons["l3_builder_failed"] += selected_for_seed
+            errors.append(f"S{seed}-08 build command failed")
+            per_seed_rows.append({
+                "seed": int(seed),
+                "source_trace_count": int(trace_count),
+                "selected_for_conversion": selected_for_seed,
+                "l3_written": 0,
+                "validated_ok": 0,
+                "validated_rejected": selected_for_seed,
+                "note": "l3_builder_failed",
+            })
+            if budget_left is not None:
+                budget_left = max(0, int(budget_left) - selected_for_seed)
+            continue
+
+        l3_metrics = _parse_l3_build_metrics(cmd_res)
+        reject_reasons["l3_skipped_trace"] += int(l3_metrics.get("skipped_trace", 0))
+        reject_reasons["l3_skipped_final"] += int(l3_metrics.get("skipped_final", 0))
+
+        ev08_zip, ev08_note, ev08_found = resolve_evidence_zip(ev08)
+        if ev08_zip is None:
+            artifacts["evidence_checks"].append({
+                "stage": f"S{seed}-08",
+                "stable_stage": "BuildTraj08",
+                "label": f"S{seed}-08",
+                "code": "MISSING_ZIP",
+                "msg": f"Missing zip: expected evidence_package.zip in {ev08}; found {ev08_found}",
+            })
+            if strict_contract:
+                errors.append(f"S{seed}-08 evidence zip missing.")
+        else:
+            code08, msg08, dur08 = Evidence.verify_zip(ev08_zip, "08_build_sft_trajectories.py", expected_trace_count=None)
+            measurements["evidence_check_sec"] = float(measurements.get("evidence_check_sec", 0.0)) + float(dur08)
+            if ev08_note:
+                msg08 = f"{msg08} ({ev08_note})"
+            artifacts["evidence_checks"].append({
+                "stage": f"S{seed}-08",
+                "stable_stage": "BuildTraj08",
+                "label": f"S{seed}-08",
+                "code": code08,
+                "msg": msg08,
+            })
+            if strict_contract and code08 != "OK":
+                errors.append(f"S{seed}-08 evidence verify failed: {msg08}")
+
+        raw_items = _read_jsonl_dicts(l3_raw_jsonl)
+        if budget_left is not None and len(raw_items) > int(budget_left):
+            extra = len(raw_items) - int(budget_left)
+            reject_reasons["max_samples_cap"] += int(extra)
+            raw_items = raw_items[: int(budget_left)]
+        if budget_left is not None:
+            budget_left = max(0, int(budget_left) - len(raw_items))
+
+        raw_items.sort(key=lambda it: str(it.get("sample_id") or ""))
+        valid_this_seed = 0
+        rejected_this_seed = 0
+        for it in raw_items:
+            ok, reason, schema_ok = _validate_phase31_item(
+                it,
+                paper_contract=paper_contract,
+                strict_contract=strict_contract,
+            )
+            if schema_ok:
+                schema_pass_count += 1
+            if not ok:
+                rejected_this_seed += 1
+                reject_reasons[reason] += 1
+                sid = str(it.get("sample_id") or "")
+                arr = validation_examples.setdefault(reason, [])
+                if sid and len(arr) < 10:
+                    arr.append(f"seed={int(seed)} sample_id={sid}")
+                continue
+            row = dict(it)
+            row["_phase2_seed"] = int(seed)
+            all_valid_items.append(row)
+            valid_this_seed += 1
+
+        per_seed_rows.append({
+            "seed": int(seed),
+            "source_trace_count": int(trace_count),
+            "selected_for_conversion": selected_for_seed,
+            "l3_written": int(len(raw_items)),
+            "validated_ok": int(valid_this_seed),
+            "validated_rejected": int(rejected_this_seed),
+            "l3_skipped_trace": int(l3_metrics.get("skipped_trace", 0)),
+            "l3_skipped_final": int(l3_metrics.get("skipped_final", 0)),
+            "trace_root": str(trace_root),
+        })
+
+    if tmp_root.exists():
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+    all_valid_items.sort(
+        key=lambda it: (
+            int(it.get("_phase2_seed", 0)),
+            str(it.get("sample_id") or ""),
+            str(it.get("trajectory_fingerprint_hash") or ""),
+        )
+    )
+
+    dedup_items: List[Dict[str, Any]] = []
+    seen_keys: Set[Tuple[int, str]] = set()
+    for it in all_valid_items:
+        seed = int(it.get("_phase2_seed", 0))
+        sid = str(it.get("sample_id") or "")
+        k = (seed, sid)
+        if k in seen_keys:
+            reject_reasons["duplicate_seed_sample"] += 1
+            continue
+        seen_keys.add(k)
+        dedup_items.append(it)
+    all_valid_items = dedup_items
+
+    tool_counter: Counter = Counter()
+    samples_with_tool = 0
+    train_items: List[Dict[str, Any]] = []
+    val_items: List[Dict[str, Any]] = []
+    traj_hashes: List[str] = []
+    for it in all_valid_items:
+        msgs_any = it.get("messages")
+        msgs = msgs_any if isinstance(msgs_any, list) else []
+        cur_tools = 0
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("role") or "") != "assistant":
+                continue
+            tc = m.get("tool_call")
+            if not isinstance(tc, dict):
+                continue
+            name = str(tc.get("name") or "").strip() or "unknown"
+            tool_counter[name] += 1
+            cur_tools += 1
+        if cur_tools > 0:
+            samples_with_tool += 1
+
+        cleaned = dict(it)
+        cleaned.pop("_phase2_seed", None)
+        sample_id = str(cleaned.get("sample_id") or "")
+        traj_hash = str(cleaned.get("trajectory_fingerprint_hash") or "")
+        if traj_hash:
+            traj_hashes.append(traj_hash)
+        bucket = _stable_split_bucket(sample_id, traj_hash)
+        if bucket == "val":
+            val_items.append(cleaned)
+        else:
+            train_items.append(cleaned)
+
+    all_items_clean = [*train_items, *val_items]
+    all_jsonl = work_dir / "trajectories_sft.jsonl"
+    train_jsonl = work_dir / "train.jsonl"
+    val_jsonl = work_dir / "val.jsonl"
+    _write_jsonl_stable(all_jsonl, all_items_clean)
+    _write_jsonl_stable(train_jsonl, train_items)
+    _write_jsonl_stable(val_jsonl, val_items)
+
+    inspected_samples = list(all_items_clean[:3])
+    content_audits = [_audit_exported_sample(it, paper_contract) for it in inspected_samples]
+    presence_totals = {
+        "has_system_prompt": int(sum(1 for x in content_audits if x.get("has_system_prompt"))),
+        "has_user_prompt": int(sum(1 for x in content_audits if x.get("has_user_prompt"))),
+        "has_assistant_reasoning": int(sum(1 for x in content_audits if x.get("has_assistant_reasoning"))),
+        "has_assistant_tool_call": int(sum(1 for x in content_audits if x.get("has_assistant_tool_call"))),
+        "has_tool_result": int(sum(1 for x in content_audits if x.get("has_tool_result"))),
+        "has_final_answer": int(sum(1 for x in content_audits if x.get("has_final_answer"))),
+        "final_answer_contract_ok": int(sum(1 for x in content_audits if x.get("final_answer_contract_ok"))),
+    }
+    pzcr_counter = Counter(str(x.get("trajectory_type") or "UNKNOWN") for x in content_audits)
+    loss_mask_ready_count = int(sum(1 for x in content_audits if x.get("loss_mask_ready_final_cot_plus_last_tool_call")))
+    loss_mask_reason_counter: Counter = Counter()
+    for x in content_audits:
+        for r in x.get("loss_mask_not_ready_reasons", []) or []:
+            loss_mask_reason_counter[str(r)] += 1
+    split_definition_audit = {
+        "policy": "val if sha256(sample_id|trajectory_fingerprint_hash)%10==0 else train",
+        "implementation_source": "verify_all.py::_stable_split_bucket",
+        "matches_existing_project_or_frozen_split_definition": "UNPROVEN",
+        "note": "No explicit frozen Phase3 split spec was found in repository files during this implementation.",
+    }
+
+    cfg_sha = _hash_file_upper(cfg_path)
+    source_hash_agg = hashlib.sha256(
+        json.dumps(source_zip_hashes, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest().upper()
+    traj_hash_agg = hashlib.sha256("\n".join(sorted(traj_hashes)).encode("utf-8")).hexdigest().upper()
+    hash_summary = {
+        "config_file_sha256": cfg_sha,
+        "source_phase2_zip_sha256_by_seed": dict(sorted(source_zip_hashes.items(), key=lambda kv: kv[0])),
+        "source_phase2_zip_sha256_aggregate": source_hash_agg,
+        "trajectory_fingerprint_hash_aggregate": traj_hash_agg,
+        "trajectories_sft_jsonl_sha256": _hash_file_upper(all_jsonl),
+        "train_jsonl_sha256": _hash_file_upper(train_jsonl),
+        "val_jsonl_sha256": _hash_file_upper(val_jsonl),
+    }
+
+    rejected_total = int(sum(int(v) for v in reject_reasons.values()))
+    not_converted = int(source_samples_selected_cap - len(all_valid_items))
+    if rejected_total < not_converted:
+        reject_reasons["unaccounted_not_converted"] += int(not_converted - rejected_total)
+        rejected_total = int(sum(int(v) for v in reject_reasons.values()))
+
+    validation_report = {
+        "source_samples_discovered": int(source_samples_discovered),
+        "source_samples_selected_for_conversion": int(source_samples_selected_cap),
+        "converted_samples": int(len(all_valid_items)),
+        "rejected_or_skipped_total": int(rejected_total),
+        "rejected_or_skipped_reasons": {k: int(v) for k, v in sorted(reject_reasons.items(), key=lambda kv: kv[0])},
+        "schema_pass_count": int(schema_pass_count),
+        "validation_examples": {k: v for k, v in sorted(validation_examples.items(), key=lambda kv: kv[0])},
+        "strict_contract": bool(strict_contract),
+        "content_audit_inspected_samples": content_audits,
+        "split_definition_audit": split_definition_audit,
+        "loss_mask_readiness_audit": {
+            "target_policy": "only_final_cot_plus_last_tool_call",
+            "ready_count": int(loss_mask_ready_count),
+            "inspected_sample_count": int(len(content_audits)),
+            "not_ready_reason_counts": {k: int(v) for k, v in sorted(loss_mask_reason_counter.items(), key=lambda kv: kv[0])},
+        },
+    }
+    validation_path = work_dir / "validation_results.json"
+    validation_path.write_text(json.dumps(validation_report, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    summary = {
+        "phase": "3.1",
+        "mode": "build_sft_traj",
+        "status": "PASS",
+        "strict_contract": bool(strict_contract),
+        "input_dir": str(input_root),
+        "output_dir": str(work_dir),
+        "seeds_selected": [int(s) for s, _ in selected],
+        "source_samples_discovered": int(source_samples_discovered),
+        "source_samples_selected_for_conversion": int(source_samples_selected_cap),
+        "converted_samples": int(len(all_valid_items)),
+        "rejected_or_skipped_total": int(rejected_total),
+        "rejected_or_skipped_reasons": {k: int(v) for k, v in sorted(reject_reasons.items(), key=lambda kv: kv[0])},
+        "schema_pass_count": int(schema_pass_count),
+        "per_tool_usage": {
+            "total_tool_calls": int(sum(tool_counter.values())),
+            "samples_with_tool_calls": int(samples_with_tool),
+            "per_tool": {k: int(v) for k, v in sorted(tool_counter.items(), key=lambda kv: kv[0])},
+        },
+        "split_counts": {
+            "train": int(len(train_items)),
+            "val": int(len(val_items)),
+        },
+        "content_audit": {
+            "inspected_sample_count": int(len(content_audits)),
+            "inspected_samples": content_audits,
+            "presence_totals": presence_totals,
+        },
+        "pz_cr_audit": {
+            "inspected_sample_count": int(len(content_audits)),
+            "counts": {k: int(v) for k, v in sorted(pzcr_counter.items(), key=lambda kv: kv[0])},
+        },
+        "split_definition_audit": split_definition_audit,
+        "loss_mask_readiness_audit": {
+            "target_policy": "only_final_cot_plus_last_tool_call",
+            "inspected_sample_count": int(len(content_audits)),
+            "ready_count": int(loss_mask_ready_count),
+            "ready_all_inspected": bool(loss_mask_ready_count == len(content_audits) if content_audits else False),
+            "not_ready_reason_counts": {k: int(v) for k, v in sorted(loss_mask_reason_counter.items(), key=lambda kv: kv[0])},
+        },
+        "hash_summary": hash_summary,
+        "artifacts": {
+            "trajectories_sft_jsonl": str(all_jsonl),
+            "train_jsonl": str(train_jsonl),
+            "val_jsonl": str(val_jsonl),
+            "validation_results_json": str(validation_path),
+        },
+        "per_seed": per_seed_rows,
+    }
+
+    if len(all_valid_items) == 0:
+        summary["status"] = "FAIL"
+        errors.append("No valid SFT trajectories were produced.")
+        remediations.append("Check Phase2 evidence zips and L3 conversion logs per seed under output_dir/seed_*/.")
+
+    if strict_contract and rejected_total > 0:
+        summary["status"] = "FAIL"
+        errors.append(
+            f"strict-contract enabled: rejected_or_skipped_total={rejected_total} must be 0."
+        )
+        remediations.append("Fix invalid/partial traces in Phase2 outputs or rerun Phase2 for affected seeds.")
+
+    summary_path = work_dir / "phase3_1_summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    artifacts["phase3_summary_path"] = str(summary_path)
+    artifacts["phase3_validation_path"] = str(validation_path)
+    artifacts["phase3_train_jsonl"] = str(train_jsonl)
+    artifacts["phase3_val_jsonl"] = str(val_jsonl)
+    artifacts["phase3_all_jsonl"] = str(all_jsonl)
+    artifacts["phase3_hash_summary"] = hash_summary
+    artifacts["phase3_per_seed"] = per_seed_rows
+    artifacts["phase3_content_audit_inspected_count"] = int(len(content_audits))
+    artifacts["phase3_pzcr_counts_inspected"] = {k: int(v) for k, v in sorted(pzcr_counter.items(), key=lambda kv: kv[0])}
+    measurements["source_samples_discovered"] = int(source_samples_discovered)
+    measurements["source_samples_selected_for_conversion"] = int(source_samples_selected_cap)
+    measurements["converted_samples"] = int(len(all_valid_items))
+    measurements["rejected_or_skipped_total"] = int(rejected_total)
+    measurements["schema_pass_count"] = int(schema_pass_count)
+
+    if summary["status"] != "PASS":
+        gates["P3_1"] = False
+    gates["P3_1_SCHEMA"] = bool(schema_pass_count == len(all_valid_items))
+
+    print(
+        f"[Phase3.1] source={int(source_samples_discovered)} selected={int(source_samples_selected_cap)} "
+        f"converted={int(len(all_valid_items))} rejected={int(rejected_total)} "
+        f"schema_pass={int(schema_pass_count)} train={int(len(train_items))} val={int(len(val_items))}",
+        file=sys.stderr,
+    )
+    print(f"[Phase3.1] {'PASS' if summary['status'] == 'PASS' else 'FAIL'} summary={summary_path}", file=sys.stderr)
+
+    return {
+        "success": bool(summary["status"] == "PASS"),
+        "gates": gates,
+        "artifacts": artifacts,
+        "errors": errors,
+        "measurements": measurements,
+        "remediations": remediations,
+    }
+
+
 def run_workload(args):
     # Phase 1 Baseline Logic
+    is_build_sft = args.mode == "build_sft_traj"
     is_phase1 = args.mode == "phase1_baseline"
     is_phase1_acceptance_only = args.mode == "phase1_acceptance_only"
     is_phase2_full = args.mode == "phase2_full_infer"
@@ -3184,6 +4087,16 @@ def run_workload(args):
                 if err not in payload["errors"]:
                     payload["errors"].append(err)
         return payload
+
+    # Phase 3.1: Build SFT trajectories from existing Phase2 outputs
+    if is_build_sft:
+        # Ensure src import path availability for subprocess calls
+        env_overrides = {}
+        src_path = PROJECT_ROOT / "src"
+        current_pp = os.environ.get("PYTHONPATH", "")
+        if str(src_path) not in current_pp and src_path.exists():
+            env_overrides["PYTHONPATH"] = f"{src_path}{os.pathsep}{current_pp}" if current_pp else str(src_path)
+        return _run_build_sft_traj_phase31(args, work_dir, env_overrides)
     
     # 0. Early Returns for strict_j FAIL-A / FAIL-B semantics (Stable J9)
     if args.allow_flags:
@@ -3423,6 +4336,7 @@ def run_workload(args):
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="AgentIAD Reproduction Verification Orchestrator")
     parser.add_argument("--mode", type=str, default="default", help="Execution mode")
+    parser.add_argument("--input-dir", type=str, default=None, dest="input_dir", help="Phase2 output root (required for --mode build_sft_traj)")
     parser.add_argument("--max-samples", type=int, default=None, dest="max_samples", help="Max samples per stage")
     parser.add_argument("--strict-contract", action="store_true", dest="strict_contract", help="Enforce strict contract")
     parser.add_argument("--output-dir", type=str, default=None, dest="output_dir", help="Output directory")
@@ -3444,14 +4358,19 @@ def main():
     # export MMAD_ROOT="/data2/lrrelevant/datasets/MMAD_ROOT"
     # CUDA_VISIBLE_DEVICES=0 python verify_all.py --mode strict_j --allow-full-dataset --dataset-split train --seeds 0 1 2
     parser = build_arg_parser()
+    seeds_flag_provided = any(str(x).strip() == "--seeds" for x in sys.argv[1:])
     args = parser.parse_args()
+    setattr(args, "seeds_provided", bool(seeds_flag_provided))
     if str(args.mode).strip() == "phase2_full":
         args.mode = "phase2_full_infer"
-    try:
-        args.seeds = _parse_seeds_value(args.seeds)
-    except ValueError as e:
-        print(f"[ArgsError] {e}", file=sys.stderr)
-        sys.exit(2)
+    if str(args.mode).strip() == "build_sft_traj" and not seeds_flag_provided:
+        args.seeds = []
+    else:
+        try:
+            args.seeds = _parse_seeds_value(args.seeds)
+        except ValueError as e:
+            print(f"[ArgsError] {e}", file=sys.stderr)
+            sys.exit(2)
     if args.dataset_split is None:
         # MMAD is single-split in this workflow; keep historical default for other modes.
         args.dataset_split = "train" if str(args.mode) in {"build_sft_traj", "phase2_full_infer"} else "test"
@@ -3460,6 +4379,9 @@ def main():
         args.output_dir = "dist/outputs/phase1_baseline"
     elif args.output_dir is None and args.mode == "phase2_full_infer":
         args.output_dir = "dist/outputs/phase2_full_infer"
+    elif args.output_dir is None and args.mode == "build_sft_traj":
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        args.output_dir = f"dist/outputs/phase3_traj_{timestamp}"
     elif args.output_dir is None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         args.output_dir = f"outputs/workload_{timestamp}"
