@@ -4284,18 +4284,30 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
         "val_jsonl_sha256": _hash_file_upper(val_jsonl),
     }
 
-    rejected_total = int(sum(int(v) for v in reject_reasons.values()))
+    sampling_truncation_total = int(reject_reasons.get("max_samples_cap", 0) or 0)
+    data_reject_reasons: Dict[str, int] = {
+        str(k): int(v)
+        for k, v in reject_reasons.items()
+        if str(k) != "max_samples_cap"
+    }
+    data_rejected_total = int(sum(int(v) for v in data_reject_reasons.values()))
     not_converted = int(source_samples_selected_cap - len(all_valid_items))
-    if rejected_total < not_converted:
-        reject_reasons["unaccounted_not_converted"] += int(not_converted - rejected_total)
-        rejected_total = int(sum(int(v) for v in reject_reasons.values()))
+    if data_rejected_total < not_converted:
+        data_reject_reasons["unaccounted_not_converted"] = int(
+            data_reject_reasons.get("unaccounted_not_converted", 0) + (not_converted - data_rejected_total)
+        )
+        data_rejected_total = int(sum(int(v) for v in data_reject_reasons.values()))
+    rejected_total_including_sampling = int(data_rejected_total + sampling_truncation_total)
 
     validation_report = {
         "source_samples_discovered": int(source_samples_discovered),
         "source_samples_selected_for_conversion": int(source_samples_selected_cap),
         "converted_samples": int(len(all_valid_items)),
-        "rejected_or_skipped_total": int(rejected_total),
-        "rejected_or_skipped_reasons": {k: int(v) for k, v in sorted(reject_reasons.items(), key=lambda kv: kv[0])},
+        "rejected_or_skipped_total": int(data_rejected_total),
+        "rejected_or_skipped_reasons": {k: int(v) for k, v in sorted(data_reject_reasons.items(), key=lambda kv: kv[0])},
+        "sampling_truncation_total": int(sampling_truncation_total),
+        "sampling_truncation_reasons": {"max_samples_cap": int(sampling_truncation_total)} if sampling_truncation_total > 0 else {},
+        "rejected_or_skipped_total_including_sampling_truncation": int(rejected_total_including_sampling),
         "schema_pass_count": int(schema_pass_count),
         "validation_examples": {k: v for k, v in sorted(validation_examples.items(), key=lambda kv: kv[0])},
         "strict_contract": bool(strict_contract),
@@ -4323,8 +4335,11 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
         "source_samples_discovered": int(source_samples_discovered),
         "source_samples_selected_for_conversion": int(source_samples_selected_cap),
         "converted_samples": int(len(all_valid_items)),
-        "rejected_or_skipped_total": int(rejected_total),
-        "rejected_or_skipped_reasons": {k: int(v) for k, v in sorted(reject_reasons.items(), key=lambda kv: kv[0])},
+        "rejected_or_skipped_total": int(data_rejected_total),
+        "rejected_or_skipped_reasons": {k: int(v) for k, v in sorted(data_reject_reasons.items(), key=lambda kv: kv[0])},
+        "sampling_truncation_total": int(sampling_truncation_total),
+        "sampling_truncation_reasons": {"max_samples_cap": int(sampling_truncation_total)} if sampling_truncation_total > 0 else {},
+        "rejected_or_skipped_total_including_sampling_truncation": int(rejected_total_including_sampling),
         "schema_pass_count": int(schema_pass_count),
         "per_tool_usage": {
             "total_tool_calls": int(sum(tool_counter.values())),
@@ -4367,10 +4382,10 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
         errors.append("No valid SFT trajectories were produced.")
         remediations.append("Check Phase2 source artifacts and L3 conversion logs per seed under output_dir/seed_*/.")
 
-    if strict_contract and rejected_total > 0:
+    if strict_contract and data_rejected_total > 0:
         summary["status"] = "FAIL"
         errors.append(
-            f"strict-contract enabled: rejected_or_skipped_total={rejected_total} must be 0."
+            f"strict-contract enabled: data_rejected_or_skipped_total={data_rejected_total} must be 0."
         )
         remediations.append("Fix invalid/partial traces in Phase2 outputs or rerun Phase2 for affected seeds.")
 
@@ -4389,7 +4404,8 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
     measurements["source_samples_discovered"] = int(source_samples_discovered)
     measurements["source_samples_selected_for_conversion"] = int(source_samples_selected_cap)
     measurements["converted_samples"] = int(len(all_valid_items))
-    measurements["rejected_or_skipped_total"] = int(rejected_total)
+    measurements["rejected_or_skipped_total"] = int(data_rejected_total)
+    measurements["sampling_truncation_total"] = int(sampling_truncation_total)
     measurements["schema_pass_count"] = int(schema_pass_count)
 
     if summary["status"] != "PASS":
@@ -4398,7 +4414,7 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
 
     print(
         f"[Phase3.1] source={int(source_samples_discovered)} selected={int(source_samples_selected_cap)} "
-        f"converted={int(len(all_valid_items))} rejected={int(rejected_total)} "
+        f"converted={int(len(all_valid_items))} rejected={int(data_rejected_total)} truncated={int(sampling_truncation_total)} "
         f"schema_pass={int(schema_pass_count)} train={int(len(train_items))} val={int(len(val_items))}",
         file=sys.stderr,
     )
