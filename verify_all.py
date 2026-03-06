@@ -3041,6 +3041,202 @@ def _discover_phase2_seed_zips(input_root: Path) -> List[Tuple[int, Path]]:
     return out
 
 
+def _read_json_dict(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _read_sample_ids_from_csv(path: Path) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "ok": False,
+        "error": "",
+        "rows_total": 0,
+        "sample_ids_total": 0,
+        "sample_ids_unique": 0,
+        "duplicate_count": 0,
+        "missing_sample_id_count": 0,
+        "ids_set": set(),
+        "id_field": "",
+    }
+    if not path.exists():
+        out["error"] = "missing_csv"
+        return out
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            fields = [str(x) for x in (reader.fieldnames or [])]
+            id_field = "sample_id" if "sample_id" in fields else ("id" if "id" in fields else "")
+            if not id_field:
+                out["error"] = "missing_sample_id_field"
+                return out
+            out["id_field"] = id_field
+            seen: Set[str] = set()
+            dup = 0
+            missing = 0
+            total = 0
+            for row in reader:
+                if not isinstance(row, dict):
+                    continue
+                total += 1
+                sid = str(row.get(id_field) or "").strip()
+                if not sid:
+                    missing += 1
+                    continue
+                if sid in seen:
+                    dup += 1
+                else:
+                    seen.add(sid)
+            out["rows_total"] = int(total)
+            out["sample_ids_total"] = int(total - missing)
+            out["sample_ids_unique"] = int(len(seen))
+            out["duplicate_count"] = int(dup)
+            out["missing_sample_id_count"] = int(missing)
+            out["ids_set"] = seen
+            out["ok"] = True
+            return out
+    except Exception as e:
+        out["error"] = f"csv_read_error:{type(e).__name__}"
+        return out
+
+
+def _read_sample_ids_from_main_jsonl(path: Path) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "ok": False,
+        "error": "",
+        "lines_total": 0,
+        "sample_ids_total": 0,
+        "sample_ids_unique": 0,
+        "duplicate_count": 0,
+        "missing_sample_id_count": 0,
+        "parse_error_count": 0,
+        "ids_set": set(),
+    }
+    if not path.exists():
+        out["error"] = "missing_main_jsonl"
+        return out
+    try:
+        seen: Set[str] = set()
+        dup = 0
+        missing = 0
+        parse_err = 0
+        total = 0
+        for line in path.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            total += 1
+            try:
+                obj = json.loads(s)
+            except Exception:
+                parse_err += 1
+                continue
+            if not isinstance(obj, dict):
+                parse_err += 1
+                continue
+            sid = str(obj.get("sample_id") or "").strip()
+            if not sid:
+                missing += 1
+                continue
+            if sid in seen:
+                dup += 1
+            else:
+                seen.add(sid)
+        out["lines_total"] = int(total)
+        out["sample_ids_total"] = int(total - missing - parse_err)
+        out["sample_ids_unique"] = int(len(seen))
+        out["duplicate_count"] = int(dup)
+        out["missing_sample_id_count"] = int(missing)
+        out["parse_error_count"] = int(parse_err)
+        out["ids_set"] = seen
+        out["ok"] = True
+        return out
+    except Exception as e:
+        out["error"] = f"main_jsonl_read_error:{type(e).__name__}"
+        return out
+
+
+def _resolve_phase2_raw_shard_roots(input_root: Path) -> Optional[Tuple[Path, Path, Path]]:
+    cands: List[Path] = [
+        (input_root / "outputs"),
+        input_root,
+        (input_root.parent / "outputs"),
+        (PROJECT_ROOT / "outputs"),
+    ]
+    uniq: List[Path] = []
+    seen: Set[str] = set()
+    for p in cands:
+        try:
+            rp = p.resolve()
+        except Exception:
+            continue
+        k = str(rp)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(rp)
+
+    for out_root in uniq:
+        traces_root = out_root / "traces"
+        logs_root = out_root / "logs"
+        tables_root = out_root / "tables"
+        if not traces_root.is_dir() or not logs_root.is_dir() or not tables_root.is_dir():
+            continue
+        has_shard = False
+        for child in sorted(traces_root.iterdir(), key=lambda p: p.name):
+            if not child.is_dir():
+                continue
+            if not re.fullmatch(r"mb4_s\d+_g\d+", child.name):
+                continue
+            if (child / "main.jsonl").exists():
+                has_shard = True
+                break
+        if has_shard:
+            return traces_root.resolve(), logs_root.resolve(), tables_root.resolve()
+    return None
+
+
+def _discover_phase2_raw_seed_shards(input_root: Path) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "traces_root": "",
+        "logs_root": "",
+        "tables_root": "",
+        "seeds": {},
+    }
+    roots = _resolve_phase2_raw_shard_roots(input_root)
+    if roots is None:
+        return out
+    traces_root, logs_root, tables_root = roots
+    seeds: Dict[int, Dict[int, Dict[str, Any]]] = {}
+    for run_dir in sorted(traces_root.iterdir(), key=lambda p: p.name):
+        if not run_dir.is_dir():
+            continue
+        m = re.fullmatch(r"mb4_s(\d+)_g(\d+)", run_dir.name)
+        if not m:
+            continue
+        seed = int(m.group(1))
+        gpu = int(m.group(2))
+        run_name = run_dir.name
+        seeds.setdefault(seed, {})[gpu] = {
+            "run_name": run_name,
+            "seed": int(seed),
+            "gpu": int(gpu),
+            "trace_root": run_dir.resolve(),
+            "main_jsonl": (run_dir / "main.jsonl").resolve(),
+            "summary_json": (logs_root / f"agentiad_infer_summary_{run_name}.json").resolve(),
+            "table_csv": (tables_root / f"agentiad_infer_{run_name}.csv").resolve(),
+        }
+    out["traces_root"] = str(traces_root)
+    out["logs_root"] = str(logs_root)
+    out["tables_root"] = str(tables_root)
+    out["seeds"] = seeds
+    return out
+
+
 def _pick_trace_root_from_unzip(tmp_unzip: Path, seed: int) -> Optional[Path]:
     cands: List[Path] = []
 
@@ -3343,7 +3539,10 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
             "artifacts": artifacts,
             "errors": [f"input_dir not found or not a directory: {input_root}"],
             "measurements": measurements,
-            "remediations": ["Pass a valid Phase2 output directory containing seed_*/ev_06/evidence_package.zip."],
+            "remediations": [
+                "Pass a valid Phase2 root containing seed_*/ev_06/evidence_package.zip",
+                "or raw shard layout outputs/traces|logs|tables.",
+            ],
         }
 
     if input_root == work_dir.resolve():
@@ -3379,36 +3578,59 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
             "remediations": ["Choose a writable output_dir under dist/outputs or outputs."],
         }
 
-    discovered = _discover_phase2_seed_zips(input_root)
-    if not discovered:
+    discovered_zip = _discover_phase2_seed_zips(input_root)
+    discovered_raw = _discover_phase2_raw_seed_shards(input_root)
+    raw_seeds_map: Dict[int, Dict[int, Dict[str, Any]]] = dict(discovered_raw.get("seeds") or {})
+    phase2_input_layout = ""
+    if raw_seeds_map:
+        phase2_input_layout = "raw_shards_mb4_s{seed}_g{gpu}"
+    elif discovered_zip:
+        phase2_input_layout = "seed_ev06_zip"
+    else:
         return {
             "success": False,
             "gates": {"P3_1": False},
             "artifacts": artifacts,
-            "errors": [f"No Phase2 evidence zips discovered under {input_root}."],
+            "errors": [f"No Phase2 inputs discovered under {input_root}."],
             "measurements": measurements,
-            "remediations": ["Expected layout: seed_<N>/ev_06/evidence_package.zip"],
+            "remediations": [
+                "Expected either seed_<N>/ev_06/evidence_package.zip",
+                "or outputs/traces/mb4_s{seed}_g{gpu}/main.jsonl + matching outputs/logs and outputs/tables files.",
+            ],
         }
+
+    discovered_seed_ids: List[int] = []
+    if phase2_input_layout == "seed_ev06_zip":
+        discovered_seed_ids = sorted(int(s) for s, _ in discovered_zip)
+    else:
+        discovered_seed_ids = sorted(int(s) for s in raw_seeds_map.keys())
 
     seeds_provided = bool(getattr(args, "seeds_provided", False))
     seed_filter: Set[int] = set(int(x) for x in (args.seeds or [])) if seeds_provided else set()
     if seeds_provided:
-        selected = [(s, z) for (s, z) in discovered if s in seed_filter]
+        selected_seed_ids = [int(s) for s in discovered_seed_ids if int(s) in seed_filter]
     else:
-        selected = list(discovered)
-    selected.sort(key=lambda x: int(x[0]))
+        selected_seed_ids = list(discovered_seed_ids)
+    selected_seed_ids.sort()
     artifacts["phase2_input_dir"] = str(input_root)
-    artifacts["phase2_seeds_discovered"] = [int(s) for s, _ in discovered]
-    artifacts["phase2_seeds_selected"] = [int(s) for s, _ in selected]
+    artifacts["phase2_input_layout"] = phase2_input_layout
+    artifacts["phase2_seeds_discovered"] = [int(s) for s in discovered_seed_ids]
+    artifacts["phase2_seeds_selected"] = [int(s) for s in selected_seed_ids]
     artifacts["phase2_seed_filter_applied"] = bool(seeds_provided)
-    if not selected:
+    if phase2_input_layout == "raw_shards_mb4_s{seed}_g{gpu}":
+        artifacts["phase2_raw_shard_roots"] = {
+            "traces_root": str(discovered_raw.get("traces_root") or ""),
+            "logs_root": str(discovered_raw.get("logs_root") or ""),
+            "tables_root": str(discovered_raw.get("tables_root") or ""),
+        }
+    if not selected_seed_ids:
         return {
             "success": False,
             "gates": {"P3_1": False},
             "artifacts": artifacts,
-            "errors": [f"No selected seeds found in input_dir for filter={sorted(seed_filter)}"],
+            "errors": [f"No selected seeds found in input_dir for filter={sorted(seed_filter)}."],
             "measurements": measurements,
-            "remediations": [f"Available seeds: {[s for s, _ in discovered]}"],
+            "remediations": [f"Available seeds: {discovered_seed_ids}"],
         }
 
     cfg_path = input_root / "mr_config.yaml"
@@ -3433,7 +3655,7 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
     if paper_contract is None:
         errors.append("PaperContract import unavailable; fallback validation used.")
 
-    source_zip_hashes: Dict[str, str] = {}
+    source_input_hashes: Dict[str, str] = {}
     per_seed_rows: List[Dict[str, Any]] = []
     reject_reasons: Counter = Counter()
     validation_examples: Dict[str, List[str]] = {}
@@ -3442,216 +3664,524 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
     source_samples_discovered = 0
     source_samples_selected_cap = 0
     budget_left: Optional[int] = int(args.max_samples) if args.max_samples is not None else None
-    tmp_root = work_dir / "_tmp_phase3_unzip"
-    if tmp_root.exists():
-        shutil.rmtree(tmp_root, ignore_errors=True)
-    tmp_root.mkdir(parents=True, exist_ok=True)
+    zip_by_seed: Dict[int, Path] = {int(s): p for s, p in discovered_zip}
+    tmp_root: Optional[Path] = None
+    if phase2_input_layout == "seed_ev06_zip":
+        tmp_root = work_dir / "_tmp_phase3_unzip"
+        if tmp_root.exists():
+            shutil.rmtree(tmp_root, ignore_errors=True)
+        tmp_root.mkdir(parents=True, exist_ok=True)
 
-    for seed, ev06_zip in selected:
-        trace_count = _count_trace_files_in_zip(ev06_zip)
-        source_samples_discovered += int(trace_count)
-        source_zip_hashes[f"seed_{int(seed)}"] = _hash_file_upper(ev06_zip)
-
-        if budget_left is not None and budget_left <= 0:
-            reject_reasons["max_samples_cap"] += int(trace_count)
-            per_seed_rows.append({
-                "seed": int(seed),
-                "source_trace_count": int(trace_count),
-                "selected_for_conversion": 0,
-                "l3_written": 0,
-                "validated_ok": 0,
-                "validated_rejected": 0,
-                "note": "max_samples_cap",
-            })
-            continue
-
-        selected_for_seed = int(trace_count) if budget_left is None else min(int(trace_count), int(budget_left))
-        source_samples_selected_cap += selected_for_seed
-
-        code, msg, dur = Evidence.verify_zip(ev06_zip, "06_run_agentiad_infer.py", expected_trace_count=None)
-        measurements["evidence_check_sec"] = float(measurements.get("evidence_check_sec", 0.0)) + float(dur)
-        artifacts["evidence_checks"].append({
-            "stage": f"S{seed}-06-src",
-            "stable_stage": "Phase31SourceZip",
-            "label": f"S{seed}-06-src",
-            "code": code,
-            "msg": msg,
-        })
-        if code != "OK":
-            reject_reasons["source_zip_verify_failed"] += selected_for_seed
-            if strict_contract:
-                errors.append(f"S{seed} source zip verify failed: {msg}")
-            per_seed_rows.append({
-                "seed": int(seed),
-                "source_trace_count": int(trace_count),
-                "selected_for_conversion": selected_for_seed,
-                "l3_written": 0,
-                "validated_ok": 0,
-                "validated_rejected": selected_for_seed,
-                "note": f"source_zip_verify_failed:{code}",
-            })
-            if budget_left is not None:
-                budget_left = max(0, int(budget_left) - selected_for_seed)
-            continue
-
-        tmp_seed = tmp_root / f"seed_{int(seed)}"
-        if tmp_seed.exists():
-            shutil.rmtree(tmp_seed, ignore_errors=True)
-        tmp_seed.mkdir(parents=True, exist_ok=True)
-        try:
-            with zipfile.ZipFile(ev06_zip, "r") as zf:
-                zf.extractall(tmp_seed)
-        except Exception as e:
-            reject_reasons["source_unzip_failed"] += selected_for_seed
-            if strict_contract:
-                errors.append(f"S{seed} unzip failed: {e}")
-            per_seed_rows.append({
-                "seed": int(seed),
-                "source_trace_count": int(trace_count),
-                "selected_for_conversion": selected_for_seed,
-                "l3_written": 0,
-                "validated_ok": 0,
-                "validated_rejected": selected_for_seed,
-                "note": "source_unzip_failed",
-            })
-            if budget_left is not None:
-                budget_left = max(0, int(budget_left) - selected_for_seed)
-            continue
-
-        trace_root = _pick_trace_root_from_unzip(tmp_seed, int(seed))
-        if trace_root is None:
-            reject_reasons["trace_root_not_found"] += selected_for_seed
-            if strict_contract:
-                errors.append(f"S{seed} trace root not found after unzip.")
-            per_seed_rows.append({
-                "seed": int(seed),
-                "source_trace_count": int(trace_count),
-                "selected_for_conversion": selected_for_seed,
-                "l3_written": 0,
-                "validated_ok": 0,
-                "validated_rejected": selected_for_seed,
-                "note": "trace_root_not_found",
-            })
-            if budget_left is not None:
-                budget_left = max(0, int(budget_left) - selected_for_seed)
-            continue
-
-        seed_out = work_dir / f"seed_{int(seed)}"
-        seed_out.mkdir(parents=True, exist_ok=True)
-        l3_raw_jsonl = seed_out / "l3_raw.jsonl"
-        ev08 = seed_out / "ev_08"
-        run_name = trace_root.name
-        trace_dir_for_l3 = trace_root.parent if trace_root.parent != trace_root else trace_root
-        builder = (
-            CmdBuilder(L3_SCRIPT)
-            .with_config(cfg_path)
-            .with_run_name(run_name)
-            .with_trace_dir(trace_dir_for_l3)
-            .with_out_jsonl(l3_raw_jsonl)
-            .with_evidence_dir(ev08)
-            .flag("--allow_skip", True)
-        )
-        if budget_left is not None:
-            builder.arg("--max_samples", int(budget_left))
-        cmd = builder.build()
-        cmd_res = CmdRunner.run(cmd, env_overrides, stream_output=True)
-        if not _require_cmd_ok(
-            StageResult(success=True, artifacts={"evidence_checks": []}),
-            cmd_res,
-            f"S{seed}-08",
-            "BuildTraj08",
-            record_cmd_failed=False,
-        ):
-            reject_reasons["l3_builder_failed"] += selected_for_seed
-            errors.append(f"S{seed}-08 build command failed")
-            per_seed_rows.append({
-                "seed": int(seed),
-                "source_trace_count": int(trace_count),
-                "selected_for_conversion": selected_for_seed,
-                "l3_written": 0,
-                "validated_ok": 0,
-                "validated_rejected": selected_for_seed,
-                "note": "l3_builder_failed",
-            })
-            if budget_left is not None:
-                budget_left = max(0, int(budget_left) - selected_for_seed)
-            continue
-
-        l3_metrics = _parse_l3_build_metrics(cmd_res)
-        reject_reasons["l3_skipped_trace"] += int(l3_metrics.get("skipped_trace", 0))
-        reject_reasons["l3_skipped_final"] += int(l3_metrics.get("skipped_final", 0))
-
-        ev08_zip, ev08_note, ev08_found = resolve_evidence_zip(ev08)
-        if ev08_zip is None:
-            artifacts["evidence_checks"].append({
-                "stage": f"S{seed}-08",
-                "stable_stage": "BuildTraj08",
-                "label": f"S{seed}-08",
-                "code": "MISSING_ZIP",
-                "msg": f"Missing zip: expected evidence_package.zip in {ev08}; found {ev08_found}",
-            })
-            if strict_contract:
-                errors.append(f"S{seed}-08 evidence zip missing.")
-        else:
-            code08, msg08, dur08 = Evidence.verify_zip(ev08_zip, "08_build_sft_trajectories.py", expected_trace_count=None)
-            measurements["evidence_check_sec"] = float(measurements.get("evidence_check_sec", 0.0)) + float(dur08)
-            if ev08_note:
-                msg08 = f"{msg08} ({ev08_note})"
-            artifacts["evidence_checks"].append({
-                "stage": f"S{seed}-08",
-                "stable_stage": "BuildTraj08",
-                "label": f"S{seed}-08",
-                "code": code08,
-                "msg": msg08,
-            })
-            if strict_contract and code08 != "OK":
-                errors.append(f"S{seed}-08 evidence verify failed: {msg08}")
-
-        raw_items = _read_jsonl_dicts(l3_raw_jsonl)
-        if budget_left is not None and len(raw_items) > int(budget_left):
-            extra = len(raw_items) - int(budget_left)
-            reject_reasons["max_samples_cap"] += int(extra)
-            raw_items = raw_items[: int(budget_left)]
-        if budget_left is not None:
-            budget_left = max(0, int(budget_left) - len(raw_items))
-
-        raw_items.sort(key=lambda it: str(it.get("sample_id") or ""))
-        valid_this_seed = 0
-        rejected_this_seed = 0
-        for it in raw_items:
-            ok, reason, schema_ok = _validate_phase31_item(
-                it,
-                paper_contract=paper_contract,
-                strict_contract=strict_contract,
-            )
-            if schema_ok:
-                schema_pass_count += 1
-            if not ok:
-                rejected_this_seed += 1
-                reject_reasons[reason] += 1
-                sid = str(it.get("sample_id") or "")
-                arr = validation_examples.setdefault(reason, [])
-                if sid and len(arr) < 10:
-                    arr.append(f"seed={int(seed)} sample_id={sid}")
+    if phase2_input_layout == "seed_ev06_zip":
+        for seed in selected_seed_ids:
+            ev06_zip = zip_by_seed.get(int(seed))
+            if ev06_zip is None:
                 continue
-            row = dict(it)
-            row["_phase2_seed"] = int(seed)
-            all_valid_items.append(row)
-            valid_this_seed += 1
+            trace_count = _count_trace_files_in_zip(ev06_zip)
+            source_samples_discovered += int(trace_count)
+            source_input_hashes[f"seed_{int(seed)}_ev06_zip"] = _hash_file_upper(ev06_zip)
 
-        per_seed_rows.append({
-            "seed": int(seed),
-            "source_trace_count": int(trace_count),
-            "selected_for_conversion": selected_for_seed,
-            "l3_written": int(len(raw_items)),
-            "validated_ok": int(valid_this_seed),
-            "validated_rejected": int(rejected_this_seed),
-            "l3_skipped_trace": int(l3_metrics.get("skipped_trace", 0)),
-            "l3_skipped_final": int(l3_metrics.get("skipped_final", 0)),
-            "trace_root": str(trace_root),
-        })
+            if budget_left is not None and budget_left <= 0:
+                reject_reasons["max_samples_cap"] += int(trace_count)
+                per_seed_rows.append({
+                    "seed": int(seed),
+                    "input_mode": "seed_ev06_zip",
+                    "source_trace_count": int(trace_count),
+                    "selected_for_conversion": 0,
+                    "l3_written": 0,
+                    "validated_ok": 0,
+                    "validated_rejected": 0,
+                    "note": "max_samples_cap",
+                })
+                continue
 
-    if tmp_root.exists():
+            selected_for_seed = int(trace_count) if budget_left is None else min(int(trace_count), int(budget_left))
+            source_samples_selected_cap += selected_for_seed
+
+            code, msg, dur = Evidence.verify_zip(ev06_zip, "06_run_agentiad_infer.py", expected_trace_count=None)
+            measurements["evidence_check_sec"] = float(measurements.get("evidence_check_sec", 0.0)) + float(dur)
+            artifacts["evidence_checks"].append({
+                "stage": f"S{seed}-06-src",
+                "stable_stage": "Phase31SourceZip",
+                "label": f"S{seed}-06-src",
+                "code": code,
+                "msg": msg,
+            })
+            if code != "OK":
+                reject_reasons["source_zip_verify_failed"] += selected_for_seed
+                if strict_contract:
+                    errors.append(f"S{seed} source zip verify failed: {msg}")
+                per_seed_rows.append({
+                    "seed": int(seed),
+                    "input_mode": "seed_ev06_zip",
+                    "source_trace_count": int(trace_count),
+                    "selected_for_conversion": selected_for_seed,
+                    "l3_written": 0,
+                    "validated_ok": 0,
+                    "validated_rejected": selected_for_seed,
+                    "note": f"source_zip_verify_failed:{code}",
+                })
+                if budget_left is not None:
+                    budget_left = max(0, int(budget_left) - selected_for_seed)
+                continue
+
+            if tmp_root is None:
+                reject_reasons["source_unzip_failed"] += selected_for_seed
+                errors.append(f"S{seed} unzip workspace missing.")
+                continue
+
+            tmp_seed = tmp_root / f"seed_{int(seed)}"
+            if tmp_seed.exists():
+                shutil.rmtree(tmp_seed, ignore_errors=True)
+            tmp_seed.mkdir(parents=True, exist_ok=True)
+            try:
+                with zipfile.ZipFile(ev06_zip, "r") as zf:
+                    zf.extractall(tmp_seed)
+            except Exception as e:
+                reject_reasons["source_unzip_failed"] += selected_for_seed
+                if strict_contract:
+                    errors.append(f"S{seed} unzip failed: {e}")
+                per_seed_rows.append({
+                    "seed": int(seed),
+                    "input_mode": "seed_ev06_zip",
+                    "source_trace_count": int(trace_count),
+                    "selected_for_conversion": selected_for_seed,
+                    "l3_written": 0,
+                    "validated_ok": 0,
+                    "validated_rejected": selected_for_seed,
+                    "note": "source_unzip_failed",
+                })
+                if budget_left is not None:
+                    budget_left = max(0, int(budget_left) - selected_for_seed)
+                continue
+
+            trace_root = _pick_trace_root_from_unzip(tmp_seed, int(seed))
+            if trace_root is None:
+                reject_reasons["trace_root_not_found"] += selected_for_seed
+                if strict_contract:
+                    errors.append(f"S{seed} trace root not found after unzip.")
+                per_seed_rows.append({
+                    "seed": int(seed),
+                    "input_mode": "seed_ev06_zip",
+                    "source_trace_count": int(trace_count),
+                    "selected_for_conversion": selected_for_seed,
+                    "l3_written": 0,
+                    "validated_ok": 0,
+                    "validated_rejected": selected_for_seed,
+                    "note": "trace_root_not_found",
+                })
+                if budget_left is not None:
+                    budget_left = max(0, int(budget_left) - selected_for_seed)
+                continue
+
+            seed_out = work_dir / f"seed_{int(seed)}"
+            seed_out.mkdir(parents=True, exist_ok=True)
+            l3_raw_jsonl = seed_out / "l3_raw.jsonl"
+            ev08 = seed_out / "ev_08"
+            run_name = trace_root.name
+            trace_dir_for_l3 = trace_root.parent if trace_root.parent != trace_root else trace_root
+            builder = (
+                CmdBuilder(L3_SCRIPT)
+                .with_config(cfg_path)
+                .with_run_name(run_name)
+                .with_trace_dir(trace_dir_for_l3)
+                .with_out_jsonl(l3_raw_jsonl)
+                .with_evidence_dir(ev08)
+                .flag("--allow_skip", True)
+            )
+            if budget_left is not None:
+                builder.arg("--max_samples", int(budget_left))
+            cmd = builder.build()
+            cmd_res = CmdRunner.run(cmd, env_overrides, stream_output=True)
+            if not _require_cmd_ok(
+                StageResult(success=True, artifacts={"evidence_checks": []}),
+                cmd_res,
+                f"S{seed}-08",
+                "BuildTraj08",
+                record_cmd_failed=False,
+            ):
+                reject_reasons["l3_builder_failed"] += selected_for_seed
+                errors.append(f"S{seed}-08 build command failed")
+                per_seed_rows.append({
+                    "seed": int(seed),
+                    "input_mode": "seed_ev06_zip",
+                    "source_trace_count": int(trace_count),
+                    "selected_for_conversion": selected_for_seed,
+                    "l3_written": 0,
+                    "validated_ok": 0,
+                    "validated_rejected": selected_for_seed,
+                    "note": "l3_builder_failed",
+                })
+                if budget_left is not None:
+                    budget_left = max(0, int(budget_left) - selected_for_seed)
+                continue
+
+            l3_metrics = _parse_l3_build_metrics(cmd_res)
+            reject_reasons["l3_skipped_trace"] += int(l3_metrics.get("skipped_trace", 0))
+            reject_reasons["l3_skipped_final"] += int(l3_metrics.get("skipped_final", 0))
+
+            ev08_zip, ev08_note, ev08_found = resolve_evidence_zip(ev08)
+            if ev08_zip is None:
+                artifacts["evidence_checks"].append({
+                    "stage": f"S{seed}-08",
+                    "stable_stage": "BuildTraj08",
+                    "label": f"S{seed}-08",
+                    "code": "MISSING_ZIP",
+                    "msg": f"Missing zip: expected evidence_package.zip in {ev08}; found {ev08_found}",
+                })
+                if strict_contract:
+                    errors.append(f"S{seed}-08 evidence zip missing.")
+            else:
+                code08, msg08, dur08 = Evidence.verify_zip(ev08_zip, "08_build_sft_trajectories.py", expected_trace_count=None)
+                measurements["evidence_check_sec"] = float(measurements.get("evidence_check_sec", 0.0)) + float(dur08)
+                if ev08_note:
+                    msg08 = f"{msg08} ({ev08_note})"
+                artifacts["evidence_checks"].append({
+                    "stage": f"S{seed}-08",
+                    "stable_stage": "BuildTraj08",
+                    "label": f"S{seed}-08",
+                    "code": code08,
+                    "msg": msg08,
+                })
+                if strict_contract and code08 != "OK":
+                    errors.append(f"S{seed}-08 evidence verify failed: {msg08}")
+
+            raw_items = _read_jsonl_dicts(l3_raw_jsonl)
+            if budget_left is not None and len(raw_items) > int(budget_left):
+                extra = len(raw_items) - int(budget_left)
+                reject_reasons["max_samples_cap"] += int(extra)
+                raw_items = raw_items[: int(budget_left)]
+            if budget_left is not None:
+                budget_left = max(0, int(budget_left) - len(raw_items))
+
+            raw_items.sort(key=lambda it: str(it.get("sample_id") or ""))
+            valid_this_seed = 0
+            rejected_this_seed = 0
+            for it in raw_items:
+                ok, reason, schema_ok = _validate_phase31_item(
+                    it,
+                    paper_contract=paper_contract,
+                    strict_contract=strict_contract,
+                )
+                if schema_ok:
+                    schema_pass_count += 1
+                if not ok:
+                    rejected_this_seed += 1
+                    reject_reasons[reason] += 1
+                    sid = str(it.get("sample_id") or "")
+                    arr = validation_examples.setdefault(reason, [])
+                    if sid and len(arr) < 10:
+                        arr.append(f"seed={int(seed)} sample_id={sid}")
+                    continue
+                row = dict(it)
+                row["_phase2_seed"] = int(seed)
+                all_valid_items.append(row)
+                valid_this_seed += 1
+
+            per_seed_rows.append({
+                "seed": int(seed),
+                "input_mode": "seed_ev06_zip",
+                "source_trace_count": int(trace_count),
+                "selected_for_conversion": selected_for_seed,
+                "l3_written": int(len(raw_items)),
+                "validated_ok": int(valid_this_seed),
+                "validated_rejected": int(rejected_this_seed),
+                "l3_skipped_trace": int(l3_metrics.get("skipped_trace", 0)),
+                "l3_skipped_final": int(l3_metrics.get("skipped_final", 0)),
+                "trace_root": str(trace_root),
+            })
+    else:
+        traces_root_for_l3 = Path(str(discovered_raw.get("traces_root") or ""))
+        required_gpus = [0, 1, 2, 3]
+        for seed in selected_seed_ids:
+            shard_map = dict(raw_seeds_map.get(int(seed)) or {})
+            missing_gpus = [g for g in required_gpus if g not in shard_map]
+            seed_fail_reasons: List[str] = []
+            seed_fail_notes: List[str] = []
+            seed_union_ids: Set[str] = set()
+            seed_expected_total = 0
+            requested_vals: List[int] = []
+            shard_checks: List[Dict[str, Any]] = []
+
+            def _add_seed_fail(reason: str, note: str) -> None:
+                if reason not in seed_fail_reasons:
+                    seed_fail_reasons.append(reason)
+                if note and len(seed_fail_notes) < 20:
+                    seed_fail_notes.append(note)
+
+            if not traces_root_for_l3.exists():
+                _add_seed_fail("raw_trace_root_missing", f"missing trace root: {traces_root_for_l3}")
+            if missing_gpus:
+                _add_seed_fail("raw_missing_gpu_shard", f"missing_gpus={missing_gpus}")
+
+            for gpu in required_gpus:
+                shard = shard_map.get(gpu)
+                if not isinstance(shard, dict):
+                    continue
+                run_name = str(shard.get("run_name") or f"mb4_s{int(seed)}_g{int(gpu)}")
+                main_jsonl = Path(str(shard.get("main_jsonl") or ""))
+                summary_json = Path(str(shard.get("summary_json") or ""))
+                table_csv = Path(str(shard.get("table_csv") or ""))
+
+                source_input_hashes[f"seed_{int(seed)}_g{int(gpu)}_main_jsonl"] = _hash_file_upper(main_jsonl)
+                source_input_hashes[f"seed_{int(seed)}_g{int(gpu)}_summary_json"] = _hash_file_upper(summary_json)
+                source_input_hashes[f"seed_{int(seed)}_g{int(gpu)}_table_csv"] = _hash_file_upper(table_csv)
+
+                missing_files: List[str] = []
+                if not main_jsonl.exists():
+                    missing_files.append("main.jsonl")
+                if not summary_json.exists():
+                    missing_files.append("summary.json")
+                if not table_csv.exists():
+                    missing_files.append("table.csv")
+                if missing_files:
+                    _add_seed_fail("raw_missing_shard_file", f"{run_name} missing={missing_files}")
+                    shard_checks.append({
+                        "gpu": int(gpu),
+                        "run_name": run_name,
+                        "status": "missing_files",
+                        "missing": missing_files,
+                    })
+                    continue
+
+                summary_obj = _read_json_dict(summary_json)
+                if summary_obj is None:
+                    _add_seed_fail("raw_summary_parse_error", f"{run_name} summary parse failed")
+                    summary_obj = {}
+                n_requested = int(summary_obj.get("n_requested_ids", 0) or 0)
+                n_success = int(summary_obj.get("n_success", 0) or 0)
+                if n_requested > 0:
+                    requested_vals.append(int(n_requested))
+
+                csv_stats = _read_sample_ids_from_csv(table_csv)
+                main_stats = _read_sample_ids_from_main_jsonl(main_jsonl)
+                if not bool(csv_stats.get("ok")):
+                    _add_seed_fail("raw_csv_read_error", f"{run_name} csv_error={csv_stats.get('error')}")
+                if not bool(main_stats.get("ok")):
+                    _add_seed_fail("raw_main_jsonl_read_error", f"{run_name} main_error={main_stats.get('error')}")
+
+                csv_dup = int(csv_stats.get("duplicate_count", 0) or 0)
+                main_dup = int(main_stats.get("duplicate_count", 0) or 0)
+                if csv_dup > 0 or main_dup > 0:
+                    _add_seed_fail("raw_duplicate_within_shard", f"{run_name} csv_dup={csv_dup} main_dup={main_dup}")
+
+                csv_unique = int(csv_stats.get("sample_ids_unique", 0) or 0)
+                main_unique = int(main_stats.get("sample_ids_unique", 0) or 0)
+                if csv_unique > 0 and main_unique > 0 and csv_unique != main_unique:
+                    _add_seed_fail("raw_csv_main_count_mismatch", f"{run_name} csv_unique={csv_unique} main_unique={main_unique}")
+                if n_success > 0 and csv_unique > 0 and n_success != csv_unique:
+                    _add_seed_fail("raw_n_success_mismatch_csv", f"{run_name} n_success={n_success} csv_unique={csv_unique}")
+
+                shard_ids = set(csv_stats.get("ids_set") or set())
+                if not shard_ids:
+                    shard_ids = set(main_stats.get("ids_set") or set())
+                overlap = seed_union_ids.intersection(shard_ids)
+                if overlap:
+                    _add_seed_fail("raw_duplicate_across_shards", f"{run_name} overlap_count={len(overlap)}")
+                seed_union_ids.update(shard_ids)
+
+                shard_checks.append({
+                    "gpu": int(gpu),
+                    "run_name": run_name,
+                    "status": "ok",
+                    "n_requested_ids": int(n_requested),
+                    "n_success": int(n_success),
+                    "csv_unique_sample_ids": int(csv_unique),
+                    "main_unique_sample_ids": int(main_unique),
+                    "csv_duplicates": int(csv_dup),
+                    "main_duplicates": int(main_dup),
+                    "main_jsonl": str(main_jsonl),
+                    "summary_json": str(summary_json),
+                    "table_csv": str(table_csv),
+                })
+
+            if requested_vals:
+                req_set = sorted(set(int(x) for x in requested_vals))
+                if len(req_set) != 1:
+                    _add_seed_fail("raw_requested_ids_inconsistent", f"requested_ids={req_set}")
+                else:
+                    seed_expected_total = int(req_set[0])
+                    if seed_expected_total > 0 and len(seed_union_ids) != seed_expected_total:
+                        _add_seed_fail(
+                            "raw_union_count_mismatch_requested",
+                            f"union={len(seed_union_ids)} expected={seed_expected_total}",
+                        )
+
+            seed_source_count = int(len(seed_union_ids))
+            source_samples_discovered += int(seed_source_count)
+
+            if budget_left is not None and budget_left <= 0:
+                reject_reasons["max_samples_cap"] += int(seed_source_count)
+                per_seed_rows.append({
+                    "seed": int(seed),
+                    "input_mode": "raw_shards_mb4_s{seed}_g{gpu}",
+                    "source_trace_count": int(seed_source_count),
+                    "selected_for_conversion": 0,
+                    "l3_written": 0,
+                    "validated_ok": 0,
+                    "validated_rejected": 0,
+                    "shards_checked": shard_checks,
+                    "note": "max_samples_cap",
+                })
+                continue
+
+            selected_for_seed = int(seed_source_count) if budget_left is None else min(int(seed_source_count), int(budget_left))
+            source_samples_selected_cap += selected_for_seed
+
+            if seed_fail_reasons:
+                primary_reason = str(seed_fail_reasons[0])
+                if selected_for_seed > 0:
+                    reject_reasons[primary_reason] += int(selected_for_seed)
+                else:
+                    reject_reasons[primary_reason] += 1
+                if strict_contract:
+                    errors.append(f"S{seed} raw shard validation failed: {seed_fail_reasons}")
+                per_seed_rows.append({
+                    "seed": int(seed),
+                    "input_mode": "raw_shards_mb4_s{seed}_g{gpu}",
+                    "source_trace_count": int(seed_source_count),
+                    "selected_for_conversion": int(selected_for_seed),
+                    "l3_written": 0,
+                    "validated_ok": 0,
+                    "validated_rejected": int(selected_for_seed),
+                    "missing_gpus": missing_gpus,
+                    "expected_total": int(seed_expected_total),
+                    "union_count": int(seed_source_count),
+                    "seed_fail_reasons": seed_fail_reasons,
+                    "seed_fail_notes": seed_fail_notes,
+                    "shards_checked": shard_checks,
+                    "note": primary_reason,
+                })
+                if budget_left is not None:
+                    budget_left = max(0, int(budget_left) - selected_for_seed)
+                continue
+
+            seed_out = work_dir / f"seed_{int(seed)}"
+            seed_out.mkdir(parents=True, exist_ok=True)
+            seed_l3_written = 0
+            seed_valid_ok = 0
+            seed_valid_rejected = 0
+            seed_skipped_trace = 0
+            seed_skipped_final = 0
+            l3_runs_used: List[str] = []
+
+            for gpu in required_gpus:
+                if budget_left is not None and budget_left <= 0:
+                    break
+                shard = shard_map.get(gpu)
+                if not isinstance(shard, dict):
+                    continue
+                run_name = str(shard.get("run_name") or f"mb4_s{int(seed)}_g{int(gpu)}")
+                l3_runs_used.append(run_name)
+
+                l3_raw_jsonl = seed_out / f"l3_raw_g{int(gpu)}.jsonl"
+                ev08 = seed_out / f"ev_08_g{int(gpu)}"
+                builder = (
+                    CmdBuilder(L3_SCRIPT)
+                    .with_config(cfg_path)
+                    .with_run_name(run_name)
+                    .with_trace_dir(traces_root_for_l3)
+                    .with_out_jsonl(l3_raw_jsonl)
+                    .with_evidence_dir(ev08)
+                    .flag("--allow_skip", True)
+                )
+                if budget_left is not None:
+                    builder.arg("--max_samples", int(budget_left))
+                cmd = builder.build()
+                cmd_res = CmdRunner.run(cmd, env_overrides, stream_output=True)
+                if not _require_cmd_ok(
+                    StageResult(success=True, artifacts={"evidence_checks": []}),
+                    cmd_res,
+                    f"S{seed}-08-g{gpu}",
+                    "BuildTraj08",
+                    record_cmd_failed=False,
+                ):
+                    remain = max(0, int(selected_for_seed) - int(seed_l3_written))
+                    reject_reasons["l3_builder_failed"] += int(remain if remain > 0 else 1)
+                    errors.append(f"S{seed}-08-g{gpu} build command failed")
+                    continue
+
+                l3_metrics = _parse_l3_build_metrics(cmd_res)
+                seed_skipped_trace += int(l3_metrics.get("skipped_trace", 0))
+                seed_skipped_final += int(l3_metrics.get("skipped_final", 0))
+                reject_reasons["l3_skipped_trace"] += int(l3_metrics.get("skipped_trace", 0))
+                reject_reasons["l3_skipped_final"] += int(l3_metrics.get("skipped_final", 0))
+
+                ev08_zip, ev08_note, ev08_found = resolve_evidence_zip(ev08)
+                if ev08_zip is None:
+                    artifacts["evidence_checks"].append({
+                        "stage": f"S{seed}-08-g{gpu}",
+                        "stable_stage": "BuildTraj08",
+                        "label": f"S{seed}-08-g{gpu}",
+                        "code": "MISSING_ZIP",
+                        "msg": f"Missing zip: expected evidence_package.zip in {ev08}; found {ev08_found}",
+                    })
+                    if strict_contract:
+                        errors.append(f"S{seed}-08-g{gpu} evidence zip missing.")
+                else:
+                    code08, msg08, dur08 = Evidence.verify_zip(ev08_zip, "08_build_sft_trajectories.py", expected_trace_count=None)
+                    measurements["evidence_check_sec"] = float(measurements.get("evidence_check_sec", 0.0)) + float(dur08)
+                    if ev08_note:
+                        msg08 = f"{msg08} ({ev08_note})"
+                    artifacts["evidence_checks"].append({
+                        "stage": f"S{seed}-08-g{gpu}",
+                        "stable_stage": "BuildTraj08",
+                        "label": f"S{seed}-08-g{gpu}",
+                        "code": code08,
+                        "msg": msg08,
+                    })
+                    if strict_contract and code08 != "OK":
+                        errors.append(f"S{seed}-08-g{gpu} evidence verify failed: {msg08}")
+
+                raw_items = _read_jsonl_dicts(l3_raw_jsonl)
+                if budget_left is not None and len(raw_items) > int(budget_left):
+                    extra = len(raw_items) - int(budget_left)
+                    reject_reasons["max_samples_cap"] += int(extra)
+                    raw_items = raw_items[: int(budget_left)]
+                if budget_left is not None:
+                    budget_left = max(0, int(budget_left) - len(raw_items))
+
+                raw_items.sort(key=lambda it: str(it.get("sample_id") or ""))
+                for it in raw_items:
+                    ok, reason, schema_ok = _validate_phase31_item(
+                        it,
+                        paper_contract=paper_contract,
+                        strict_contract=strict_contract,
+                    )
+                    if schema_ok:
+                        schema_pass_count += 1
+                    if not ok:
+                        seed_valid_rejected += 1
+                        reject_reasons[reason] += 1
+                        sid = str(it.get("sample_id") or "")
+                        arr = validation_examples.setdefault(reason, [])
+                        if sid and len(arr) < 10:
+                            arr.append(f"seed={int(seed)} sample_id={sid}")
+                        continue
+                    row = dict(it)
+                    row["_phase2_seed"] = int(seed)
+                    all_valid_items.append(row)
+                    seed_valid_ok += 1
+                seed_l3_written += int(len(raw_items))
+
+            per_seed_rows.append({
+                "seed": int(seed),
+                "input_mode": "raw_shards_mb4_s{seed}_g{gpu}",
+                "source_trace_count": int(seed_source_count),
+                "selected_for_conversion": int(selected_for_seed),
+                "l3_written": int(seed_l3_written),
+                "validated_ok": int(seed_valid_ok),
+                "validated_rejected": int(seed_valid_rejected),
+                "l3_skipped_trace": int(seed_skipped_trace),
+                "l3_skipped_final": int(seed_skipped_final),
+                "missing_gpus": missing_gpus,
+                "expected_total": int(seed_expected_total),
+                "union_count": int(seed_source_count),
+                "l3_runs_used": l3_runs_used,
+                "shards_checked": shard_checks,
+            })
+
+    if tmp_root is not None and tmp_root.exists():
         shutil.rmtree(tmp_root, ignore_errors=True)
 
     all_valid_items.sort(
@@ -3744,13 +4274,13 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
 
     cfg_sha = _hash_file_upper(cfg_path)
     source_hash_agg = hashlib.sha256(
-        json.dumps(source_zip_hashes, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        json.dumps(source_input_hashes, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest().upper()
     traj_hash_agg = hashlib.sha256("\n".join(sorted(traj_hashes)).encode("utf-8")).hexdigest().upper()
     hash_summary = {
         "config_file_sha256": cfg_sha,
-        "source_phase2_zip_sha256_by_seed": dict(sorted(source_zip_hashes.items(), key=lambda kv: kv[0])),
-        "source_phase2_zip_sha256_aggregate": source_hash_agg,
+        "source_phase2_input_sha256": dict(sorted(source_input_hashes.items(), key=lambda kv: kv[0])),
+        "source_phase2_input_sha256_aggregate": source_hash_agg,
         "trajectory_fingerprint_hash_aggregate": traj_hash_agg,
         "trajectories_sft_jsonl_sha256": _hash_file_upper(all_jsonl),
         "train_jsonl_sha256": _hash_file_upper(train_jsonl),
@@ -3790,8 +4320,9 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
         "status": "PASS",
         "strict_contract": bool(strict_contract),
         "input_dir": str(input_root),
+        "phase2_input_layout": phase2_input_layout,
         "output_dir": str(work_dir),
-        "seeds_selected": [int(s) for s, _ in selected],
+        "seeds_selected": [int(s) for s in selected_seed_ids],
         "source_samples_discovered": int(source_samples_discovered),
         "source_samples_selected_for_conversion": int(source_samples_selected_cap),
         "converted_samples": int(len(all_valid_items)),
@@ -3837,7 +4368,7 @@ def _run_build_sft_traj_phase31(args: argparse.Namespace, work_dir: Path, env_ov
     if len(all_valid_items) == 0:
         summary["status"] = "FAIL"
         errors.append("No valid SFT trajectories were produced.")
-        remediations.append("Check Phase2 evidence zips and L3 conversion logs per seed under output_dir/seed_*/.")
+        remediations.append("Check Phase2 source artifacts and L3 conversion logs per seed under output_dir/seed_*/.")
 
     if strict_contract and rejected_total > 0:
         summary["status"] = "FAIL"
