@@ -2202,13 +2202,13 @@ def main() -> int:
             with torch.autocast(device_type=device, dtype=amp_dtype, enabled=amp_enabled):
                 losses: List["torch.Tensor"] = []
                 token_counts: List[int] = []
-                chunk_size = 8
+                chunk_size = 1
                 if isinstance(cfg, dict):
                     try:
-                        v = int(cfg.get("logprob_batch_size", 8))
+                        v = int(cfg.get("logprob_batch_size", 1))
                         chunk_size = max(1, v)
                     except Exception:
-                        chunk_size = 8
+                        chunk_size = 1
                 n_total = len(prompts)
                 if n_total > 0:
                     chunk_size = min(int(chunk_size), int(n_total))
