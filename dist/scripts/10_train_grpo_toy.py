@@ -1218,7 +1218,22 @@ def main() -> int:
     tokenizer.truncation_side = "left"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if bool(cuda_available) and device == "cuda":
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    n_cuda_devices = int(torch.cuda.device_count()) if bool(cuda_available) else 0
+    ddp_enabled = False
+    if device == "cuda" and world_size > 1:
+        if local_rank < 0 or local_rank >= max(1, n_cuda_devices):
+            print(f"error=invalid_local_rank local_rank={local_rank} n_cuda_devices={n_cuda_devices}", file=sys.stderr)
+            return 2
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+        if bool(getattr(torch, "distributed", None)) and torch.distributed.is_available():
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(backend="nccl", init_method="env://")
+            ddp_enabled = True
+    device_is_cuda = bool(str(device).startswith("cuda"))
+    if bool(cuda_available) and device_is_cuda:
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
         except Exception:
@@ -1239,19 +1254,19 @@ def main() -> int:
             return model_cls.from_pretrained(train_args.base_model, local_files_only=bool(local_files_only), **model_kwargs)
         except Exception:
             return model_cls.from_pretrained(train_args.base_model, local_files_only=bool(local_files_only))
-    if real_phase4 and AutoModelForImageTextToText is not None:
-        try:
-            base_ref = _load_model(AutoModelForImageTextToText).to(device)
-        except Exception:
-            base_ref = _load_model(AutoModelForCausalLM).to(device)
+    if real_phase4:
+        if AutoModelForImageTextToText is None:
+            print("error=missing_multimodal_model_loader AutoModelForImageTextToText", file=sys.stderr)
+            return 2
+        base_ref = _load_model(AutoModelForImageTextToText).to(device)
     else:
         base_ref = _load_model(AutoModelForCausalLM).to(device)
     base_ref.eval()
-    if real_phase4 and AutoModelForImageTextToText is not None:
-        try:
-            base_for_adapter = _load_model(AutoModelForImageTextToText).to(device)
-        except Exception:
-            base_for_adapter = _load_model(AutoModelForCausalLM).to(device)
+    if real_phase4:
+        if AutoModelForImageTextToText is None:
+            print("error=missing_multimodal_model_loader AutoModelForImageTextToText", file=sys.stderr)
+            return 2
+        base_for_adapter = _load_model(AutoModelForImageTextToText).to(device)
     else:
         base_for_adapter = _load_model(AutoModelForCausalLM).to(device)
     base_for_adapter.train()
@@ -1274,15 +1289,40 @@ def main() -> int:
             bias="none",
         )
         model = get_peft_model(base_for_adapter, lora_cfg)
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception:
+            pass
+    if hasattr(model, "enable_input_require_grads"):
+        try:
+            model.enable_input_require_grads()
+        except Exception:
+            pass
+    if hasattr(model, "config"):
+        try:
+            model.config.use_cache = False
+        except Exception:
+            pass
     model.train()
     model.print_trainable_parameters()
-    train_model = model  # default: keep original single-GPU training path
-    n_cuda_devices = int(torch.cuda.device_count()) if bool(cuda_available) else 0  # detect visible CUDA devices
-    if device == "cuda" and n_cuda_devices > 1:
-        train_model = torch.nn.DataParallel(model, device_ids=list(range(n_cuda_devices)))  # replicate model for multi-GPU data parallel forward/backward
-        print(f"multi_gpu_mode=DataParallel n_cuda_devices={int(n_cuda_devices)} primary_device=cuda:0")  # runtime verification in logs
+    train_model = model
+    if ddp_enabled:
+        train_model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
+        print(
+            f"multi_gpu_mode=DistributedDataParallel world_size={int(world_size)} "
+            f"local_rank={int(local_rank)} device={str(device)}"
+        )
+    elif device_is_cuda and n_cuda_devices > 1:
+        train_model = torch.nn.DataParallel(model, device_ids=list(range(n_cuda_devices)))
+        print(f"multi_gpu_mode=DataParallel n_cuda_devices={int(n_cuda_devices)} primary_device=cuda:0")
     else:
-        print(f"multi_gpu_mode=single_device n_cuda_devices={int(n_cuda_devices)} device={str(device)}")  # safe fallback when <=1 GPU or CPU
+        print(f"multi_gpu_mode=single_device n_cuda_devices={int(n_cuda_devices)} device={str(device)}")
 
     lora_target_modules = list(target_modules) if isinstance(target_modules, list) else []
     trainable_param_count, total_param_count, trainable_param_ratio = _trainable_param_stats(model)
@@ -1301,7 +1341,7 @@ def main() -> int:
             "timestamp_utc": None,
             "seed": int(train_args.seed),
             "device": str(device),
-            "used_cuda": bool(device == "cuda"),
+            "used_cuda": bool(str(device).startswith("cuda")),
             "torch_cuda_available": bool(torch.cuda.is_available()),
             "base_model": str(train_args.base_model),
             "script_sha256": _sha256_upper_text(script_text),
@@ -1952,9 +1992,9 @@ def main() -> int:
 
         B = int(len(seqs))
         token_slice = 64
-        local_autocast_enabled = bool(device == "cuda") and (not bool(getattr(torch, "is_autocast_enabled", lambda: False)()))
+        local_autocast_enabled = bool(str(device).startswith("cuda")) and (not bool(getattr(torch, "is_autocast_enabled", lambda: False)()))
         local_autocast_dtype = torch.float16
-        if bool(device == "cuda") and hasattr(torch, "get_autocast_gpu_dtype"):
+        if bool(str(device).startswith("cuda")) and hasattr(torch, "get_autocast_gpu_dtype"):
             try:
                 local_autocast_dtype = torch.get_autocast_gpu_dtype()
             except Exception:
@@ -1987,7 +2027,11 @@ def main() -> int:
                     break
                 attn = torch.ones((1, t1), dtype=torch.long, device=device)
                 pos_ids = torch.arange(t0, t1, dtype=torch.long, device=device).unsqueeze(0)
-                with torch.autocast(device_type=str(device), dtype=local_autocast_dtype, enabled=local_autocast_enabled):
+                with torch.autocast(
+                    device_type="cuda" if bool(str(device).startswith("cuda")) else "cpu",
+                    dtype=local_autocast_dtype,
+                    enabled=local_autocast_enabled,
+                ):
                     out = train_model(
                         input_ids=input_chunk,
                         attention_mask=attn,
@@ -2093,13 +2137,13 @@ def main() -> int:
         print(f"selftest logprob max_abs_diff={max_abs:.12g} n={int(len(picked))} dtype={out_dtype}")
 
     try:
-        if device == "cuda":
+        if bool(str(device).startswith("cuda")):
             optim = torch.optim.AdamW(model.parameters(), lr=float(train_args.lr), fused=True)
         else:
             optim = torch.optim.AdamW(model.parameters(), lr=float(train_args.lr))
     except TypeError:
         optim = torch.optim.AdamW(model.parameters(), lr=float(train_args.lr))
-    amp_enabled = bool(cuda_available) and device == "cuda"
+    amp_enabled = bool(cuda_available) and bool(str(device).startswith("cuda"))
     amp_dtype = torch.bfloat16 if (amp_enabled and bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())) else torch.float16
     amp_use_scaler = bool(amp_enabled and amp_dtype == torch.float16)
     scaler = torch.amp.GradScaler(enabled=amp_use_scaler)
@@ -2249,16 +2293,10 @@ def main() -> int:
                 advantages = [r - baseline_ema for r in rewards]
 
             optim.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=amp_enabled):
+            with torch.autocast(device_type=("cuda" if bool(str(device).startswith("cuda")) else "cpu"), dtype=amp_dtype, enabled=amp_enabled):
                 losses: List["torch.Tensor"] = []
                 token_counts: List[int] = []
                 chunk_size = 1
-                if isinstance(cfg, dict):
-                    try:
-                        v = int(cfg.get("logprob_batch_size", 1))
-                        chunk_size = max(1, v)
-                    except Exception:
-                        chunk_size = 1
                 n_total = len(prompts)
                 if n_total > 0:
                     chunk_size = min(int(chunk_size), int(n_total))
@@ -2444,7 +2482,7 @@ def main() -> int:
             "timestamp_utc": None,
             "seed": int(train_args.seed),
             "device": str(device),
-            "used_cuda": bool(device == "cuda"),
+            "used_cuda": bool(str(device).startswith("cuda")),
             "torch_cuda_available": bool(torch.cuda.is_available()),
             "base_model": str(train_args.base_model),
             "script_sha256": _sha256_upper_text(script_text),
@@ -2483,7 +2521,7 @@ def main() -> int:
             "timestamp_utc": None,
             "seed": int(train_args.seed),
             "device": str(device),
-            "used_cuda": bool(device == "cuda"),
+            "used_cuda": bool(str(device).startswith("cuda")),
             "torch_cuda_available": bool(torch.cuda.is_available()),
             "base_model": str(train_args.base_model),
             "script_sha256": _sha256_upper_text(script_text),
@@ -2526,7 +2564,7 @@ def main() -> int:
         "timestamp_utc": None,
             "seed": int(train_args.seed),
             "device": str(device),
-            "used_cuda": bool(device == "cuda"),
+            "used_cuda": bool(str(device).startswith("cuda")),
             "torch_cuda_available": bool(torch.cuda.is_available()),
             "base_model": str(train_args.base_model),
             "script_sha256": _sha256_upper_text(script_text),
