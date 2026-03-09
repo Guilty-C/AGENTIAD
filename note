@@ -1,0 +1,46 @@
+
+
+set -euo pipefail
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
+export HF_HOME="/data2/lrrelevant/hf_offline"
+export MMAD_ROOT="/data2/lrrelevant/datasets/MMAD_ROOT"
+
+cd /data2/lrrelevant/work/agentiad_repro/repo/AGENTIAD
+  conda activate agentiad
+
+export CONFIG_PATH="dist/configs/model.yaml"
+export SHARDED_RUN="dist/outputs/phase2_full_sharded_20260303_140050"
+export TS="$(date +%Y%m%d_%H%M%S)"
+export RUN="dist/outputs/phase2_full_mb4_s3_g4_${TS}"
+mkdir -p "$RUN/logs"
+
+# sanity: id files exist
+ls -la "$SHARDED_RUN/ids_all.txt" "$SHARDED_RUN/shards/ids_"*.txt | tee "$RUN/logs/ids_ls_${TS}.txt"
+wc -l "$SHARDED_RUN/ids_all.txt" "$SHARDED_RUN/shards/ids_"*.txt | tee "$RUN/logs/ids_wc_${TS}.txt"
+for seed in 0 1 2; do
+  for rank in 0 1 2 3; do
+    (
+      export CUDA_VISIBLE_DEVICES="$rank"
+      LOG="$RUN/logs/seed${seed}_gpu${rank}.txt"
+      python dist/scripts/06_run_agentiad_infer.py \
+        --config "$CONFIG_PATH" \
+        --split train \
+        --seed "$seed" \
+        --run_name "mb4_s${seed}_g${rank}" \
+        --id_list "$SHARDED_RUN/shards/ids_${rank}.txt" \
+        --micro_batch_size 4 \
+        --use_cache true \
+        --cleanup_every_n 0 \
+        --perf true \
+        --progress true \
+        2>&1 | tee "$LOG"
+    ) &
+    sleep 0.2
+  done
+
+  # ✅ important: finish seed before starting next seed
+  wait
+done
+
+echo "DONE: $RUN"
