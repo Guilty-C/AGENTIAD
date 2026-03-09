@@ -1232,6 +1232,7 @@ def main() -> int:
             if not torch.distributed.is_initialized():
                 torch.distributed.init_process_group(backend="nccl", init_method="env://")
             ddp_enabled = True
+    print(f"process_info local_rank={int(local_rank)} world_size={int(world_size)} device={str(device)}")
     device_is_cuda = bool(str(device).startswith("cuda"))
     if bool(cuda_available) and device_is_cuda:
         try:
@@ -1254,7 +1255,9 @@ def main() -> int:
             return model_cls.from_pretrained(train_args.base_model, local_files_only=bool(local_files_only), **model_kwargs)
         except Exception:
             return model_cls.from_pretrained(train_args.base_model, local_files_only=bool(local_files_only))
-    if real_phase4:
+    base_model_name_l = str(train_args.base_model).lower()
+    use_multimodal_loader = bool(real_phase4) or ("qwen2.5-vl" in base_model_name_l)
+    if use_multimodal_loader:
         if AutoModelForImageTextToText is None:
             print("error=missing_multimodal_model_loader AutoModelForImageTextToText", file=sys.stderr)
             return 2
@@ -1262,7 +1265,7 @@ def main() -> int:
     else:
         base_ref = _load_model(AutoModelForCausalLM).to(device)
     base_ref.eval()
-    if real_phase4:
+    if use_multimodal_loader:
         if AutoModelForImageTextToText is None:
             print("error=missing_multimodal_model_loader AutoModelForImageTextToText", file=sys.stderr)
             return 2
@@ -1289,11 +1292,20 @@ def main() -> int:
             bias="none",
         )
         model = get_peft_model(base_for_adapter, lora_cfg)
-    if hasattr(model, "gradient_checkpointing_enable"):
-        try:
-            model.gradient_checkpointing_enable()
-        except Exception:
-            pass
+    checkpointing_enabled = False
+    if ddp_enabled:
+        if hasattr(model, "gradient_checkpointing_disable"):
+            try:
+                model.gradient_checkpointing_disable()
+            except Exception:
+                pass
+    else:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            try:
+                model.gradient_checkpointing_enable()
+                checkpointing_enabled = True
+            except Exception:
+                checkpointing_enabled = False
     if hasattr(model, "enable_input_require_grads"):
         try:
             model.enable_input_require_grads()
@@ -1304,6 +1316,7 @@ def main() -> int:
             model.config.use_cache = False
         except Exception:
             pass
+    print(f"gradient_checkpointing_enabled={bool(checkpointing_enabled)}")
     model.train()
     model.print_trainable_parameters()
     train_model = model
