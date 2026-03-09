@@ -1952,10 +1952,10 @@ def main() -> int:
         out = model(input_ids=batch_ids, attention_mask=batch_mask, position_ids=pos_ids)
         logits = out.logits
         logits1 = logits[:, :-1, :]
-        lse = torch.logsumexp(logits1.float(), dim=-1).to(dtype=logits1.dtype)
-        logp = logits1 - lse.unsqueeze(-1)
         tgt = batch_ids[:, 1:]
-        token_logp = logp.gather(dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)
+        lse = torch.logsumexp(logits1, dim=-1)
+        token_logits = logits1.gather(dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)
+        token_logp = token_logits - lse
 
         B = int(batch_ids.shape[0])
         T = int(batch_ids.shape[1])
@@ -2203,12 +2203,6 @@ def main() -> int:
                 losses: List["torch.Tensor"] = []
                 token_counts: List[int] = []
                 chunk_size = 1
-                if isinstance(cfg, dict):
-                    try:
-                        v = int(cfg.get("logprob_batch_size", 1))
-                        chunk_size = max(1, v)
-                    except Exception:
-                        chunk_size = 1
                 n_total = len(prompts)
                 if n_total > 0:
                     chunk_size = min(int(chunk_size), int(n_total))
