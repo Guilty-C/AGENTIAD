@@ -1276,6 +1276,13 @@ def main() -> int:
         model = get_peft_model(base_for_adapter, lora_cfg)
     model.train()
     model.print_trainable_parameters()
+    train_model = model  # default: keep original single-GPU training path
+    n_cuda_devices = int(torch.cuda.device_count()) if bool(cuda_available) else 0  # detect visible CUDA devices
+    if device == "cuda" and n_cuda_devices > 1:
+        train_model = torch.nn.DataParallel(model, device_ids=list(range(n_cuda_devices)))  # replicate model for multi-GPU data parallel forward/backward
+        print(f"multi_gpu_mode=DataParallel n_cuda_devices={int(n_cuda_devices)} primary_device=cuda:0")  # runtime verification in logs
+    else:
+        print(f"multi_gpu_mode=single_device n_cuda_devices={int(n_cuda_devices)} device={str(device)}")  # safe fallback when <=1 GPU or CPU
 
     lora_target_modules = list(target_modules) if isinstance(target_modules, list) else []
     trainable_param_count, total_param_count, trainable_param_ratio = _trainable_param_stats(model)
@@ -1943,40 +1950,83 @@ def main() -> int:
             slice_starts.append(ss)
             cont_lens.append(cl)
 
-        batch_input = {"input_ids": [seq for seq in seqs]}
-        padded = tokenizer.pad(batch_input, padding=True, return_tensors="pt")
-        batch_ids = padded["input_ids"].to(device)
-        batch_mask = padded["attention_mask"].to(device)
-
-        pos_ids = (batch_mask.cumsum(dim=1) - 1).clamp(min=0).to(dtype=torch.long)
-        out = model(input_ids=batch_ids, attention_mask=batch_mask, position_ids=pos_ids)
-        logits = out.logits
-        logits1 = logits[:, :-1, :]
-        tgt = batch_ids[:, 1:]
-        lse = torch.logsumexp(logits1, dim=-1)
-        token_logits = logits1.gather(dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)
-        token_logp = token_logits - lse
-
-        B = int(batch_ids.shape[0])
-        T = int(batch_ids.shape[1])
+        B = int(len(seqs))
+        token_slice = 64
+        local_autocast_enabled = bool(device == "cuda") and (not bool(getattr(torch, "is_autocast_enabled", lambda: False)()))
+        local_autocast_dtype = torch.float16
+        if bool(device == "cuda") and hasattr(torch, "get_autocast_gpu_dtype"):
+            try:
+                local_autocast_dtype = torch.get_autocast_gpu_dtype()
+            except Exception:
+                local_autocast_dtype = torch.float16
         out_lps: List["torch.Tensor"] = []
         out_nt: List[int] = []
         for i in range(B):
             seq_len_i = int(len(seqs[i]))
-            pad_left_i = int(T - seq_len_i)
             pl = int(prompt_lens[i])
             cl = int(cont_lens[i])
             ss = int(slice_starts[i])
             start_all = max(0, pl - 1)
             end_all = start_all + cl
-            start_i = int(pad_left_i + max(0, start_all - ss))
-            end_i = int(pad_left_i + min(seq_len_i - 1, end_all - ss))
+            start_i = int(max(0, start_all - ss))
+            end_i = int(min(seq_len_i - 1, end_all - ss))
             if end_i <= start_i:
-                out_lps.append(logits.sum() * 0.0)
+                out_lps.append(torch.zeros((), device=device))
+                out_nt.append(0)
+                continue
+
+            seq_ids = torch.tensor(seqs[i], dtype=torch.long, device=device).unsqueeze(0)
+            lp_accum: Optional["torch.Tensor"] = None
+            nt_i = 0
+            past_key_values = None
+            t0 = 0
+            while t0 < seq_len_i:
+                t1 = min(seq_len_i, t0 + token_slice)
+                input_chunk = seq_ids[:, t0:t1]
+                if int(input_chunk.shape[1]) <= 0:
+                    break
+                attn = torch.ones((1, t1), dtype=torch.long, device=device)
+                pos_ids = torch.arange(t0, t1, dtype=torch.long, device=device).unsqueeze(0)
+                with torch.autocast(device_type=str(device), dtype=local_autocast_dtype, enabled=local_autocast_enabled):
+                    out = train_model(
+                        input_ids=input_chunk,
+                        attention_mask=attn,
+                        position_ids=pos_ids,
+                        use_cache=True,
+                        past_key_values=past_key_values,
+                    )
+                logits = out.logits
+                past_key_values = getattr(out, "past_key_values", None)
+
+                valid = int(min(int(logits.shape[1]), max(0, seq_len_i - 1 - t0)))
+                if valid > 0:
+                    logits1 = logits[:, :valid, :]
+                    tgt = seq_ids[:, t0 + 1 : t0 + 1 + valid]
+                    lse = torch.logsumexp(logits1, dim=-1)
+                    token_logits = logits1.gather(dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)
+                    token_logp = token_logits - lse
+
+                    pred_start = int(t0)
+                    pred_end = int(t0 + valid)
+                    take_start = int(max(start_i, pred_start))
+                    take_end = int(min(end_i, pred_end))
+                    if take_end > take_start:
+                        ls = int(take_start - pred_start)
+                        le = int(take_end - pred_start)
+                        chunk_sum = token_logp[:, ls:le].float().sum()
+                        lp_accum = chunk_sum if lp_accum is None else (lp_accum + chunk_sum)
+                        nt_i += int(take_end - take_start)
+
+                    del lse, token_logits, token_logp, tgt, logits1
+                del out, logits, input_chunk, attn, pos_ids
+                t0 = t1
+
+            if lp_accum is None:
+                out_lps.append(seq_ids.sum() * 0.0)
                 out_nt.append(0)
             else:
-                out_lps.append(token_logp[i, start_i:end_i].float().sum())
-                out_nt.append(int(end_i - start_i))
+                out_lps.append(lp_accum)
+                out_nt.append(int(nt_i))
         return out_lps, out_nt
 
     if str(os.environ.get("GRPO_TOY_LOGPROB_SELFTEST", "")).strip() == "1":
@@ -1999,7 +2049,7 @@ def main() -> int:
             slice_start = max(0, int(full_len) - int(max_len))
             input_ids = full_ids_all[slice_start:].unsqueeze(0).to(device)
             pos_ids = torch.arange(int(input_ids.shape[1]), device=input_ids.device).unsqueeze(0)
-            out = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), position_ids=pos_ids)
+            out = train_model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), position_ids=pos_ids)
             logits = out.logits
             if cont_len <= 0:
                 return logits.sum() * 0.0, 0
