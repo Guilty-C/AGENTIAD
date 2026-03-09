@@ -4,7 +4,7 @@
   tables_dir: outputs/tables
   traces_dir: outputs/traces
   data_dir: data
-  mmad_dir: data/mmad
+  mmad_dir: data2/lrrelevant/datasets/MMAD_ROOT
   mmad_root: ""
   trajectories_dir: data/trajectories
   cache_dir: data/cache
