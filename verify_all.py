@@ -298,11 +298,13 @@ def _emit_terminal_log_header(log_path: Path, args: argparse.Namespace, output_d
     print(f"[Log] git_commit={git_commit}")
     print(f"[Log] env_summary={json.dumps(env_summary, ensure_ascii=False, sort_keys=True)}")
 
-def _cleanup_work_dir_preserve_logs(work_dir: Path):
+def _cleanup_work_dir_preserve_logs(work_dir: Path, preserve_files: Optional[Set[str]] = None):
     if not work_dir.exists():
         return
+    keep = set(preserve_files or set())
+    keep.add("logs")
     for child in work_dir.iterdir():
-        if child.name == "logs" and child.is_dir():
+        if child.name in keep:
             continue
         if child.is_dir():
             shutil.rmtree(child, ignore_errors=True)
@@ -1585,6 +1587,17 @@ class ProbeIds(Stage):
 
         if ctx.phase1_baseline or ctx.phase2_full_infer:
             with Timer("Phase1 Dataset Binding"):
+                if ctx.phase1_baseline:
+                    pre_ids = ctx.work_dir / "ids.txt"
+                    if pre_ids.exists() and pre_ids.stat().st_size > 0:
+                        valid_ids = [x.strip() for x in pre_ids.read_text(encoding="utf-8").splitlines() if x.strip()]
+                        if valid_ids:
+                            res.artifacts["ids_sha256"] = hashlib.sha256("\n".join(valid_ids).encode()).hexdigest()
+                            res.artifacts["phase1_full_mode"] = True
+                            res.artifacts["audit_ids_total"] = len(valid_ids)
+                            res.artifacts["audit_ids_source"] = "ids.txt"
+                            res.artifacts["ids_source_note"] = "phase1_baseline reused pre-existing ids.txt from output_dir"
+                            return
                 try:
                     valid_ids, used_split = _generate_ids_from_dataset(ctx.dataset_split)
                     
@@ -1730,17 +1743,16 @@ class ProbeIds(Stage):
 class AgentInfer06(Stage):
     def execute(self, ctx: StageContext, res: StageResult):
         mr_cfg = ctx.work_dir / "mr_config.yaml"
+        cfg_obj: Dict[str, Any] = {}
+        if mr_cfg.exists():
+            try:
+                import yaml
+                loaded = yaml.safe_load(mr_cfg.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cfg_obj = dict(loaded)
+            except Exception:
+                cfg_obj = {}
         if ctx.phase2_full_infer:
-            cfg_obj: Dict[str, Any] = {}
-            if mr_cfg.exists():
-                try:
-                    import yaml
-
-                    loaded = yaml.safe_load(mr_cfg.read_text(encoding="utf-8"))
-                    if isinstance(loaded, dict):
-                        cfg_obj = dict(loaded)
-                except Exception:
-                    cfg_obj = {}
             if ctx.vlm_model_id:
                 cfg_obj["vlm_model_id"] = str(ctx.vlm_model_id)
                 cfg_obj["model_id"] = str(ctx.vlm_model_id)
@@ -1759,6 +1771,35 @@ class AgentInfer06(Stage):
                 mr_cfg.write_text(yaml.safe_dump(cfg_obj, allow_unicode=True, sort_keys=False), encoding="utf-8")
             except Exception:
                 mr_cfg.write_text("model_id: distilgpt2\nrun_name: minireal\n", encoding="utf-8")
+        elif ctx.phase1_baseline:
+            if mr_cfg.exists():
+                print(f"[Phase1Wrapper] reusing_existing_config path={str(mr_cfg.resolve())}", file=sys.stderr)
+            else:
+                effective_model = str(ctx.vlm_model_id or "").strip()
+                if not effective_model:
+                    res.success = False
+                    res.errors.append(
+                        "Phase1 wrapper missing vlm_model_id/model_id: provide --vlm-model-id or precreate output_dir/mr_config.yaml"
+                    )
+                    return
+                cfg_obj["vlm_model_id"] = effective_model
+                cfg_obj["model_id"] = effective_model
+                cfg_obj["split"] = str(ctx.dataset_split)
+                cfg_obj["enable_tools"] = False
+                if "run_name" not in cfg_obj:
+                    cfg_obj["run_name"] = "minireal"
+                try:
+                    import yaml
+                    mr_cfg.write_text(yaml.safe_dump(cfg_obj, allow_unicode=True, sort_keys=False), encoding="utf-8")
+                except Exception:
+                    mr_cfg.write_text(
+                        f"vlm_model_id: {effective_model}\n"
+                        f"model_id: {effective_model}\n"
+                        f"split: {ctx.dataset_split}\n"
+                        "enable_tools: false\n"
+                        "run_name: minireal\n",
+                        encoding="utf-8",
+                    )
         elif not mr_cfg.exists():
             mr_cfg.write_text("model_id: distilgpt2\nrun_name: minireal\n", encoding="utf-8")
         (ctx.work_dir / "L1_baseline.csv").write_text("idx,split,answer,pred,correct,method,triggered\n")
@@ -1795,6 +1836,32 @@ class AgentInfer06(Stage):
                 if ctx.allow_flags: cmd.arg("--allow_code_execution")
                 
                 cmd_list = cmd.build()
+                if ctx.phase1_baseline:
+                    cfg_view: Dict[str, Any] = {}
+                    if mr_cfg.exists():
+                        try:
+                            import yaml
+                            loaded_cfg = yaml.safe_load(mr_cfg.read_text(encoding="utf-8"))
+                            if isinstance(loaded_cfg, dict):
+                                cfg_view = dict(loaded_cfg)
+                        except Exception:
+                            cfg_view = {}
+                    cfg_key_fields = {
+                        "vlm_model_id": cfg_view.get("vlm_model_id"),
+                        "model_id": cfg_view.get("model_id"),
+                        "split": cfg_view.get("split"),
+                        "enable_tools": cfg_view.get("enable_tools"),
+                    }
+                    print(f"[Phase1Wrapper] 06_config_path={str(mr_cfg.resolve())}", file=sys.stderr)
+                    print(
+                        "[Phase1Wrapper] 06_config_fields="
+                        + json.dumps(cfg_key_fields, ensure_ascii=False, sort_keys=True),
+                        file=sys.stderr,
+                    )
+                    print(
+                        "[Phase1Wrapper] 06_cmd=" + " ".join(str(x) for x in cmd_list),
+                        file=sys.stderr,
+                    )
                 if J1.record_if_violation(cmd_list, res, f"06 cmd seed {seed}"): return
                 cmd_res = CmdRunner.run(cmd_list, ctx.env_overrides, stream_output=True)
                 merged_output = b""
@@ -4549,7 +4616,8 @@ def run_workload(args):
     phase2_vlm_retry_n_source = "default"
     if is_phase1:
         args.allow_full_dataset = True
-        args.seeds = [0, 1, 2]
+        if args.seeds is None or args.seeds == [42]:
+            args.seeds = [0, 1, 2]
         if args.output_dir is None: args.output_dir = "dist/outputs/phase1_baseline"
     if is_phase1_acceptance_only:
         args.seeds = [0, 1, 2]
@@ -4593,6 +4661,44 @@ def run_workload(args):
     phase2_requested_vlm_model_id: Optional[str] = None
     phase2_requested_vlm_local_dir: Optional[str] = None
     phase2_vlm_model_source = "config"
+    if is_phase1:
+        cli_local = str(args.vlm_model_local_dir or "").strip()
+        cli_id = str(args.vlm_model_id or "").strip()
+        env_local = str(os.environ.get("VLM_MODEL_LOCAL_DIR", "") or "").strip()
+        env_id = str(os.environ.get("VLM_MODEL_ID", "") or "").strip()
+        if cli_id:
+            phase2_requested_vlm_model_id = cli_id
+        elif env_id:
+            phase2_requested_vlm_model_id = env_id
+        if cli_local:
+            phase2_requested_vlm_local_dir = cli_local
+        elif env_local:
+            phase2_requested_vlm_local_dir = env_local
+        if cli_local:
+            phase2_vlm_model_id = cli_local
+            phase2_vlm_model_source = "cli"
+        elif cli_id:
+            phase2_vlm_model_id = cli_id
+            phase2_vlm_model_source = "cli"
+        elif env_local:
+            phase2_vlm_model_id = env_local
+            phase2_vlm_model_source = "env"
+        elif env_id:
+            phase2_vlm_model_id = env_id
+            phase2_vlm_model_source = "env"
+        else:
+            mr_cfg_existing = Path(args.output_dir).resolve() / "mr_config.yaml"
+            if mr_cfg_existing.exists():
+                try:
+                    import yaml
+                    loaded_cfg = yaml.safe_load(mr_cfg_existing.read_text(encoding="utf-8"))
+                    if isinstance(loaded_cfg, dict):
+                        cfg_mid = str(loaded_cfg.get("vlm_model_id") or loaded_cfg.get("model_id") or "").strip()
+                        if cfg_mid:
+                            phase2_vlm_model_id = cfg_mid
+                            phase2_vlm_model_source = "config"
+                except Exception:
+                    pass
     if is_phase2_full:
         argv = [str(x) for x in sys.argv]
         has_vlm_max_side_cli = "--vlm-max-side" in argv
@@ -4873,7 +4979,12 @@ def run_workload(args):
 
     # NORMAL WORKLOAD
     try:
-        _cleanup_work_dir_preserve_logs(work_dir)
+        preserve_files: Set[str] = set()
+        if is_phase1 or is_phase2_full:
+            preserve_files.add("mr_config.yaml")
+        if is_phase1:
+            preserve_files.add("ids.txt")
+        _cleanup_work_dir_preserve_logs(work_dir, preserve_files=preserve_files)
         work_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         return {
@@ -4965,7 +5076,7 @@ def run_workload(args):
                 if err not in payload["errors"]:
                     payload["errors"].append(err)
         payload["artifacts"]["phase1_baseline_spec"] = {
-            "seed_policy_fixed": [0, 1, 2],
+            "seed_policy_fixed": [int(x) for x in ctx.seeds],
             "scope": "full_mmad_baseline_no_sft_no_grpo_training",
         }
     if ctx.phase2_full_infer:
